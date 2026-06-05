@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "Cython>=3.0", "numpy>=1.24"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "hypforge"
@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev  = ["pytest>=8.0", "pytest-cov", "pandas", "matplotlib"]
+dev  = ["pytest>=8.0", "pytest-cov", "pandas", "matplotlib", "Cython>=3.0"]
 full = ["pandas", "matplotlib"]
 
 [project.urls]
@@ -35,16 +35,11 @@ Homepage   = "https://github.com/cree1116/hypforge"
 Repository = "https://github.com/cree1116/hypforge"
 Issues     = "https://github.com/cree1116/hypforge/issues"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/hypforge"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
-[tool.hatch.build.targets.sdist]
-include = [
-    "src/",
-    "tests/",
-    "README.md",
-    "pyproject.toml",
-]
+[tool.setuptools.package-data]
+"hypforge" = ["_ext/bfstree.cpp", "*.pyi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

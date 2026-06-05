@@ -25,9 +25,11 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
 
+      - name: Install build deps
+        run: pip install "Cython>=3.0" numpy setuptools wheel
+
       - name: Install PyTorch (CPU-only for CI speed)
-        run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install package + dev deps
         run: pip install -e ".[dev]"

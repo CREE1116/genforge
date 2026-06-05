@@ -14,3 +14,8 @@ htmlcov/
 src/hypforge/_ext/*.so
 src/hypforge/_ext/*.dylib
 src/hypforge/_ext/*.dll
+# Cython generated files (source hidden — only .pyx committed)
+src/hypforge/_pool.c
+src/hypforge/_pool*.so
+src/hypforge/_pool*.pyd
+*.egg-info/
