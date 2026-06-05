@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.dll
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+src/hypforge/_ext/*.so
+src/hypforge/_ext/*.dylib
+src/hypforge/_ext/*.dll
