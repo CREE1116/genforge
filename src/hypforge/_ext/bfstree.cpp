@@ -255,4 +255,12 @@ int bfstree_get_total_nodes(void* handle) {
     return static_cast<BFSTree*>(handle)->total_nodes;
 }
 
+// Fill out[i] with split_hyp_idx[i] for i in [0, total_nodes).
+// out must be caller-allocated int array of size total_nodes.
+void bfstree_get_split_indices(void* handle, int* out) {
+    const BFSTree* tree = static_cast<const BFSTree*>(handle);
+    for (int i = 0; i < tree->total_nodes; ++i)
+        out[i] = tree->split_hyp_idx[i];
+}
+
 } // extern "C"

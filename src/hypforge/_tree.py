@@ -76,6 +76,10 @@ def _get_lib():
     lib.bfstree_free.restype   = None
     lib.bfstree_get_K.argtypes = [ctypes.c_void_p]
     lib.bfstree_get_K.restype  = ctypes.c_int
+    lib.bfstree_get_total_nodes.argtypes = [ctypes.c_void_p]
+    lib.bfstree_get_total_nodes.restype  = ctypes.c_int
+    lib.bfstree_get_split_indices.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    lib.bfstree_get_split_indices.restype  = None
 
     _lib = lib
     return lib
@@ -121,6 +125,17 @@ class BFSTree:
         N_pred = Z.shape[1]
         out = np.zeros((N_pred, self.K), dtype=np.float32)
         lib.bfstree_predict(self._handle, _ptr(Z), N_pred, _ptr(out))
+        return out
+
+    def get_split_hyp_indices(self) -> np.ndarray:
+        """Return int32 [total_nodes] of hypothesis index per node (-1 = leaf)."""
+        lib        = _get_lib()
+        n_nodes    = lib.bfstree_get_total_nodes(self._handle)
+        out        = np.empty(n_nodes, dtype=np.int32)
+        lib.bfstree_get_split_indices(
+            self._handle,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        )
         return out
 
     def __del__(self):

@@ -193,9 +193,11 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         check_is_fitted(self, "trees_")
         imp = np.zeros(self.n_features_in_, dtype=np.float64)
         for h in self._pool_hypotheses_:
-            if h.hyp_type in ("linear", "square", "abs") and h.w is not None:
-                w_cpu = h.w.cpu().numpy().astype(np.float64)
-                imp += np.abs(w_cpu) * h.use_count
+            if h.hyp_type not in ("linear", "square", "abs") or h.w is None:
+                continue
+            w_abs  = np.abs(h.w.cpu().numpy()).astype(np.float64)
+            weight = float(h.use_count) if h.use_count > 0 else max(h.fitness, 0.0)
+            imp   += w_abs * weight
         total = imp.sum()
         if total > 0:
             imp /= total
@@ -516,8 +518,13 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             Fsc     = Fsc + self.learning_rate * torch.tensor(pred_np, dtype=torch.float32, device=dev)
             self.trees_.append(tree)
 
-            # ── track hypothesis usage for feature importance ─────────────────
-            # (done inside pool.evolve via fitness; use_count updated here)
+            # ── update use_count from C++ split index array ───────────────────
+            split_idx = tree.get_split_hyp_indices()
+            P_cur     = len(pool.pop)
+            for idx in split_idx:
+                if 0 <= idx < P_cur:
+                    pool.pop[idx].use_count += 1
+                    pool.pop[idx].rounds_since_last_use = 0
 
             # ── validation & early stopping ──────────────────────────────────
             val_str = ""
