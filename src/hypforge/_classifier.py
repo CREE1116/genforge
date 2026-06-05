@@ -428,6 +428,55 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         check_is_fitted(self, "trees_")
         return len(self.trees_)
 
+    # ── save / load ───────────────────────────────────────────────────────────
+
+    def save(self, path: str) -> None:
+        """
+        Save the fitted model to disk.
+
+        Uses joblib internally; the C++ tree structures are serialized to numpy
+        arrays so the file is fully portable across processes and machines
+        (same OS + Python version required).
+
+        Parameters
+        ----------
+        path : str
+            File path, e.g. ``"model.joblib"`` or ``"checkpoints/round50.pkl"``.
+
+        Examples
+        --------
+        >>> clf.save("hypforge_model.joblib")
+        >>> clf2 = HypForgeClassifier.load("hypforge_model.joblib")
+        """
+        import joblib
+        # Move hypothesis weights to CPU before pickling to avoid device mismatch on load
+        for h in self._pool_hypotheses_:
+            if h.w is not None:
+                h.w = h.w.cpu()
+            if h.h1 is not None and h.h1.w is not None:
+                h.h1.w = h.h1.w.cpu()
+            if h.h2 is not None and h.h2.w is not None:
+                h.h2.w = h.h2.w.cpu()
+        joblib.dump(self, path, compress=3)
+
+    @classmethod
+    def load(cls, path: str) -> "HypForgeClassifier":
+        """
+        Load a model saved with :meth:`save`.
+
+        Parameters
+        ----------
+        path : str
+            Path to the saved file.
+
+        Examples
+        --------
+        >>> clf = HypForgeClassifier.load("hypforge_model.joblib")
+        >>> clf.predict(X_test)
+        """
+        import joblib
+        return joblib.load(path)
+
     # ── internal ─────────────────────────────────────────────────────────────
 
     def _resolve_D_num(self, D: int) -> int:

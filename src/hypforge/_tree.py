@@ -76,10 +76,32 @@ def _get_lib():
     lib.bfstree_free.restype   = None
     lib.bfstree_get_K.argtypes = [ctypes.c_void_p]
     lib.bfstree_get_K.restype  = ctypes.c_int
+    lib.bfstree_get_max_depth.argtypes   = [ctypes.c_void_p]
+    lib.bfstree_get_max_depth.restype    = ctypes.c_int
     lib.bfstree_get_total_nodes.argtypes = [ctypes.c_void_p]
     lib.bfstree_get_total_nodes.restype  = ctypes.c_int
     lib.bfstree_get_split_indices.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     lib.bfstree_get_split_indices.restype  = None
+
+    lib.bfstree_export.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),    # split_hyp_idx
+        ctypes.POINTER(ctypes.c_float),  # split_threshold
+        ctypes.POINTER(ctypes.c_float),  # leaf_values
+        ctypes.POINTER(ctypes.c_uint8),  # is_leaf
+    ]
+    lib.bfstree_export.restype = None
+
+    lib.bfstree_from_arrays.argtypes = [
+        ctypes.POINTER(ctypes.c_int),    # split_hyp_idx
+        ctypes.POINTER(ctypes.c_float),  # split_threshold
+        ctypes.POINTER(ctypes.c_float),  # leaf_values
+        ctypes.POINTER(ctypes.c_uint8),  # is_leaf
+        ctypes.c_int,  # total_nodes
+        ctypes.c_int,  # K
+        ctypes.c_int,  # max_depth
+    ]
+    lib.bfstree_from_arrays.restype = ctypes.c_void_p
 
     _lib = lib
     return lib
@@ -129,14 +151,60 @@ class BFSTree:
 
     def get_split_hyp_indices(self) -> np.ndarray:
         """Return int32 [total_nodes] of hypothesis index per node (-1 = leaf)."""
-        lib        = _get_lib()
-        n_nodes    = lib.bfstree_get_total_nodes(self._handle)
-        out        = np.empty(n_nodes, dtype=np.int32)
+        lib     = _get_lib()
+        n_nodes = lib.bfstree_get_total_nodes(self._handle)
+        out     = np.empty(n_nodes, dtype=np.int32)
         lib.bfstree_get_split_indices(
             self._handle,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         )
         return out
+
+    # ── pickling / serialization ──────────────────────────────────────────────
+
+    def __getstate__(self):
+        if self._handle is None:
+            return {"handle": None, "K": self.K}
+        lib        = _get_lib()
+        n_nodes    = lib.bfstree_get_total_nodes(self._handle)
+        max_depth  = lib.bfstree_get_max_depth(self._handle)
+        K          = self.K
+        hyp_idx    = np.empty(n_nodes,      dtype=np.int32)
+        threshold  = np.empty(n_nodes,      dtype=np.float32)
+        leaf_vals  = np.empty(n_nodes * K,  dtype=np.float32)
+        is_leaf    = np.empty(n_nodes,      dtype=np.uint8)
+        lib.bfstree_export(
+            self._handle,
+            hyp_idx.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            threshold.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            leaf_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            is_leaf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        )
+        return {
+            "handle":    "serialized",
+            "K":          K,
+            "max_depth":  max_depth,
+            "n_nodes":    n_nodes,
+            "hyp_idx":    hyp_idx,
+            "threshold":  threshold,
+            "leaf_vals":  leaf_vals,
+            "is_leaf":    is_leaf,
+        }
+
+    def __setstate__(self, state):
+        self.K = state["K"]
+        if state["handle"] is None:
+            self._handle = None
+            return
+        lib = _get_lib()
+        s   = state
+        self._handle = lib.bfstree_from_arrays(
+            s["hyp_idx"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            s["threshold"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            s["leaf_vals"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            s["is_leaf"].ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            s["n_nodes"], s["K"], s["max_depth"],
+        )
 
     def __del__(self):
         if self._handle is not None:

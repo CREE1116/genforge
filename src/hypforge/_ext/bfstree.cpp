@@ -263,4 +263,44 @@ void bfstree_get_split_indices(void* handle, int* out) {
         out[i] = tree->split_hyp_idx[i];
 }
 
+// ── Serialization ─────────────────────────────────────────────────────────────
+
+// Export all tree arrays for serialization.
+// Caller allocates: split_hyp_idx[total_nodes], split_threshold[total_nodes],
+//                   leaf_values[total_nodes * K], is_leaf[total_nodes].
+void bfstree_export(
+    void*    handle,
+    int*     split_hyp_idx,
+    float*   split_threshold,
+    float*   leaf_values,
+    uint8_t* is_leaf
+) {
+    const BFSTree* tree = static_cast<const BFSTree*>(handle);
+    int n   = tree->total_nodes;
+    int K   = tree->K;
+    for (int i = 0; i < n;   ++i) split_hyp_idx[i]  = tree->split_hyp_idx[i];
+    for (int i = 0; i < n;   ++i) split_threshold[i] = tree->split_threshold[i];
+    for (int i = 0; i < n*K; ++i) leaf_values[i]     = tree->leaf_values[i];
+    for (int i = 0; i < n;   ++i) is_leaf[i]          = tree->is_leaf[i];
+}
+
+// Reconstruct a tree from serialized arrays (no training).
+void* bfstree_from_arrays(
+    const int*     split_hyp_idx,
+    const float*   split_threshold,
+    const float*   leaf_values,
+    const uint8_t* is_leaf,
+    int total_nodes, int K, int max_depth
+) {
+    BFSTree* tree     = new BFSTree();
+    tree->total_nodes = total_nodes;
+    tree->K           = K;
+    tree->max_depth   = max_depth;
+    tree->split_hyp_idx.assign(split_hyp_idx,   split_hyp_idx   + total_nodes);
+    tree->split_threshold.assign(split_threshold, split_threshold + total_nodes);
+    tree->leaf_values.assign(leaf_values,        leaf_values      + (size_t)total_nodes * K);
+    tree->is_leaf.assign(is_leaf,               is_leaf           + total_nodes);
+    return static_cast<void*>(tree);
+}
+
 } // extern "C"

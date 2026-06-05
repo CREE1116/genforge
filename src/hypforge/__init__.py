@@ -17,5 +17,11 @@ from ._classifier import HypForgeClassifier
 from ._pool import Hypothesis, HypForgePool
 from ._tree import BFSTree
 
+
+def load_model(path: str) -> HypForgeClassifier:
+    """Load a model saved with ``clf.save(path)``."""
+    return HypForgeClassifier.load(path)
+
+
 __version__ = "0.1.0"
-__all__ = ["HypForgeClassifier", "Hypothesis", "HypForgePool", "BFSTree"]
+__all__ = ["HypForgeClassifier", "Hypothesis", "HypForgePool", "BFSTree", "load_model"]

@@ -180,6 +180,38 @@ def test_cat_features_name():
     clf.fit(X, y)
 
 
+# ── save / load ───────────────────────────────────────────────────────────────
+
+def test_save_load(binary_data, tmp_path):
+    from hypforge import load_model
+    X, y = binary_data
+    clf  = HypForgeClassifier(**TINY)
+    clf.fit(X, y)
+    proba_before = clf.predict_proba(X)
+
+    path = str(tmp_path / "model.joblib")
+    clf.save(path)
+    clf2 = load_model(path)
+
+    proba_after = clf2.predict_proba(X)
+    np.testing.assert_allclose(proba_before, proba_after, atol=1e-5)
+
+
+def test_save_load_preserves_feature_info(binary_data, tmp_path):
+    pd = pytest.importorskip("pandas")
+    X, y = binary_data
+    df   = pd.DataFrame(X, columns=[f"feat_{i}" for i in range(X.shape[1])])
+    clf  = HypForgeClassifier(**TINY)
+    clf.fit(df, y)
+
+    path = str(tmp_path / "model.joblib")
+    clf.save(path)
+    clf2 = HypForgeClassifier.load(path)
+
+    assert clf2.feature_names_in_ == clf.feature_names_in_
+    assert clf2.get_n_trees() == clf.get_n_trees()
+
+
 # ── sklearn pipeline ──────────────────────────────────────────────────────────
 
 def test_pipeline_with_downstream_model(binary_data):
