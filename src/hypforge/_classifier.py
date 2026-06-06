@@ -165,11 +165,19 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         lp    = np.array(self.F_init_, dtype=np.float32)
         Fsc   = np.tile(lp, (X.shape[0], 1))
 
-        Z_pred = np.ascontiguousarray(
-            np.stack([h.eval(X_t).cpu().numpy() for h in self._pool_hypotheses_])
-        )
+        # Each tree was built with the pool as it was at that round.
+        # Compute h.eval() once per unique hypothesis object (dedup by id),
+        # then assemble the correct Z for each tree from its own snapshot.
+        eval_cache: dict[int, np.ndarray] = {}
 
-        for tree in self.trees_:
+        for tree, snap in zip(self.trees_, self.pool_snaps_):
+            Z_rows = []
+            for h in snap:
+                h_id = id(h)
+                if h_id not in eval_cache:
+                    eval_cache[h_id] = h.eval(X_t).cpu().numpy()
+                Z_rows.append(eval_cache[h_id])
+            Z_pred = np.ascontiguousarray(np.stack(Z_rows))
             Fsc += self.learning_rate * tree.predict(Z_pred)
 
         Fsc -= Fsc.max(1, keepdims=True)
@@ -518,12 +526,18 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         pool = HypForgePool(D, max_size=self.pool_size, dev=str(dev))
         for h in pool.pop:
             h.initialize_cache(X_t)
+        if X_val_t is not None:
+            for h in pool.pop:
+                h.val_cache_cpu = h.eval(X_val_t).cpu().numpy()
 
         rng             = torch.Generator(device="cpu").manual_seed(seed)
         best_val_loss   = float("inf")
         best_trees      = []
+        best_snaps      = []   # pool snapshots paired with best_trees
+        best_pool_snap  = []   # final pool at the best round (for _pool_hypotheses_)
         no_improv       = 0
         self.trees_     = []
+        self.pool_snaps_ = []  # per-tree pool snapshots (same order as trees_)
 
         for m in range(self.n_estimators):
             for h in pool.pop:
@@ -539,6 +553,10 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             if m % self.evolve_every == 0:
                 sub = torch.randperm(N, generator=rng)[:min(N, 10000)].to(dev)
                 pool.evolve(X_t, G_w, H_w, sub, D_num, self.reg_lambda)
+                if X_val_t is not None:
+                    for h in pool.pop:
+                        if h.val_cache_cpu is None:
+                            h.val_cache_cpu = h.eval(X_val_t).cpu().numpy()
 
             # ── build tree (C++) ─────────────────────────────────────────────
             Z_full_np     = np.stack([h.full_cache_cpu for h in pool.pop])        # [P, N]
@@ -566,6 +584,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             pred_np = tree.predict(Z_full_np)
             Fsc     = Fsc + self.learning_rate * torch.tensor(pred_np, dtype=torch.float32, device=dev)
             self.trees_.append(tree)
+            self.pool_snaps_.append(list(pool.pop))  # snapshot for this tree's index space
 
             # ── update use_count from C++ split index array ───────────────────
             split_idx = tree.get_split_hyp_indices()
@@ -578,7 +597,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             # ── validation & early stopping ──────────────────────────────────
             val_str = ""
             if X_val_t is not None:
-                Z_val_np    = np.ascontiguousarray(np.stack([h.eval(X_val_t).cpu().numpy() for h in pool.pop]))
+                Z_val_np    = np.ascontiguousarray(np.stack([h.val_cache_cpu for h in pool.pop]))
                 pred_val_np = tree.predict(Z_val_np)
                 F_val       = F_val + self.learning_rate * torch.tensor(pred_val_np, dtype=torch.float32, device=dev)
 
@@ -589,28 +608,33 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                 val_str  = f" | ValLoss={val_loss:.4f} | ValAcc={val_acc:.4f}"
 
                 if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    no_improv     = 0
-                    best_trees    = list(self.trees_)
+                    best_val_loss  = val_loss
+                    no_improv      = 0
+                    best_trees     = list(self.trees_)
+                    best_snaps     = list(self.pool_snaps_)   # per-tree snapshots
+                    best_pool_snap = list(pool.pop)            # final pool at best round
                 else:
                     no_improv += 1
 
             if self.verbose:
                 ll  = -torch.log(Pm.gather(1, y_t.unsqueeze(1)).clamp(1e-8)).mean()
                 acc = (Pm.argmax(1) == y_t).float().mean()
-                best_fit = pool.pop[0].fitness if pool.pop else 0.0
+                best_ucb = pool.pop[0].score if pool.pop else 0.0
+                best_mu  = pool.pop[0].mu_fitness if pool.pop else 0.0
                 print(
                     f"  [HypForge] Round {m+1:3d} | Loss={ll.item():.4f} | Acc={acc.item():.4f} | "
-                    f"BestFit={best_fit:.4f} | Pop={len(pool.pop)}{val_str}"
+                    f"UCB={best_ucb:.4f} | μ={best_mu:.4f} | Pop={len(pool.pop)}{val_str}"
                 )
 
             if X_val_t is not None and self.early_stopping_rounds is not None:
                 if no_improv >= self.early_stopping_rounds:
                     if self.verbose:
                         print(f"  [HypForge] Early stopping at round {m+1} (best ValLoss={best_val_loss:.4f})")
-                    self.trees_ = best_trees
+                    self.trees_       = best_trees
+                    self.pool_snaps_  = best_snaps
+                    pool.pop          = best_pool_snap
                     break
 
-        self._pool_hypotheses_ = list(pool.pop)
+        self._pool_hypotheses_ = best_pool_snap if best_pool_snap else list(pool.pop)
         for h in self._pool_hypotheses_:
             h.clear_runtime_caches()
