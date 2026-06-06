@@ -13,8 +13,8 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
     HypForge: Hypothesis Pool Evolution for Oblique GBDT.
 
     Gradient-boosted oblique decision trees where split directions are drawn
-    from an evolving pool of projections (linear, square, abs, product
-    combinations of gradient-aligned, SVD, and synergy hypotheses).
+    from an evolving pool of projections (linear, relu, product combinations
+    of gradient-aligned and synergy hypotheses).
 
     Implements both ``ClassifierMixin`` (predict/predict_proba) and
     ``TransformerMixin`` (transform), so it can be used as a feature-selection
@@ -64,9 +64,9 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         self,
         n_estimators: int   = 500,
         learning_rate: float = 0.05,
-        max_depth: int       = 6,
+        max_depth: int       = 4,
         reg_lambda: float    = 1.0,
-        pool_size: int       = 500,
+        pool_size: int       = 400,
         evolve_every: int    = 1,
         subsample: float     = 0.8,
         early_stopping_rounds: int | None = 50,
@@ -74,6 +74,9 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         random_state: int | None = None,
         verbose: bool        = False,
         cat_features: list | None = None,
+        crossover_top_k: int = 3,
+        elitism_k: int       = 20,
+        map_elites_slots: int = 100,
     ):
         self.n_estimators          = n_estimators
         self.learning_rate         = learning_rate
@@ -87,6 +90,9 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         self.random_state          = random_state
         self.verbose               = verbose
         self.cat_features          = cat_features
+        self.crossover_top_k       = crossover_top_k
+        self.elitism_k             = elitism_k
+        self.map_elites_slots      = map_elites_slots
 
     # ── public fit/predict ────────────────────────────────────────────────────
 
@@ -152,18 +158,28 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         lp    = np.array(self.F_init_, dtype=np.float32)
         Fsc   = np.tile(lp, (X.shape[0], 1))
 
-        # Each tree was built with the pool as it was at that round.
-        # Compute h.eval() once per unique hypothesis object (dedup by id),
-        # then assemble the correct Z for each tree from its own snapshot.
-        eval_cache: dict[int, np.ndarray] = {}
+        # pool.pop creates new Python objects every call so id() never repeats.
+        # Key by (type, weight-bytes) instead to deduplicate across rounds.
+        z_cache: dict = {}
+
+        def _hyp_key(h):
+            if h.hyp_type == "product":
+                return ("product", _hyp_key(h.h1), _hyp_key(h.h2))
+            return (h.hyp_type, h.w.tobytes())
+
+        def _eval_cached(h):
+            key = _hyp_key(h)
+            if key not in z_cache:
+                if h.hyp_type == "linear":
+                    z_cache[key] = X @ h.w
+                elif h.hyp_type == "leaky_relu":
+                    z = X @ h.w; z_cache[key] = np.where(z > 0, z, 0.01 * z)
+                elif h.hyp_type == "product":
+                    z_cache[key] = _eval_cached(h.h1) * _eval_cached(h.h2)
+            return z_cache[key]
 
         for tree, snap in zip(self.trees_, self.pool_snaps_):
-            Z_rows = []
-            for h in snap:
-                h_id = id(h)
-                if h_id not in eval_cache:
-                    eval_cache[h_id] = h.eval(X)
-                Z_rows.append(eval_cache[h_id])
+            Z_rows = [_eval_cached(h) for h in snap]
             Z_pred = np.ascontiguousarray(np.stack(Z_rows))
             Fsc += self.learning_rate * tree.predict(Z_pred)
 
@@ -188,7 +204,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         check_is_fitted(self, "trees_")
         imp = np.zeros(self.n_features_in_, dtype=np.float64)
         for h in self._pool_hypotheses_:
-            if h.hyp_type not in ("linear", "square", "abs") or h.w is None:
+            if h.hyp_type not in ("linear", "relu") or h.w is None:
                 continue
             w_abs  = np.abs(h.w).astype(np.float64)
             weight = float(h.use_count) if h.use_count > 0 else max(h.fitness, 0.0)
@@ -258,7 +274,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         check_is_fitted(self, "_pool_hypotheses_")
         mask = np.zeros(self.n_features_in_, dtype=bool)
         for h in self._pool_hypotheses_:
-            if h.hyp_type in ("linear", "square", "abs") and h.w is not None:
+            if h.hyp_type in ("linear", "leaky_relu") and h.w is not None:
                 mask |= (np.abs(h.w) > threshold)
         return mask
 
@@ -367,7 +383,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
 
         Columns
         -------
-        type        : 'linear' | 'square' | 'abs' | 'product'
+        type        : 'linear' | 'relu' | 'product'
         fitness     : GBDT split-gain score
         use_count   : times this hypothesis was selected as a split direction
         complexity  : number of non-zero weights (or sum for product types)
@@ -381,7 +397,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         rows = []
         for h in self._pool_hypotheses_:
             top_feats = ""
-            if h.hyp_type in ("linear", "square", "abs") and h.w is not None:
+            if h.hyp_type in ("linear", "leaky_relu") and h.w is not None:
                 w_abs = np.abs(h.w)
                 top_k = min(5, int((w_abs > 1e-3).sum()))
                 if top_k > 0:
@@ -494,7 +510,14 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         if X_val is not None:
             F_val = np.tile(lp, (X_val.shape[0], 1))
 
-        pool = HypForgePool(D, max_size=self.pool_size)
+        pool = HypForgePool(
+            D, max_size=self.pool_size,
+            op_mode="all",
+            crossover_top_k=self.crossover_top_k,
+            elitism_k=self.elitism_k,
+            alps_mode=True,
+            map_elites_slots=self.map_elites_slots,
+        )
 
         rng             = np.random.default_rng(seed)
         best_val_loss   = float("inf")
@@ -514,40 +537,27 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             G_w = sw[:, None] * (Pm - oh)
             H_w = sw[:, None] * Pm * (1.0 - Pm)
 
-            if m % self.evolve_every == 0:
-                sub = rng.choice(N, size=min(N, 10000), replace=False).astype(np.int32)
-                pool.evolve(X, G_w, H_w, sub, D_num, self.reg_lambda)
-
-            # ── build tree (C++) ─────────────────────────────────────────────
-            Z_full_np, thresholds_np = pool.get_caches_and_thresholds(N)
-
+            # ── build tree: evolve + Z assembly + tree + predict all in C++ ────
+            do_evolve = (m % self.evolve_every == 0)
+            evolve_sub = rng.choice(N, size=min(N, 10000), replace=False).astype(np.int32)
             if self.subsample < 1.0:
-                sub_size     = min(N, max(5000, int(N * self.subsample)))
-                tree_sub     = rng.choice(N, size=sub_size, replace=False).astype(np.int32)
-                Z_tree_np    = np.ascontiguousarray(Z_full_np[:, tree_sub])
-                G_tree_np    = G_w[tree_sub]
-                H_tree_np    = H_w[tree_sub]
+                sub_size = min(N, max(5000, int(N * self.subsample)))
+                tree_sub = rng.choice(N, size=sub_size, replace=False).astype(np.int32)
             else:
-                Z_tree_np = Z_full_np
-                G_tree_np = G_w
-                H_tree_np = H_w
+                tree_sub = np.arange(N, dtype=np.int32)
 
-            tree = BFSTree()
-            tree.build(
-                Z=Z_tree_np, thresholds=thresholds_np,
-                G=G_tree_np, H=H_tree_np,
-                max_depth=self.max_depth, reg_lambda=self.reg_lambda,
+            tree, pred_np = pool.build_tree(
+                X, G_w, H_w,
+                evolve_sub, tree_sub,
+                D_num, self.max_depth,
+                reg_lambda=self.reg_lambda,
+                do_evolve=do_evolve,
             )
-
-            pred_np = tree.predict(Z_full_np)
-            Fsc     = Fsc + self.learning_rate * pred_np
+            Fsc  = Fsc + self.learning_rate * pred_np
             self.trees_.append(tree)
             snap = pool.pop                        # single export per round
             self.pool_snaps_.append(snap)
-
-            # ── update use_count from C++ split index array ───────────────────
-            split_idx = tree.get_split_hyp_indices()
-            pool.update_use_counts(split_idx)
+            # use_count update is performed inside pool.build_tree
 
             # ── validation & early stopping ──────────────────────────────────
             val_str = ""

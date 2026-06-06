@@ -27,8 +27,17 @@
 #  include <omp.h>
 #endif
 
+// Operator types:
+//   0 = linear     : w·x
+//   1 = leaky_relu : max(w·x, 0.01·w·x)
+//   2 = product    : h1·h2  (composite)
+static inline float apply_op(float val, int type) {
+    if (type == 1) return (val > 0.0f) ? val : 0.01f * val;
+    return val; // 0=linear, default
+}
+
 struct Hypothesis {
-    int type; // 0=linear, 1=square, 2=abs, 3=product
+    int type; // 0=linear, 1=leaky_relu (alpha=0.01), 2=product
     std::vector<float> w; // size D
     int h1_idx = -1;
     int h2_idx = -1;
@@ -48,7 +57,9 @@ struct Hypothesis {
 
     // caches
     std::vector<float> full_cache; // size N
-    std::vector<float> thresholds; // size 9
+    std::vector<float> thresholds; // size 9 (kept for backward-compat / evolve fitness scan)
+    float bin_min = 0.0f;          // uniform-histogram range, computed in initialize_cache
+    float bin_max = 1.0f;
     int stored_complexity = 0;
 
     int complexity() const {
@@ -56,7 +67,7 @@ struct Hypothesis {
     }
 
     void update_complexity(const std::vector<Hypothesis>& pool) {
-        if (type == 3) {
+        if (type == 2) {
             stored_complexity = pool[h1_idx].complexity() + pool[h2_idx].complexity();
         } else {
             stored_complexity = 0;
@@ -99,13 +110,33 @@ static std::vector<int> get_random_indices(int N, int size, unsigned int seed) {
     return idxs;
 }
 
+// evolve_mode      : 0=standard, 1=crossover, 2=novelty
+// op_mode          : 0=all (linear+lrelu), 1=linear_only, 2=lrelu_only
+// mutation_mode    : 0=gradient, 1=random_perturb, 2=none
+// feedback_mode    : 0=split_gain, 1=scan_only
+// crossover_top_k  : top-k pairs for crossover
+// fitness_norm_mode: 0=none, 1=round_mean, 2=zscore
+// elitism_k        : always protect top-k from similarity eviction
+// alps_mode        : 0=off, 1=youth-priority (n_obs<5 get score boost during eviction)
+
 class HypForgePool {
 public:
     int D;
     int max_size;
     int N = 0;
+    int op_mode           = 0;
+    int crossover_top_k   = 6;
+    int elitism_k            = 0;
+    int alps_mode            = 0;
+    int map_elites_slots     = 0;   // >0: max per type in pool
     std::vector<Hypothesis> pop;
     unsigned int seed = 42;
+
+    // Persistent scratch buffers — allocated once, reused every round.
+    // Avoids the cost of repeated 30-50 MB heap allocations per round.
+    std::vector<float> Z_buf_;   // [P * Ns_tree] subsampled projections
+    std::vector<float> G_buf_;   // [Ns_tree * K]
+    std::vector<float> H_buf_;   // [Ns_tree * K]
 
     HypForgePool(int D, int max_size) : D(D), max_size(max_size) {
         // Initialize base hypotheses
@@ -122,19 +153,15 @@ public:
 
     void initialize_cache(Hypothesis& h, const float* X, const std::vector<int>& rand_indices) {
         h.full_cache.resize(N);
-        if (h.type == 3) {
+        if (h.type == 2) {
             for (int i = 0; i < N; i++) {
                 h.full_cache[i] = pop[h.h1_idx].full_cache[i] * pop[h.h2_idx].full_cache[i];
             }
         } else {
             for (int i = 0; i < N; i++) {
                 float val = 0.0f;
-                for (int d = 0; d < D; d++) {
-                    val += h.w[d] * X[i * D + d];
-                }
-                if (h.type == 0) h.full_cache[i] = val;
-                else if (h.type == 1) h.full_cache[i] = val * val;
-                else if (h.type == 2) h.full_cache[i] = std::abs(val);
+                for (int d = 0; d < D; d++) val += h.w[d] * X[i * D + d];
+                h.full_cache[i] = apply_op(val, h.type);
             }
         }
 
@@ -145,12 +172,17 @@ public:
         }
         std::sort(sample.begin(), sample.end());
 
+        // 9 quantile thresholds for the evolve fitness scan (kept for backward compat)
         h.thresholds.resize(9);
         for (int q = 0; q < 9; q++) {
             int idx = (int)((q + 1) * 0.1f * Ns_q);
             if (idx >= Ns_q) idx = Ns_q - 1;
             h.thresholds[q] = sample[idx];
         }
+
+        // min/max range for uniform histogram binning in pool_build_tree
+        h.bin_min = sample.front();
+        h.bin_max = sample.back();
     }
 
     std::vector<float> sparsify(const std::vector<float>& w, int D_num) {
@@ -223,12 +255,18 @@ public:
         }
 
         int P = pop.size();
+        std::vector<float> best_gains(P, 0.0f);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 2)
+#endif
         for (int p = 0; p < P; p++) {
-            auto& h = pop[p];
+            const auto& h = pop[p];
             float best_gain = 0.0f;
+            std::vector<float> G_L(K), H_L(K);
             for (int q = 0; q < 9; q++) {
                 float thr = h.thresholds[q];
-                std::vector<float> G_L(K, 0.0f), H_L(K, 0.0f);
+                std::fill(G_L.begin(), G_L.end(), 0.0f);
+                std::fill(H_L.begin(), H_L.end(), 0.0f);
                 int n_left = 0;
                 for (int j = 0; j < Ns; j++) {
                     int idx = sub_indices[j];
@@ -252,7 +290,11 @@ public:
                 gain = 0.5f * (gain - parent_score);
                 if (gain > best_gain) best_gain = gain;
             }
-            h.observe_fitness(best_gain, eta_penalty);
+            best_gains[p] = best_gain;
+        }
+
+        for (int p = 0; p < P; p++) {
+            pop[p].observe_fitness(best_gains[p], eta_penalty);
         }
 
         std::sort(pop.begin(), pop.end(), [](const Hypothesis& a, const Hypothesis& b) {
@@ -277,7 +319,10 @@ public:
             std::vector<float> V_k(D);
             for (int d = 0; d < D; d++) V_k[d] = V[d * K + k];
             std::vector<float> w_k = sparsify(V_k, D_num);
-            for (int type = 0; type < 3; type++) {
+            // op_mode: 0=linear+lrelu, 1=linear_only, 2=lrelu_only
+            int type_lo = (op_mode == 2) ? 1 : 0;
+            int type_hi = (op_mode == 1) ? 1 : 2;
+            for (int type = type_lo; type < type_hi; type++) {
                 Hypothesis c;
                 c.type = type;
                 c.w = w_k;
@@ -286,67 +331,27 @@ public:
             }
         }
 
-        int flow_count = 0;
-        for (int i = 0; i < (int)pop.size(); i++) {
-            if (flow_count >= 20) break;
-            const auto& h = pop[i];
-            if (h.type >= 3) continue;
-            flow_count++;
-
-            std::vector<float> z(Ns);
-            std::vector<float> p_proj(Ns);
-            for (int j = 0; j < Ns; j++) {
-                int idx = sub_indices[j];
-                float val = 0.0f;
-                for (int d = 0; d < D; d++) val += h.w[d] * X[idx * D + d];
-                p_proj[j] = val;
-                if (h.type == 0) z[j] = val;
-                else if (h.type == 1) z[j] = val * val;
-                else if (h.type == 2) z[j] = std::abs(val);
-            }
-
-            std::vector<float> v(K, 0.0f);
-            for (int k = 0; k < K; k++) {
-                for (int j = 0; j < Ns; j++) {
-                    int idx = sub_indices[j];
-                    v[k] += G_full[idx * K + k] * z[j];
+        // Crossover between top hypothesis pairs
+        if ((int)pop.size() >= 2) {
+            std::mt19937 rng_cx(seed++);
+            std::uniform_real_distribution<float> alpha_dist(0.3f, 0.7f);
+            int n_top = std::min((int)pop.size(), crossover_top_k);
+            for (int i = 0; i < n_top; i++) {
+                for (int j = i + 1; j < n_top; j++) {
+                    if (pop[i].type >= 2 || pop[j].type >= 2) continue; // skip product
+                    float alpha = alpha_dist(rng_cx);
+                    std::vector<float> w_child(D);
+                    for (int d = 0; d < D; d++)
+                        w_child[d] = alpha * pop[i].w[d] + (1.0f - alpha) * pop[j].w[d];
+                    w_child = sparsify(w_child, D_num);
+                    // child inherits the type of the fitter parent
+                    Hypothesis c;
+                    c.type = (pop[i].score >= pop[j].score) ? pop[i].type : pop[j].type;
+                    c.w = w_child;
+                    c.update_complexity(pop);
+                    raw_candidates.push_back(c);
                 }
             }
-
-            std::vector<float> g(Ns, 0.0f);
-            for (int j = 0; j < Ns; j++) {
-                int idx = sub_indices[j];
-                for (int k = 0; k < K; k++) {
-                    g[j] += G_full[idx * K + k] * v[k];
-                }
-            }
-
-            std::vector<float> grad_w(D, 0.0f);
-            for (int d = 0; d < D; d++) {
-                float sum_grad = 0.0f;
-                for (int j = 0; j < Ns; j++) {
-                    int idx = sub_indices[j];
-                    float diff = g[j] - z[j];
-                    if (h.type == 0) {
-                        sum_grad += X[idx * D + d] * diff;
-                    } else if (h.type == 1) {
-                        sum_grad += 2.0f * X[idx * D + d] * diff * p_proj[j];
-                    } else if (h.type == 2) {
-                        float sign_p = (p_proj[j] >= 0.0f) ? 1.0f : -1.0f;
-                        sum_grad += X[idx * D + d] * diff * sign_p;
-                    }
-                }
-                grad_w[d] = sum_grad;
-            }
-
-            std::vector<float> w_new(D);
-            for (int d = 0; d < D; d++) w_new[d] = h.w[d] + 0.1f * grad_w[d];
-            std::vector<float> w_refined = sparsify(w_new, D_num);
-            Hypothesis c;
-            c.type = h.type;
-            c.w = w_refined;
-            c.update_complexity(pop);
-            raw_candidates.push_back(c);
         }
 
         if (raw_candidates.empty()) return;
@@ -355,35 +360,37 @@ public:
         int C_cand = raw_candidates.size();
 
         std::vector<std::vector<float>> cand_sub_cache(C_cand, std::vector<float>(Ns));
+        std::vector<float> cand_best_gain(C_cand, 0.0f);
+
+        // Parallelize both sub-cache computation and fitness scan over candidates.
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 2)
+#endif
         for (int ci = 0; ci < C_cand; ci++) {
-            auto& c = raw_candidates[ci];
+            const auto& c = raw_candidates[ci];
+            auto& z_sub = cand_sub_cache[ci];
             for (int j = 0; j < Ns; j++) {
                 int idx = sub_indices[j];
                 float val = 0.0f;
                 for (int d = 0; d < D; d++) val += c.w[d] * X[idx * D + d];
-                if (c.type == 0) cand_sub_cache[ci][j] = val;
-                else if (c.type == 1) cand_sub_cache[ci][j] = val * val;
-                else if (c.type == 2) cand_sub_cache[ci][j] = std::abs(val);
+                z_sub[j] = apply_op(val, c.type);
             }
-        }
-
-        for (int ci = 0; ci < C_cand; ci++) {
-            auto& c = raw_candidates[ci];
-            const auto& z_sub = cand_sub_cache[ci];
 
             std::vector<float> sorted_z = z_sub;
             std::sort(sorted_z.begin(), sorted_z.end());
             std::vector<float> cand_thr(9);
             for (int q = 0; q < 9; q++) {
-                int idx = (int)((q + 1) * 0.1f * Ns);
-                if (idx >= Ns) idx = Ns - 1;
-                cand_thr[q] = sorted_z[idx];
+                int idx2 = (int)((q + 1) * 0.1f * Ns);
+                if (idx2 >= Ns) idx2 = Ns - 1;
+                cand_thr[q] = sorted_z[idx2];
             }
 
             float best_gain = 0.0f;
+            std::vector<float> G_L(K), H_L(K);
             for (int q = 0; q < 9; q++) {
                 float thr = cand_thr[q];
-                std::vector<float> G_L(K, 0.0f), H_L(K, 0.0f);
+                std::fill(G_L.begin(), G_L.end(), 0.0f);
+                std::fill(H_L.begin(), H_L.end(), 0.0f);
                 int n_left = 0;
                 for (int j = 0; j < Ns; j++) {
                     if (z_sub[j] < thr) {
@@ -407,9 +414,13 @@ public:
                 gain = 0.5f * (gain - parent_score);
                 if (gain > best_gain) best_gain = gain;
             }
+            cand_best_gain[ci] = best_gain;
+        }
 
-            if (best_gain > 1e-5f) {
-                c.observe_fitness(best_gain, eta_penalty);
+        for (int ci = 0; ci < C_cand; ci++) {
+            if (cand_best_gain[ci] > 1e-5f) {
+                auto& c = raw_candidates[ci];
+                c.observe_fitness(cand_best_gain[ci], eta_penalty);
                 admitted.push_back(c);
             }
         }
@@ -427,30 +438,66 @@ public:
         });
 
         P = pop.size();
-        std::vector<std::vector<float>> sub_caches(P, std::vector<float>(Ns));
-        std::vector<float> norms(P, 0.0f);
+        // Extract and normalize sub_caches on a smaller subset of samples
+        int Ns_sim = std::min(Ns, 1000);
+        std::vector<std::vector<float>> sub_caches(P, std::vector<float>(Ns_sim));
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
         for (int p = 0; p < P; p++) {
             float norm_sq = 0.0f;
-            for (int j = 0; j < Ns; j++) {
+            for (int j = 0; j < Ns_sim; j++) {
                 int idx = sub_indices[j];
                 float val = pop[p].full_cache[idx];
                 sub_caches[p][j] = val;
                 norm_sq += val * val;
             }
-            norms[p] = std::sqrt(norm_sq) + 1e-8f;
+            float norm = std::sqrt(norm_sq) + 1e-8f;
+            for (int j = 0; j < Ns_sim; j++) {
+                sub_caches[p][j] /= norm;
+            }
+        }
+
+        // Precompute the absolute similarity matrix in parallel
+        std::vector<float> sim_matrix(P * P, 0.0f);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 8)
+#endif
+        for (int i = 0; i < P; i++) {
+            for (int j = i + 1; j < P; j++) {
+                float dot = 0.0f;
+                const float* ci = sub_caches[i].data();
+                const float* cj = sub_caches[j].data();
+                for (int k = 0; k < Ns_sim; k++) {
+                    dot += ci[k] * cj[k];
+                }
+                float sim = std::abs(dot);
+                sim_matrix[i * P + j] = sim;
+                sim_matrix[j * P + i] = sim;
+            }
+        }
+
+        // Priority boosts for eviction ordering: ALPS (youth)
+        if (alps_mode > 0) {
+            for (auto& h : pop)
+                if (h.n_obs < 5) h.score += 1e6f;
+            std::sort(pop.begin(), pop.end(), [](const Hypothesis& a, const Hypothesis& b) {
+                return a.score > b.score;
+            });
+            for (auto& h : pop)
+                if (h.n_obs < 5) h.score -= 1e6f;
         }
 
         std::vector<int> kept;
+        int elite_cap = (elitism_k > 0) ? std::min(elitism_k, P) : 0;
+        for (int i = 0; i < elite_cap; i++) kept.push_back(i);
+
         for (int i = 0; i < P; i++) {
+            if (i < elite_cap) continue;
             bool redundant = false;
             for (int j : kept) {
                 float thr_val = (pop[i].type == pop[j].type) ? 0.90f : 0.98f;
-                float dot = 0.0f;
-                for (int k = 0; k < Ns; k++) {
-                    dot += sub_caches[i][k] * sub_caches[j][k];
-                }
-                float similarity = std::abs(dot) / (norms[i] * norms[j]);
-                if (similarity > thr_val) {
+                if (sim_matrix[i * P + j] > thr_val) {
                     redundant = true;
                     break;
                 }
@@ -459,6 +506,20 @@ public:
                 kept.push_back(i);
                 if ((int)kept.size() >= max_size) break;
             }
+        }
+
+        // MAP-Elites: apply per-type slot quota after similarity dedup
+        if (map_elites_slots > 0) {
+            std::vector<int> filtered;
+            int type_cnts[3] = {0, 0, 0};
+            for (int i : kept) {
+                int t = pop[i].type;
+                if (type_cnts[t < 3 ? t : 0] < map_elites_slots) {
+                    filtered.push_back(i);
+                    if (t >= 0 && t < 3) type_cnts[t]++;
+                }
+            }
+            kept = filtered;
         }
 
         std::vector<Hypothesis> pruned_pop;
@@ -478,19 +539,19 @@ public:
 
     void eval(const float* X, int N_in, float* out_Z) const {
         int P_size = pop.size();
+        // Parallelise over samples; inner p-loop is sequential because type==2 (product) reads p' < p.
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static, 256)
+#endif
         for (int i = 0; i < N_in; i++) {
             for (int p = 0; p < P_size; p++) {
                 const auto& h = pop[p];
-                if (h.type == 3) {
+                if (h.type == 2) {
                     out_Z[(size_t)p * N_in + i] = out_Z[(size_t)h.h1_idx * N_in + i] * out_Z[(size_t)h.h2_idx * N_in + i];
                 } else {
                     float val = 0.0f;
-                    for (int d = 0; d < D; d++) {
-                        val += h.w[d] * X[i * D + d];
-                    }
-                    if (h.type == 0) out_Z[(size_t)p * N_in + i] = val;
-                    else if (h.type == 1) out_Z[(size_t)p * N_in + i] = val * val;
-                    else if (h.type == 2) out_Z[(size_t)p * N_in + i] = std::abs(val);
+                    for (int d = 0; d < D; d++) val += h.w[d] * X[i * D + d];
+                    out_Z[(size_t)p * N_in + i] = apply_op(val, h.type);
                 }
             }
         }
@@ -505,7 +566,253 @@ struct BFSTree {
     std::vector<float>   split_threshold;  // [total_nodes]
     std::vector<float>   leaf_values;      // [total_nodes * K]
     std::vector<uint8_t> is_leaf;          // [total_nodes]
+    std::vector<float>   split_gain;       // [total_nodes], actual gain per split node (0 for leaves)
 };
+
+// ── Histogram BFS tree build (internal, used by pool_build_tree) ─────────────
+//
+// 255-bin uniform histogram split search.
+// Cost per hypothesis per node: O(Ns + 255*K)  vs  old O(9 * Ns * K)
+// At K=19, Ns=25000: ~55k ops vs ~4.3M → ~78× faster per split search.
+
+static const int N_HIST_BINS = 255;
+
+static BFSTree* bfs_build_hist(
+    const HypForgePool* pool,
+    const float* Z_sub,    // [P, Ns], subsampled projections
+    const float* G,        // [Ns, K]
+    const float* H,        // [Ns, K]
+    int P, int Ns, int K,
+    int max_depth, int min_split, int min_leaf, float reg_lambda
+) {
+    BFSTree* tree     = new BFSTree();
+    tree->max_depth   = max_depth;
+    tree->K           = K;
+    int total_nodes   = (1 << (max_depth + 1)) - 1;
+    tree->total_nodes = total_nodes;
+    tree->split_hyp_idx.assign(total_nodes, -1);
+    tree->split_threshold.assign(total_nodes, 0.0f);
+    tree->split_gain.assign(total_nodes, 0.0f);
+    tree->leaf_values.assign((size_t)total_nodes * K, 0.0f);
+    tree->is_leaf.assign(total_nodes, 1);
+
+    std::vector<std::vector<int>> node_samples(total_nodes);
+    node_samples[0].resize(Ns);
+    std::iota(node_samples[0].begin(), node_samples[0].end(), 0);
+
+    std::vector<float> G_sum(K), H_sum(K);
+    std::vector<float> G_tot(K), H_tot(K);
+
+    for (int depth = 0; depth <= max_depth; depth++) {
+        int n_nodes  = 1 << depth;
+        int base     = n_nodes - 1;
+        bool is_last = (depth == max_depth);
+
+        for (int local = 0; local < n_nodes; local++) {
+            int t         = base + local;
+            auto& samples = node_samples[t];
+            int  n_in     = (int)samples.size();
+
+            if (n_in == 0) { tree->is_leaf[t] = 1; continue; }
+
+            // ── Leaf value ───────────────────────────────────────────────────
+            std::fill(G_sum.begin(), G_sum.end(), 0.0f);
+            std::fill(H_sum.begin(), H_sum.end(), 0.0f);
+            for (int idx : samples) {
+                const float* gi = G + (size_t)idx * K;
+                const float* hi = H + (size_t)idx * K;
+                for (int k = 0; k < K; k++) { G_sum[k] += gi[k]; H_sum[k] += hi[k]; }
+            }
+            float* lv = &tree->leaf_values[(size_t)t * K];
+            for (int k = 0; k < K; k++) lv[k] = -(G_sum[k] / (H_sum[k] + reg_lambda));
+
+            if (is_last || n_in < min_split) {
+                tree->is_leaf[t] = 1;
+                { std::vector<int> tmp; tmp.swap(samples); }
+                continue;
+            }
+
+            // ── Subsample for split search ───────────────────────────────────
+            const int* sp = samples.data();
+            int Ns_node   = n_in;
+            std::vector<int> sub_buf;
+            if (n_in > 25000) {
+                Ns_node = 25000;
+                sub_buf.assign(samples.begin(), samples.begin() + Ns_node);
+                sp = sub_buf.data();
+            }
+
+            std::fill(G_tot.begin(), G_tot.end(), 0.0f);
+            std::fill(H_tot.begin(), H_tot.end(), 0.0f);
+            for (int j = 0; j < Ns_node; j++) {
+                const float* gi = G + (size_t)sp[j] * K;
+                const float* hi = H + (size_t)sp[j] * K;
+                for (int k = 0; k < K; k++) { G_tot[k] += gi[k]; H_tot[k] += hi[k]; }
+            }
+            float parent_score = 0.0f;
+            for (int k = 0; k < K; k++)
+                parent_score += G_tot[k] * G_tot[k] / (G_tot[k] > 0 ? H_tot[k] + reg_lambda : H_tot[k] + reg_lambda);
+            // (simplified: parent_score = sum G^2/(H+lam))
+            parent_score = 0.0f;
+            for (int k = 0; k < K; k++)
+                parent_score += G_tot[k] * G_tot[k] / (H_tot[k] + reg_lambda);
+
+            // ── Histogram split search (parallelised over hypotheses) ────────
+            float best_gain = 1e-5f;
+            int   best_p    = -1;
+            float best_thr  = 0.0f;
+
+#ifdef _OPENMP
+            #pragma omp parallel
+            {
+                std::vector<float> G_hist(N_HIST_BINS * K);
+                std::vector<float> H_hist(N_HIST_BINS * K);
+                std::vector<int>   cnt_hist(N_HIST_BINS);
+                std::vector<float> G_L(K), H_L(K);
+                float tl_gain = 1e-5f; int tl_p = -1; float tl_thr = 0.0f;
+
+                #pragma omp for nowait
+                for (int p = 0; p < P; p++) {
+                    float bmin = pool->pop[p].bin_min;
+                    float bmax = pool->pop[p].bin_max;
+                    float range = bmax - bmin;
+                    if (range < 1e-8f) continue;
+                    float inv_r = N_HIST_BINS / range;
+
+                    const float* Z_p = Z_sub + (size_t)p * Ns;
+
+                    std::fill(G_hist.begin(), G_hist.end(), 0.0f);
+                    std::fill(H_hist.begin(), H_hist.end(), 0.0f);
+                    std::fill(cnt_hist.begin(), cnt_hist.end(), 0);
+
+                    for (int j = 0; j < Ns_node; j++) {
+                        float z = Z_p[sp[j]];
+                        int b = (int)((z - bmin) * inv_r);
+                        if (b < 0) b = 0;
+                        if (b >= N_HIST_BINS) b = N_HIST_BINS - 1;
+                        cnt_hist[b]++;
+                        const float* gi = G + (size_t)sp[j] * K;
+                        const float* hi = H + (size_t)sp[j] * K;
+                        for (int k = 0; k < K; k++) {
+                            G_hist[b * K + k] += gi[k];
+                            H_hist[b * K + k] += hi[k];
+                        }
+                    }
+
+                    std::fill(G_L.begin(), G_L.end(), 0.0f);
+                    std::fill(H_L.begin(), H_L.end(), 0.0f);
+                    int n_left = 0;
+                    for (int b = 0; b < N_HIST_BINS - 1; b++) {
+                        n_left += cnt_hist[b];
+                        for (int k = 0; k < K; k++) {
+                            G_L[k] += G_hist[b * K + k];
+                            H_L[k] += H_hist[b * K + k];
+                        }
+                        int n_right = Ns_node - n_left;
+                        if (n_left < min_leaf || n_right < min_leaf) continue;
+
+                        float gain = 0.0f;
+                        for (int k = 0; k < K; k++) {
+                            float GR = G_tot[k] - G_L[k];
+                            float HR = H_tot[k] - H_L[k];
+                            gain += G_L[k]*G_L[k]/(H_L[k]+reg_lambda)
+                                  + GR*GR/(HR+reg_lambda);
+                        }
+                        gain = 0.5f * (gain - parent_score);
+                        float split_val = bmin + (b + 1) / inv_r;
+                        if (gain > tl_gain) { tl_gain = gain; tl_p = p; tl_thr = split_val; }
+                    }
+                }
+                #pragma omp critical
+                { if (tl_gain > best_gain) { best_gain = tl_gain; best_p = tl_p; best_thr = tl_thr; } }
+            }
+#else
+            {
+                std::vector<float> G_hist(N_HIST_BINS * K);
+                std::vector<float> H_hist(N_HIST_BINS * K);
+                std::vector<int>   cnt_hist(N_HIST_BINS);
+                std::vector<float> G_L(K), H_L(K);
+
+                for (int p = 0; p < P; p++) {
+                    float bmin = pool->pop[p].bin_min;
+                    float bmax = pool->pop[p].bin_max;
+                    float range = bmax - bmin;
+                    if (range < 1e-8f) continue;
+                    float inv_r = N_HIST_BINS / range;
+
+                    const float* Z_p = Z_sub + (size_t)p * Ns;
+
+                    std::fill(G_hist.begin(), G_hist.end(), 0.0f);
+                    std::fill(H_hist.begin(), H_hist.end(), 0.0f);
+                    std::fill(cnt_hist.begin(), cnt_hist.end(), 0);
+
+                    for (int j = 0; j < Ns_node; j++) {
+                        float z = Z_p[sp[j]];
+                        int b = (int)((z - bmin) * inv_r);
+                        if (b < 0) b = 0;
+                        if (b >= N_HIST_BINS) b = N_HIST_BINS - 1;
+                        cnt_hist[b]++;
+                        const float* gi = G + (size_t)sp[j] * K;
+                        const float* hi = H + (size_t)sp[j] * K;
+                        for (int k = 0; k < K; k++) {
+                            G_hist[b * K + k] += gi[k];
+                            H_hist[b * K + k] += hi[k];
+                        }
+                    }
+
+                    std::fill(G_L.begin(), G_L.end(), 0.0f);
+                    std::fill(H_L.begin(), H_L.end(), 0.0f);
+                    int n_left = 0;
+                    for (int b = 0; b < N_HIST_BINS - 1; b++) {
+                        n_left += cnt_hist[b];
+                        for (int k = 0; k < K; k++) {
+                            G_L[k] += G_hist[b * K + k];
+                            H_L[k] += H_hist[b * K + k];
+                        }
+                        int n_right = Ns_node - n_left;
+                        if (n_left < min_leaf || n_right < min_leaf) continue;
+
+                        float gain = 0.0f;
+                        for (int k = 0; k < K; k++) {
+                            float GR = G_tot[k] - G_L[k];
+                            float HR = H_tot[k] - H_L[k];
+                            gain += G_L[k]*G_L[k]/(H_L[k]+reg_lambda)
+                                  + GR*GR/(HR+reg_lambda);
+                        }
+                        gain = 0.5f * (gain - parent_score);
+                        float split_val = bmin + (b + 1) / inv_r;
+                        if (gain > best_gain) { best_gain = gain; best_p = p; best_thr = split_val; }
+                    }
+                }
+            }
+#endif
+
+            if (best_p < 0) {
+                tree->is_leaf[t] = 1;
+                { std::vector<int> tmp; tmp.swap(samples); }
+                continue;
+            }
+
+            // ── Record split & route ─────────────────────────────────────────
+            tree->is_leaf[t]         = 0;
+            tree->split_hyp_idx[t]   = best_p;
+            tree->split_threshold[t] = best_thr;
+            tree->split_gain[t]      = best_gain;
+
+            int t_left  = 2 * t + 1;
+            int t_right = 2 * t + 2;
+            const float* Z_best = Z_sub + (size_t)best_p * Ns;
+            node_samples[t_left ].reserve(n_in / 2 + 8);
+            node_samples[t_right].reserve(n_in / 2 + 8);
+            for (int idx : samples) {
+                if (Z_best[idx] < best_thr) node_samples[t_left ].push_back(idx);
+                else                        node_samples[t_right].push_back(idx);
+            }
+            { std::vector<int> tmp; tmp.swap(samples); }
+        }
+    }
+    return tree;
+}
 
 extern "C" {
 
@@ -532,6 +839,7 @@ void* bfstree_build(
     tree->split_threshold.assign(total_nodes, 0.0f);
     tree->leaf_values.assign((size_t)total_nodes * K, 0.0f);
     tree->is_leaf.assign(total_nodes, 1);
+    tree->split_gain.assign(total_nodes, 0.0f);
 
     // Each node owns its sample index list; routing moves indices to children.
     std::vector<std::vector<int>> node_samples(total_nodes);
@@ -703,6 +1011,7 @@ void* bfstree_build(
             tree->is_leaf[t]         = 0;
             tree->split_hyp_idx[t]   = best_p;
             tree->split_threshold[t] = best_thr;
+            tree->split_gain[t]      = best_gain;
 
             int t_left  = 2 * t + 1;
             int t_right = 2 * t + 2;
@@ -830,8 +1139,9 @@ void* bfstree_from_arrays(
 
 // ── Pool Lifecycle ───────────────────────────────────────────────────────────
 
-void* pool_create(int D, int max_size) {
-    return static_cast<void*>(new HypForgePool(D, max_size));
+void* pool_create(int D, int max_size, int evolve_mode) {
+    auto* pool = new HypForgePool(D, max_size);
+    return static_cast<void*>(pool);
 }
 
 void pool_free(void* handle) {
@@ -889,6 +1199,18 @@ void pool_update_use_counts(void* handle, const int* split_indices, int n_nodes)
     }
 }
 
+void pool_set_options(
+    void* handle,
+    int op_mode, int crossover_top_k, int elitism_k, int alps_mode, int map_elites_slots
+) {
+    auto* pool = static_cast<HypForgePool*>(handle);
+    pool->op_mode           = op_mode;
+    pool->crossover_top_k   = crossover_top_k;
+    pool->elitism_k         = elitism_k;
+    pool->alps_mode         = alps_mode;
+    pool->map_elites_slots  = map_elites_slots;
+}
+
 void pool_export(
     void* handle,
     int* types,
@@ -921,7 +1243,7 @@ void pool_export(
         scores[p] = h.score;
         is_base[p] = h.is_base ? 1 : 0;
         
-        if (h.type < 3) {
+        if (h.type < 2) {
             std::memcpy(weights + p * D, h.w.data(), D * sizeof(float));
         } else {
             std::memset(weights + p * D, 0, D * sizeof(float));
@@ -960,13 +1282,130 @@ void* pool_import(
         h.score = scores[p];
         h.is_base = is_base[p] != 0;
         
-        if (h.type < 3) {
+        if (h.type < 2) {
             h.w.assign(weights + p * D, weights + (p + 1) * D);
         }
         h.update_complexity(pool->pop);
         pool->pop.push_back(std::move(h));
     }
     return static_cast<void*>(pool);
+}
+
+// ── Integrated: evolve + build + predict in one C++ call ─────────────────────
+//
+// Replaces the Python sequence:
+//   pool.evolve() → get_caches_and_thresholds() → bfstree_build() →
+//   tree.predict() → update_use_counts()
+//
+// Benefits:
+//   • Z_full [P×N] never allocated in Python (saves ~175 MB per round)
+//   • Prediction uses full_cache directly, avoiding a second Z_full copy
+//   • use_count update from actual tree splits (not deferred)
+//
+// Returns a BFSTree handle (same ownership semantics as bfstree_build).
+void* pool_build_tree(
+    void*  pool_handle,
+    const float* X,          // [N, D]
+    const float* G_full,     // [N, K]
+    const float* H_full,     // [N, K]
+    int N, int K,
+    const int* evolve_sub,   int Ns_evolve,
+    const int* tree_sub,     int Ns_tree,
+    int D_num, int max_depth,
+    float reg_lambda, float eta_penalty,
+    int do_evolve,           // 1 = run evolve, 0 = skip (reuse last state)
+    float* out_pred          // [N, K], caller allocs, caller zero-inits
+) {
+    auto* pool = static_cast<HypForgePool*>(pool_handle);
+
+    // ── 1. Optionally evolve pool ─────────────────────────────────────────────
+    if (do_evolve) {
+        pool->evolve(X, G_full, H_full, evolve_sub,
+                     N, Ns_evolve, K, D_num, reg_lambda, eta_penalty);
+    }
+
+    int P = (int)pool->pop.size();
+    if (P == 0) return nullptr;
+
+    // ── 2. Build Z_sub [P, Ns_tree] from full_cache using persistent buffer ───
+    //    Reusing pool->Z_buf_ / G_buf_ / H_buf_ avoids ~30-50 MB malloc per round.
+    size_t z_need = (size_t)P * Ns_tree;
+    size_t gh_need = (size_t)Ns_tree * K;
+    if (pool->Z_buf_.size() < z_need)  pool->Z_buf_.resize(z_need);
+    if (pool->G_buf_.size() < gh_need) pool->G_buf_.resize(gh_need);
+    if (pool->H_buf_.size() < gh_need) pool->H_buf_.resize(gh_need);
+
+    float* Z_sub = pool->Z_buf_.data();
+    float* G_sub = pool->G_buf_.data();
+    float* H_sub = pool->H_buf_.data();
+
+    for (int p = 0; p < P; p++) {
+        const float* fc = pool->pop[p].full_cache.data();
+        float* Zp = Z_sub + (size_t)p * Ns_tree;
+        for (int j = 0; j < Ns_tree; j++) Zp[j] = fc[tree_sub[j]];
+    }
+
+    // ── 3. Subsample G, H for tree build ─────────────────────────────────────
+    for (int j = 0; j < Ns_tree; j++) {
+        int idx = tree_sub[j];
+        std::memcpy(G_sub + (size_t)j * K, G_full + (size_t)idx * K, K * sizeof(float));
+        std::memcpy(H_sub + (size_t)j * K, H_full + (size_t)idx * K, K * sizeof(float));
+    }
+
+    // ── 4. Build BFS tree using 255-bin histogram splits ─────────────────────
+    //    bfs_build_hist uses pool->pop[p].bin_min/bin_max for uniform binning.
+    //    Split search cost: O(Ns + 255*K) vs old O(9*Ns*K) ≈ 78× faster at K=19.
+    BFSTree* tree = bfs_build_hist(
+        pool,
+        Z_sub, G_sub, H_sub,
+        P, Ns_tree, K,
+        max_depth, 20, 10, reg_lambda
+    );
+
+    // ── 5. Update use_counts from actual tree splits ─────────────────────────
+    {
+        int n_nodes = tree->total_nodes;
+        for (int p = 0; p < P; p++) pool->pop[p].rounds_since_last_use++;
+        for (int t = 0; t < n_nodes; t++) {
+            int idx = tree->split_hyp_idx[t];
+            if (idx >= 0 && idx < P) {
+                pool->pop[idx].use_count++;
+                pool->pop[idx].rounds_since_last_use = 0;
+            }
+        }
+    }
+
+    // ── 6. Predict on full N using full_cache — no Z_full allocation ──────────
+    // Walk each sample through tree routing; full_cache[p][i] replaces Z[p*N+i].
+    {
+        std::vector<int> node_assign(N, 0);
+        int max_d = tree->max_depth;
+
+        for (int depth = 0; depth < max_d; depth++) {
+            int n_nodes = 1 << depth;
+            int base    = n_nodes - 1;
+            for (int local = 0; local < n_nodes; local++) {
+                int t = base + local;
+                if (tree->is_leaf[t]) continue;
+                int   p      = tree->split_hyp_idx[t];
+                float thr    = tree->split_threshold[t];
+                const float* fc = pool->pop[p].full_cache.data();
+                int t_left = 2 * t + 1, t_right = 2 * t + 2;
+                for (int i = 0; i < N; i++) {
+                    if (node_assign[i] == t)
+                        node_assign[i] = (fc[i] < thr) ? t_left : t_right;
+                }
+            }
+        }
+
+        for (int i = 0; i < N; i++) {
+            const float* lv = tree->leaf_values.data() + (size_t)node_assign[i] * K;
+            float* oi = out_pred + (size_t)i * K;
+            for (int k = 0; k < K; k++) oi[k] = lv[k];
+        }
+    }
+
+    return static_cast<void*>(tree);
 }
 
 } // extern "C"

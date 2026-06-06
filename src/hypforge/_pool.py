@@ -11,9 +11,15 @@ def _get_pool_lib():
     if _pool_configured:
         return lib
         
-    lib.pool_create.argtypes = [ctypes.c_int, ctypes.c_int]
+    lib.pool_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]  # D, max_size, evolve_mode
     lib.pool_create.restype = ctypes.c_void_p
-    
+
+    lib.pool_set_options.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # op_mode, crossover_top_k, elitism_k, alps_mode, map_elites_slots
+    ]
+    lib.pool_set_options.restype = None
+
     lib.pool_free.argtypes = [ctypes.c_void_p]
     lib.pool_free.restype = None
     
@@ -53,7 +59,22 @@ def _get_pool_lib():
         ctypes.c_int
     ]
     lib.pool_update_use_counts.restype = None
-    
+
+    lib.pool_build_tree.argtypes = [
+        ctypes.c_void_p,                          # pool_handle
+        ctypes.POINTER(ctypes.c_float),           # X [N, D]
+        ctypes.POINTER(ctypes.c_float),           # G [N, K]
+        ctypes.POINTER(ctypes.c_float),           # H [N, K]
+        ctypes.c_int, ctypes.c_int,               # N, K
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,  # evolve_sub, Ns_evolve
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,  # tree_sub, Ns_tree
+        ctypes.c_int, ctypes.c_int,               # D_num, max_depth
+        ctypes.c_float, ctypes.c_float,           # reg_lambda, eta_penalty
+        ctypes.c_int,                             # do_evolve
+        ctypes.POINTER(ctypes.c_float),           # out_pred [N, K]
+    ]
+    lib.pool_build_tree.restype = ctypes.c_void_p
+
     lib.pool_export.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_int),      # types
@@ -151,19 +172,15 @@ class Hypothesis:
             w_t = torch.as_tensor(w, dtype=X.dtype, device=X.device)
             if self.hyp_type == "linear":
                 return X @ w_t
-            elif self.hyp_type == "square":
-                return (X @ w_t) ** 2
-            elif self.hyp_type == "abs":
-                return (X @ w_t).abs()
+            elif self.hyp_type == "leaky_relu":
+                z = X @ w_t; return torch.where(z > 0, z, 0.01 * z)
             elif self.hyp_type == "product":
                 return self.h1.eval(X) * self.h2.eval(X)
         else:
             if self.hyp_type == "linear":
                 return X @ w
-            elif self.hyp_type == "square":
-                return (X @ w) ** 2
-            elif self.hyp_type == "abs":
-                return np.abs(X @ w)
+            elif self.hyp_type == "leaky_relu":
+                z = X @ w; return np.where(z > 0, z, 0.01 * z)
             elif self.hyp_type == "product":
                 return self.h1.eval(X) * self.h2.eval(X)
         raise ValueError(f"Unknown hyp_type: {self.hyp_type}")
@@ -178,11 +195,31 @@ class Hypothesis:
 
 
 class HypForgePool:
-    def __init__(self, D, max_size=500, dev="cpu"):
+    OP_MODES          = {"all": 0, "linear_only": 1, "lrelu_only": 2}
+    TYPE_NAMES        = {0: "linear", 1: "leaky_relu", 2: "product"}
+
+    def __init__(self, D, max_size=500, dev="cpu",
+                 op_mode="all", crossover_top_k=6,
+                 elitism_k=0, alps_mode=False,
+                 map_elites_slots=0):
         self.D = D
         self.max_size = max_size
         lib = _get_pool_lib()
-        self._handle = lib.pool_create(D, max_size)
+
+        def _resolve(val, mapping):
+            return mapping.get(val, val) if isinstance(val, str) else int(val)
+
+        # evolve_mode is hardcoded to 1 (crossover)
+        self._handle = lib.pool_create(D, max_size, 1)
+
+        lib.pool_set_options(
+            self._handle,
+            _resolve(op_mode,       self.OP_MODES),
+            int(crossover_top_k),
+            int(elitism_k),
+            int(alps_mode),
+            int(map_elites_slots),
+        )
 
     def evolve(self, X_full, G_full, H_full, sub_indices, D_num, reg_lambda=1.0, eta_penalty=0.002):
         import ctypes
@@ -243,6 +280,51 @@ class HypForgePool:
             len(split_indices)
         )
 
+    def build_tree(self, X_full, G_full, H_full,
+                   evolve_sub, tree_sub,
+                   D_num, max_depth,
+                   reg_lambda=1.0, eta_penalty=0.002,
+                   do_evolve=True):
+        """Evolve pool + build BFS tree + predict on all N — no Z matrix in Python.
+
+        Returns (BFSTree, pred_np) where pred_np is float32 [N, K].
+        """
+        import ctypes
+        from ._tree import BFSTree, _get_lib as _get_tree_lib
+
+        lib = _get_pool_lib()
+
+        X         = np.ascontiguousarray(X_full,    dtype=np.float32)
+        G         = np.ascontiguousarray(G_full,    dtype=np.float32)
+        H         = np.ascontiguousarray(H_full,    dtype=np.float32)
+        ev_sub    = np.ascontiguousarray(evolve_sub, dtype=np.int32)
+        tr_sub    = np.ascontiguousarray(tree_sub,   dtype=np.int32)
+
+        def _pf(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        def _pi(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+
+        N        = X.shape[0]
+        K        = G.shape[1]
+        out_pred = np.zeros((N, K), dtype=np.float32)
+
+        tree_handle = lib.pool_build_tree(
+            self._handle,
+            _pf(X), _pf(G), _pf(H),
+            N, K,
+            _pi(ev_sub), len(ev_sub),
+            _pi(tr_sub), len(tr_sub),
+            D_num, max_depth,
+            ctypes.c_float(reg_lambda),
+            ctypes.c_float(eta_penalty),
+            ctypes.c_int(1 if do_evolve else 0),
+            _pf(out_pred),
+        )
+
+        tree    = BFSTree.__new__(BFSTree)
+        tree._handle = tree_handle
+        tree.K       = _get_tree_lib().bfstree_get_K(tree_handle)
+        return tree, out_pred
+
     def export_pop(self):
         import ctypes
         lib = _get_pool_lib()
@@ -283,13 +365,13 @@ class HypForgePool:
         )
         
         py_pop = []
-        type_names = ["linear", "square", "abs", "product"]
+        type_names = {0: "linear", 1: "leaky_relu", 2: "product"}
         for p in range(P):
-            t_name = type_names[types[p]]
+            t_name = type_names.get(types[p], f"type_{types[p]}")
             w = None
             h1 = None
             h2 = None
-            if types[p] < 3:
+            if types[p] != 2:
                 w = weights[p * self.D : (p + 1) * self.D].copy()
             else:
                 h1 = py_pop[h1_indices[p]]
@@ -311,7 +393,7 @@ class HypForgePool:
     def import_pop(self, py_pop):
         import ctypes
         P = len(py_pop)
-        type_map = {"linear": 0, "square": 1, "abs": 2, "product": 3}
+        type_map = {"linear": 0, "leaky_relu": 1, "product": 2}
         
         types = np.zeros(P, dtype=np.int32)
         weights = np.zeros(P * self.D, dtype=np.float32)
