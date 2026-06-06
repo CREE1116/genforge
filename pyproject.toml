@@ -1,15 +1,15 @@
 [build-system]
-requires = ["setuptools>=68", "Cython>=3.0", "numpy>=1.24"]
+requires = ["setuptools>=68", "numpy>=1.24"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hypforge"
 version = "0.1.0"
-description = "Hypothesis Pool Evolution for Oblique GBDT — GPU-accelerated, C++ tree backend"
+description = "Hypothesis Pool Evolution for Oblique GBDT — high-performance C++ tree backend"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
-keywords = ["gradient-boosting", "oblique-trees", "machine-learning", "gpu"]
+keywords = ["gradient-boosting", "oblique-trees", "machine-learning"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -21,13 +21,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.0",
     "numpy>=1.24",
     "scikit-learn>=1.3",
 ]
 
 [project.optional-dependencies]
-dev  = ["pytest>=8.0", "pytest-cov", "pandas", "matplotlib", "Cython>=3.0"]
+dev  = ["pytest>=8.0", "pytest-cov", "pandas", "matplotlib"]
 full = ["pandas", "matplotlib"]
 
 [project.urls]

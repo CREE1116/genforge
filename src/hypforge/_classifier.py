@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
-from ._pool import Hypothesis, HypForgePool, _split_gain_fitness
+from ._pool import Hypothesis, HypForgePool
 from ._tree import BFSTree
 
 
@@ -160,8 +159,6 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             X = X.values
         X = np.asarray(X, dtype=np.float32)
 
-        dev   = _detect_device(self.device)
-        X_t   = torch.tensor(X, dtype=torch.float32, device=dev)
         lp    = np.array(self.F_init_, dtype=np.float32)
         Fsc   = np.tile(lp, (X.shape[0], 1))
 
@@ -175,7 +172,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             for h in snap:
                 h_id = id(h)
                 if h_id not in eval_cache:
-                    eval_cache[h_id] = h.eval(X_t).cpu().numpy()
+                    eval_cache[h_id] = h.eval(X)
                 Z_rows.append(eval_cache[h_id])
             Z_pred = np.ascontiguousarray(np.stack(Z_rows))
             Fsc += self.learning_rate * tree.predict(Z_pred)
@@ -203,7 +200,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         for h in self._pool_hypotheses_:
             if h.hyp_type not in ("linear", "square", "abs") or h.w is None:
                 continue
-            w_abs  = np.abs(h.w.cpu().numpy()).astype(np.float64)
+            w_abs  = np.abs(h.w).astype(np.float64)
             weight = float(h.use_count) if h.use_count > 0 else max(h.fitness, 0.0)
             imp   += w_abs * weight
         total = imp.sum()
@@ -272,7 +269,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         mask = np.zeros(self.n_features_in_, dtype=bool)
         for h in self._pool_hypotheses_:
             if h.hyp_type in ("linear", "square", "abs") and h.w is not None:
-                mask |= (np.abs(h.w.cpu().numpy()) > threshold)
+                mask |= (np.abs(h.w) > threshold)
         return mask
 
     def get_used_features(
@@ -368,14 +365,11 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             X = X.values
         X = np.asarray(X, dtype=np.float32)
 
-        dev = _detect_device(self.device)
-        X_t = torch.tensor(X, dtype=torch.float32, device=dev)
-
         hyps = self._pool_hypotheses_
         if top_k is not None:
             hyps = sorted(hyps, key=lambda h: h.fitness, reverse=True)[:top_k]
 
-        return np.stack([h.eval(X_t).cpu().numpy() for h in hyps], axis=1).astype(np.float32)
+        return np.stack([h.eval(X) for h in hyps], axis=1).astype(np.float32)
 
     def get_hypothesis_summary(self) -> "pd.DataFrame":
         """
@@ -398,7 +392,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         for h in self._pool_hypotheses_:
             top_feats = ""
             if h.hyp_type in ("linear", "square", "abs") and h.w is not None:
-                w_abs = np.abs(h.w.cpu().numpy())
+                w_abs = np.abs(h.w)
                 top_k = min(5, int((w_abs > 1e-3).sum()))
                 if top_k > 0:
                     top_idx  = np.argsort(w_abs)[::-1][:top_k]
@@ -408,7 +402,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             elif h.hyp_type == "product":
                 def _feat_str(hh):
                     if hh.hyp_type in ("linear", "square", "abs") and hh.w is not None:
-                        w_abs = np.abs(hh.w.cpu().numpy())
+                        w_abs = np.abs(hh.w)
                         idx = int(w_abs.argmax())
                         return f"{names[idx]}({w_abs[idx]:.3f})"
                     return "?"
@@ -457,14 +451,6 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         >>> clf2 = HypForgeClassifier.load("hypforge_model.joblib")
         """
         import joblib
-        # Move hypothesis weights to CPU before pickling to avoid device mismatch on load
-        for h in self._pool_hypotheses_:
-            if h.w is not None:
-                h.w = h.w.cpu()
-            if h.h1 is not None and h.h1.w is not None:
-                h.h1.w = h.h1.w.cpu()
-            if h.h2 is not None and h.h2.w is not None:
-                h.h2.w = h.h2.w.cpu()
         joblib.dump(self, path, compress=3)
 
     @classmethod
@@ -500,37 +486,27 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         return D - len(cat_idx)
 
     def _fit_core(self, X, y, X_val, y_val, D_num):
-        dev  = _detect_device(self.device)
         N, D = X.shape
         K    = int(y.max()) + 1
         seed = self.random_state if self.random_state is not None else 42
 
         cnt  = np.bincount(y, minlength=K).astype(np.float32)
         cw   = N / (K * cnt.clip(min=1))
-        sw   = torch.tensor(cw[y], dtype=torch.float32, device=dev)
+        sw   = cw[y]
 
         lp   = np.log(cnt / N + 1e-8)
         lp  -= lp.mean()
         self.F_init_ = lp.tolist()
 
-        X_t  = torch.tensor(X, dtype=torch.float32, device=dev)
-        y_t  = torch.tensor(y, dtype=torch.long,    device=dev)
+        Fsc = np.tile(lp, (N, 1))
 
-        X_val_t = y_val_t = F_val = None
+        F_val = None
         if X_val is not None:
-            X_val_t = torch.tensor(X_val, dtype=torch.float32, device=dev)
-            y_val_t = torch.tensor(y_val, dtype=torch.long,    device=dev)
-            F_val   = torch.tensor(np.tile(lp, (X_val_t.shape[0], 1)), dtype=torch.float32, device=dev)
+            F_val = np.tile(lp, (X_val.shape[0], 1))
 
-        Fsc  = torch.tensor(np.tile(lp, (N, 1)), dtype=torch.float32, device=dev)
-        pool = HypForgePool(D, max_size=self.pool_size, dev=str(dev))
-        for h in pool.pop:
-            h.initialize_cache(X_t)
-        if X_val_t is not None:
-            for h in pool.pop:
-                h.val_cache_cpu = h.eval(X_val_t).cpu().numpy()
+        pool = HypForgePool(D, max_size=self.pool_size)
 
-        rng             = torch.Generator(device="cpu").manual_seed(seed)
+        rng             = np.random.default_rng(seed)
         best_val_loss   = float("inf")
         best_trees      = []
         best_snaps      = []   # pool snapshots paired with best_trees
@@ -540,39 +516,31 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         self.pool_snaps_ = []  # per-tree pool snapshots (same order as trees_)
 
         for m in range(self.n_estimators):
-            for h in pool.pop:
-                h.rounds_since_last_use += 1
+            Fsh = Fsc - Fsc.max(axis=1, keepdims=True)
+            Pm  = np.exp(Fsh); Pm /= Pm.sum(axis=1, keepdims=True)
 
-            Fsh = Fsc - Fsc.max(1, keepdim=True).values
-            Pm  = Fsh.exp(); Pm /= Pm.sum(1, keepdim=True)
-
-            oh  = torch.zeros(N, K, device=dev).scatter_(1, y_t.unsqueeze(1), 1.0)
-            G_w = sw.unsqueeze(1) * (Pm - oh)
-            H_w = sw.unsqueeze(1) * Pm * (1.0 - Pm)
+            oh  = np.zeros((N, K), dtype=np.float32)
+            oh[np.arange(N), y] = 1.0
+            G_w = sw[:, None] * (Pm - oh)
+            H_w = sw[:, None] * Pm * (1.0 - Pm)
 
             if m % self.evolve_every == 0:
-                sub = torch.randperm(N, generator=rng)[:min(N, 10000)].to(dev)
-                pool.evolve(X_t, G_w, H_w, sub, D_num, self.reg_lambda)
-                if X_val_t is not None:
-                    for h in pool.pop:
-                        if h.val_cache_cpu is None:
-                            h.val_cache_cpu = h.eval(X_val_t).cpu().numpy()
+                sub = rng.choice(N, size=min(N, 10000), replace=False).astype(np.int32)
+                pool.evolve(X, G_w, H_w, sub, D_num, self.reg_lambda)
 
             # ── build tree (C++) ─────────────────────────────────────────────
-            Z_full_np     = np.stack([h.full_cache_cpu for h in pool.pop])        # [P, N]
-            thresholds_np = np.stack([h.thresholds_cpu for h in pool.pop], axis=1) # [9, P]
+            Z_full_np, thresholds_np = pool.get_caches_and_thresholds(N)
 
             if self.subsample < 1.0:
                 sub_size     = min(N, max(5000, int(N * self.subsample)))
-                tree_sub     = torch.randperm(N, generator=rng)[:sub_size]
-                tree_sub_cpu = tree_sub.numpy()
-                Z_tree_np    = np.ascontiguousarray(Z_full_np[:, tree_sub_cpu])
-                G_tree_np    = G_w[tree_sub.to(dev)].cpu().numpy()
-                H_tree_np    = H_w[tree_sub.to(dev)].cpu().numpy()
+                tree_sub     = rng.choice(N, size=sub_size, replace=False).astype(np.int32)
+                Z_tree_np    = np.ascontiguousarray(Z_full_np[:, tree_sub])
+                G_tree_np    = G_w[tree_sub]
+                H_tree_np    = H_w[tree_sub]
             else:
                 Z_tree_np = Z_full_np
-                G_tree_np = G_w.cpu().numpy()
-                H_tree_np = H_w.cpu().numpy()
+                G_tree_np = G_w
+                H_tree_np = H_w
 
             tree = BFSTree()
             tree.build(
@@ -582,29 +550,25 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             )
 
             pred_np = tree.predict(Z_full_np)
-            Fsc     = Fsc + self.learning_rate * torch.tensor(pred_np, dtype=torch.float32, device=dev)
+            Fsc     = Fsc + self.learning_rate * pred_np
             self.trees_.append(tree)
-            self.pool_snaps_.append(list(pool.pop))  # snapshot for this tree's index space
+            self.pool_snaps_.append(pool.pop)  # snapshot for this tree's index space
 
             # ── update use_count from C++ split index array ───────────────────
             split_idx = tree.get_split_hyp_indices()
-            P_cur     = len(pool.pop)
-            for idx in split_idx:
-                if 0 <= idx < P_cur:
-                    pool.pop[idx].use_count += 1
-                    pool.pop[idx].rounds_since_last_use = 0
+            pool.update_use_counts(split_idx)
 
             # ── validation & early stopping ──────────────────────────────────
             val_str = ""
-            if X_val_t is not None:
-                Z_val_np    = np.ascontiguousarray(np.stack([h.val_cache_cpu for h in pool.pop]))
+            if X_val is not None:
+                Z_val_np    = pool.eval(X_val)
                 pred_val_np = tree.predict(Z_val_np)
-                F_val       = F_val + self.learning_rate * torch.tensor(pred_val_np, dtype=torch.float32, device=dev)
+                F_val       = F_val + self.learning_rate * pred_val_np
 
-                Fv_sh    = F_val - F_val.max(1, keepdim=True).values
-                P_val    = Fv_sh.exp(); P_val /= P_val.sum(1, keepdim=True)
-                val_loss = -torch.log(P_val.gather(1, y_val_t.unsqueeze(1)).clamp(1e-8)).mean().item()
-                val_acc  = (P_val.argmax(1) == y_val_t).float().mean().item()
+                Fv_sh    = F_val - F_val.max(axis=1, keepdims=True)
+                P_val    = np.exp(Fv_sh); P_val /= P_val.sum(axis=1, keepdims=True)
+                val_loss = -np.log(P_val[np.arange(len(y_val)), y_val].clip(1e-8)).mean()
+                val_acc  = (P_val.argmax(axis=1) == y_val).mean()
                 val_str  = f" | ValLoss={val_loss:.4f} | ValAcc={val_acc:.4f}"
 
                 if val_loss < best_val_loss:
@@ -612,21 +576,22 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                     no_improv      = 0
                     best_trees     = list(self.trees_)
                     best_snaps     = list(self.pool_snaps_)   # per-tree snapshots
-                    best_pool_snap = list(pool.pop)            # final pool at best round
+                    best_pool_snap = pool.pop            # final pool at best round
                 else:
                     no_improv += 1
 
             if self.verbose:
-                ll  = -torch.log(Pm.gather(1, y_t.unsqueeze(1)).clamp(1e-8)).mean()
-                acc = (Pm.argmax(1) == y_t).float().mean()
-                best_ucb = pool.pop[0].score if pool.pop else 0.0
-                best_mu  = pool.pop[0].mu_fitness if pool.pop else 0.0
+                ll  = -np.log(Pm[np.arange(N), y].clip(1e-8)).mean()
+                acc = (Pm.argmax(axis=1) == y).mean()
+                current_pop = pool.pop
+                best_ucb = current_pop[0].score if current_pop else 0.0
+                best_mu  = current_pop[0].mu_fitness if current_pop else 0.0
                 print(
-                    f"  [HypForge] Round {m+1:3d} | Loss={ll.item():.4f} | Acc={acc.item():.4f} | "
-                    f"UCB={best_ucb:.4f} | μ={best_mu:.4f} | Pop={len(pool.pop)}{val_str}"
+                    f"  [HypForge] Round {m+1:3d} | Loss={ll:.4f} | Acc={acc:.4f} | "
+                    f"UCB={best_ucb:.4f} | μ={best_mu:.4f} | Pop={len(current_pop)}{val_str}"
                 )
 
-            if X_val_t is not None and self.early_stopping_rounds is not None:
+            if X_val is not None and self.early_stopping_rounds is not None:
                 if no_improv >= self.early_stopping_rounds:
                     if self.verbose:
                         print(f"  [HypForge] Early stopping at round {m+1} (best ValLoss={best_val_loss:.4f})")
@@ -635,6 +600,6 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                     pool.pop          = best_pool_snap
                     break
 
-        self._pool_hypotheses_ = best_pool_snap if best_pool_snap else list(pool.pop)
+        self._pool_hypotheses_ = best_pool_snap if best_pool_snap else pool.pop
         for h in self._pool_hypotheses_:
             h.clear_runtime_caches()
