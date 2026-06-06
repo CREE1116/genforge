@@ -79,8 +79,8 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         map_elites_slots: int = 100,
         family_max_size: int = 30,
         meta_evolution: bool = True,
-        family_lambda: float = 0.1,
-        breeding_beta: float = 0.3,
+        family_lambda: float = 0.1,  # Credit lambda: weight of ancestor credit in UCB scoring
+        breeding_beta: float = 0.3,  # Credit gamma: discount decay factor for ancestor credit propagation
     ):
         self.n_estimators          = n_estimators
         self.learning_rate         = learning_rate
@@ -423,17 +423,18 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                 top_feats = f"[{_feat_str(h.h1)}] × [{_feat_str(h.h2)}]"
 
             rows.append({
-                "type":           h.hyp_type,
-                "fitness":        round(h.fitness, 6),
-                "use_count":      h.use_count,
-                "complexity":     h.complexity(),
-                "top_features":   top_feats,
-                "family_id":      h.family_id,
-                "birth_round":    h.birth_round,
-                "parent1":        h.parent1,
-                "parent2":        h.parent2,
-                "family_fitness": round(h.family_fitness, 6),
-                "breeding_value": round(h.breeding_value, 6),
+                "type":            h.hyp_type,
+                "fitness":         round(h.fitness, 6),
+                "use_count":       h.use_count,
+                "complexity":      h.complexity(),
+                "top_features":    top_feats,
+                "family_id":       h.family_id,
+                "birth_round":     h.birth_round,
+                "parent1":         h.parent1,
+                "parent2":         h.parent2,
+                "family_fitness":  round(h.family_fitness, 6),
+                "breeding_value":  round(h.breeding_value, 6),
+                "ancestor_credit": round(h.ancestor_credit, 6),
             })
 
         return pd.DataFrame(rows).sort_values("fitness", ascending=False).reset_index(drop=True)

@@ -269,6 +269,7 @@ def test_genealogical_evolution(binary_data):
         assert hasattr(h, "family_id")
         assert hasattr(h, "family_fitness")
         assert hasattr(h, "breeding_value")
+        assert hasattr(h, "ancestor_credit")
         assert h.family_id >= 0
 
     # Check that summary dataframe includes new columns
@@ -279,6 +280,7 @@ def test_genealogical_evolution(binary_data):
     assert "parent2" in df.columns
     assert "family_fitness" in df.columns
     assert "breeding_value" in df.columns
+    assert "ancestor_credit" in df.columns
 
 
 def test_meta_evolution_telemetry(binary_data):
@@ -307,3 +309,23 @@ def test_meta_evolution_telemetry(binary_data):
     births, survivors = pool.get_transition_matrix()
     assert births.shape == (3, 3)
     assert survivors.shape == (3, 3)
+
+
+def test_ancestor_credit_backpropagation(binary_data):
+    X, y = binary_data
+    clf = HypForgeClassifier(
+        n_estimators=30,
+        max_depth=3,
+        pool_size=50,
+        meta_evolution=True,
+        family_lambda=0.5,
+        breeding_beta=0.8,
+        random_state=42
+    )
+    clf.fit(X, y)
+    
+    pool = clf.get_hypothesis_pool()
+    # Check that ancestor_credit is populated and behaves correctly
+    df = clf.get_hypothesis_summary()
+    assert "ancestor_credit" in df.columns
+    assert df["ancestor_credit"].max() >= 0.0

@@ -64,6 +64,7 @@ struct Hypothesis {
     int family_id = -1;
     float family_fitness = 0.0f;
     float breeding_value = 0.0f;
+    float ancestor_credit = 0.0f;
 
     // caches
     std::vector<float> full_cache; // size N
@@ -208,57 +209,17 @@ public:
         }
     }
 
+    void propagate_credit(int gid, float gain, float gamma, int depth) {
+        if (gid < 0 || gid >= (int)history.size()) return;
+        history[gid].ancestor_credit += gain * std::pow(gamma, depth);
+        int p1 = history[gid].parent1;
+        int p2 = history[gid].parent2;
+        if (p1 >= 0) propagate_credit(p1, gain, gamma, depth + 1);
+        if (p2 >= 0) propagate_credit(p2, gain, gamma, depth + 1);
+    }
+
     void update_genealogy_stats() {
-        int H = history.size();
-        if (H == 0) return;
-
-        std::vector<std::unordered_set<int>> descendants(H);
-        std::vector<std::vector<float>> child_fitnesses(H);
-
-        // Compute descendants in reverse topological order (since i > parent)
-        for (int i = H - 1; i >= 0; i--) {
-            float fit = history[i].fitness;
-            int p1 = history[i].parent1;
-            int p2 = history[i].parent2;
-
-            if (p1 >= 0 && p1 < H) {
-                child_fitnesses[p1].push_back(fit);
-                descendants[p1].insert(i);
-                for (int desc : descendants[i]) {
-                    descendants[p1].insert(desc);
-                }
-            }
-            if (p2 >= 0 && p2 < H) {
-                child_fitnesses[p2].push_back(fit);
-                descendants[p2].insert(i);
-                for (int desc : descendants[i]) {
-                    descendants[p2].insert(desc);
-                }
-            }
-        }
-
-        // Calculate stats
-        for (int i = 0; i < H; i++) {
-            if (!descendants[i].empty()) {
-                double sum_fit = 0.0;
-                for (int desc : descendants[i]) {
-                    sum_fit += history[desc].fitness;
-                }
-                history[i].family_fitness = (float)(sum_fit / descendants[i].size());
-            } else {
-                history[i].family_fitness = history[i].fitness;
-            }
-
-            if (!child_fitnesses[i].empty()) {
-                double sum_fit = 0.0;
-                for (float f : child_fitnesses[i]) {
-                    sum_fit += f;
-                }
-                history[i].breeding_value = (float)(sum_fit / child_fitnesses[i].size());
-            } else {
-                history[i].breeding_value = history[i].fitness;
-            }
-        }
+        // Obsolete: family fitness is now replaced by credit propagation.
     }
 
     void initialize_cache(Hypothesis& h, const float* X, const std::vector<int>& rand_indices) {
@@ -428,10 +389,11 @@ public:
         for (auto& h : pop) {
             int gid = h.global_id;
             if (gid >= 0 && gid < (int)history.size()) {
-                h.family_fitness = history[gid].family_fitness;
-                h.breeding_value = history[gid].breeding_value;
+                h.ancestor_credit = history[gid].ancestor_credit;
+                h.family_fitness = history[gid].ancestor_credit;
+                h.breeding_value = history[gid].ancestor_credit;
             }
-            h.score = h.ucb_score(eta_penalty) + family_lambda * h.family_fitness;
+            h.score = h.ucb_score(eta_penalty) + family_lambda * h.ancestor_credit;
         }
 
         std::sort(pop.begin(), pop.end(), [](const Hypothesis& a, const Hypothesis& b) {
@@ -480,7 +442,7 @@ public:
             };
             std::vector<ParentInfo> parents;
             for (int p = 0; p < (int)pop.size(); p++) {
-                float parent_score = pop[p].fitness + breeding_beta * pop[p].breeding_value;
+                float parent_score = pop[p].fitness + pop[p].ancestor_credit;
                 parents.push_back({p, parent_score});
             }
             std::sort(parents.begin(), parents.end(), [](const ParentInfo& a, const ParentInfo& b) {
@@ -505,9 +467,7 @@ public:
                         int type_j = pop[idx_j].type;
                         if (type_i >= 2 || type_j >= 2) continue; // skip product
 
-                        float birth = cx_births[type_i][type_j];
-                        float surv = cx_survivors[type_i][type_j];
-                        float weight = (surv + 1.0f) / (birth + 2.0f);
+                        float weight = 1.0f;
                         possible_pairs.push_back({idx_i, idx_j, weight});
                         total_weight += weight;
                     }
@@ -1529,7 +1489,7 @@ void pool_export(
         parent2[p] = h.parent2;
         birth_round[p] = h.birth_round;
         family_id[p] = h.family_id;
-        family_fitness[p] = h.family_fitness;
+        family_fitness[p] = h.ancestor_credit;
         breeding_value[p] = h.breeding_value;
         
         if (h.type < 2) {
@@ -1583,6 +1543,7 @@ void* pool_import(
         h.family_id = family_id[p];
         h.family_fitness = family_fitness[p];
         h.breeding_value = breeding_value[p];
+        h.ancestor_credit = family_fitness[p];
         
         if (h.type < 2) {
             h.w.assign(weights + p * D, weights + (p + 1) * D);
@@ -1730,9 +1691,14 @@ void* pool_build_tree(
         pool->total_policy_rounds++;
     }
 
-    // ── 5. Update use_counts from actual tree splits ─────────────────────────
+    // ── 5. Update use_counts and propagate ancestor credit ───────────────────
     {
         int n_nodes = tree->total_nodes;
+        float gamma = pool->user_breeding_beta;
+        if (pool->enable_meta_evolution > 0 && !pool->policies.empty()) {
+            gamma = pool->policies[pool->active_policy_idx].breeding_beta;
+        }
+
         for (int p = 0; p < P; p++) {
             pool->pop[p].rounds_since_last_use++;
             int gid = pool->pop[p].global_id;
@@ -1749,6 +1715,13 @@ void* pool_build_tree(
                 if (gid >= 0 && gid < (int)pool->history.size()) {
                     pool->history[gid].use_count++;
                     pool->history[gid].rounds_since_last_use = 0;
+
+                    // Backpropagate split gains to ancestors (recursively starting from parents at depth 1)
+                    float split_gain_val = tree->split_gain[t];
+                    int p1 = pool->history[gid].parent1;
+                    int p2 = pool->history[gid].parent2;
+                    if (p1 >= 0) pool->propagate_credit(p1, split_gain_val, gamma, 1);
+                    if (p2 >= 0) pool->propagate_credit(p2, split_gain_val, gamma, 1);
                 }
             }
         }

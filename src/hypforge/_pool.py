@@ -173,6 +173,7 @@ class Hypothesis:
         self.family_id      = -1
         self.family_fitness = 0.0
         self.breeding_value = 0.0
+        self.ancestor_credit = 0.0
 
         # ── projection caches ─────────────────────────────────────────────
         self.cache          = None
@@ -451,6 +452,7 @@ class HypForgePool:
             h.family_id = int(family_id[p])
             h.family_fitness = float(family_fitness[p])
             h.breeding_value = float(breeding_value[p])
+            h.ancestor_credit = float(family_fitness[p])
             py_pop.append(h)
             
         return py_pop
@@ -505,7 +507,7 @@ class HypForgePool:
             parent2[p] = h.parent2
             birth_round[p] = h.birth_round
             family_id[p] = h.family_id
-            family_fitness[p] = h.family_fitness
+            family_fitness[p] = h.ancestor_credit
             breeding_value[p] = h.breeding_value
             
         def _ptr_i(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
