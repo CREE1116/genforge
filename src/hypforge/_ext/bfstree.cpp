@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <random>
 #include <unordered_set>
+#include <unordered_map>
 #ifdef _OPENMP
 #  include <omp.h>
 #endif
@@ -54,6 +55,15 @@ struct Hypothesis {
     float fitness = 0.0;
     float score = 0.0;
     bool is_base = false;
+
+    // genealogy / lineage stats
+    int global_id = -1;
+    int parent1 = -1;
+    int parent2 = -1;
+    int birth_round = 0;
+    int family_id = -1;
+    float family_fitness = 0.0f;
+    float breeding_value = 0.0f;
 
     // caches
     std::vector<float> full_cache; // size N
@@ -96,6 +106,17 @@ struct Hypothesis {
     }
 };
 
+struct EvolutionPolicy {
+    int crossover_top_k;
+    float family_lambda;
+    float breeding_beta;
+
+    // UCB bandit stats
+    int use_count = 0;
+    double sum_reward = 0.0;
+    double mean_reward = 0.0;
+};
+
 static std::vector<int> get_random_indices(int N, int size, unsigned int seed) {
     std::vector<int> idxs(N);
     std::iota(idxs.begin(), idxs.end(), 0);
@@ -132,6 +153,19 @@ public:
     std::vector<Hypothesis> pop;
     unsigned int seed = 42;
 
+    // Genealogy and Meta-Evolution fields
+    std::vector<Hypothesis> history;
+    float cx_births[3][3];
+    float cx_survivors[3][3];
+
+    std::vector<EvolutionPolicy> policies;
+    int active_policy_idx = 0;
+    int total_policy_rounds = 0;
+    int enable_meta_evolution = 1;
+    float user_family_lambda = 0.1f;
+    float user_breeding_beta = 0.3f;
+    int family_max_size = 30;
+
     // Persistent scratch buffers — allocated once, reused every round.
     // Avoids the cost of repeated 30-50 MB heap allocations per round.
     std::vector<float> Z_buf_;   // [P * Ns_tree] subsampled projections
@@ -139,6 +173,15 @@ public:
     std::vector<float> H_buf_;   // [Ns_tree * K]
 
     HypForgePool(int D, int max_size) : D(D), max_size(max_size) {
+        std::memset(cx_births, 0, sizeof(cx_births));
+        std::memset(cx_survivors, 0, sizeof(cx_survivors));
+
+        // Initialize candidate policies for Meta-Evolution
+        policies.push_back({6, 0.1f, 0.3f});
+        policies.push_back({3, 0.05f, 0.5f});
+        policies.push_back({10, 0.3f, 0.1f});
+        policies.push_back({4, 0.1f, 0.6f});
+
         // Initialize base hypotheses
         for (int j = 0; j < D; j++) {
             Hypothesis h;
@@ -146,8 +189,75 @@ public:
             h.w.assign(D, 0.0f);
             h.w[j] = 1.0f;
             h.is_base = true;
+            h.global_id = history.size();
+            h.parent1 = -1;
+            h.parent2 = -1;
+            h.birth_round = 0;
+            h.family_id = j; // Base hypotheses start their own families
             h.update_complexity(pop);
-            pop.push_back(h);
+            
+            // Save to history (clear caches first to save memory)
+            Hypothesis hist_h = h;
+            hist_h.full_cache.clear();
+            hist_h.full_cache.shrink_to_fit();
+            hist_h.thresholds.clear();
+            hist_h.thresholds.shrink_to_fit();
+            history.push_back(std::move(hist_h));
+
+            pop.push_back(std::move(h));
+        }
+    }
+
+    void update_genealogy_stats() {
+        int H = history.size();
+        if (H == 0) return;
+
+        std::vector<std::unordered_set<int>> descendants(H);
+        std::vector<std::vector<float>> child_fitnesses(H);
+
+        // Compute descendants in reverse topological order (since i > parent)
+        for (int i = H - 1; i >= 0; i--) {
+            float fit = history[i].fitness;
+            int p1 = history[i].parent1;
+            int p2 = history[i].parent2;
+
+            if (p1 >= 0 && p1 < H) {
+                child_fitnesses[p1].push_back(fit);
+                descendants[p1].insert(i);
+                for (int desc : descendants[i]) {
+                    descendants[p1].insert(desc);
+                }
+            }
+            if (p2 >= 0 && p2 < H) {
+                child_fitnesses[p2].push_back(fit);
+                descendants[p2].insert(i);
+                for (int desc : descendants[i]) {
+                    descendants[p2].insert(desc);
+                }
+            }
+        }
+
+        // Calculate stats
+        for (int i = 0; i < H; i++) {
+            if (!descendants[i].empty()) {
+                double sum_fit = 0.0;
+                for (int desc : descendants[i]) {
+                    sum_fit += history[desc].fitness;
+                }
+                history[i].family_fitness = (float)(sum_fit / descendants[i].size());
+            } else {
+                history[i].family_fitness = history[i].fitness;
+            }
+
+            if (!child_fitnesses[i].empty()) {
+                double sum_fit = 0.0;
+                for (float f : child_fitnesses[i]) {
+                    sum_fit += f;
+                }
+                history[i].breeding_value = (float)(sum_fit / child_fitnesses[i].size());
+            } else {
+                history[i].breeding_value = history[i].fitness;
+            }
         }
     }
 
@@ -231,7 +341,8 @@ public:
         int N_in, int Ns, int K,
         int D_num,
         float reg_lambda,
-        float eta_penalty = 0.002f
+        float eta_penalty = 0.002f,
+        int current_round = 0
     ) {
         this->N = N_in;
         std::vector<int> rand_indices = get_random_indices(N, std::min(N, 10000), seed++);
@@ -240,6 +351,11 @@ public:
                 initialize_cache(h, X, rand_indices);
             }
         }
+
+        // Active policy settings
+        float family_lambda = (enable_meta_evolution > 0 && !policies.empty()) ? policies[active_policy_idx].family_lambda : user_family_lambda;
+        float breeding_beta = (enable_meta_evolution > 0 && !policies.empty()) ? policies[active_policy_idx].breeding_beta : user_breeding_beta;
+        int cx_top_k = (enable_meta_evolution > 0 && !policies.empty()) ? policies[active_policy_idx].crossover_top_k : crossover_top_k;
 
         std::vector<float> G_tot(K, 0.0f), H_tot(K, 0.0f);
         for (int j = 0; j < Ns; j++) {
@@ -297,6 +413,27 @@ public:
             pop[p].observe_fitness(best_gains[p], eta_penalty);
         }
 
+        // Sync updates to history, update genealogy stats, and score pop
+        for (int p = 0; p < P; p++) {
+            int gid = pop[p].global_id;
+            if (gid >= 0 && gid < (int)history.size()) {
+                history[gid].fitness = pop[p].fitness;
+                history[gid].n_obs = pop[p].n_obs;
+                history[gid].mu_fitness = pop[p].mu_fitness;
+                history[gid].M2_fitness = pop[p].M2_fitness;
+                history[gid].score = pop[p].score;
+            }
+        }
+        update_genealogy_stats();
+        for (auto& h : pop) {
+            int gid = h.global_id;
+            if (gid >= 0 && gid < (int)history.size()) {
+                h.family_fitness = history[gid].family_fitness;
+                h.breeding_value = history[gid].breeding_value;
+            }
+            h.score = h.ucb_score(eta_penalty) + family_lambda * h.family_fitness;
+        }
+
         std::sort(pop.begin(), pop.end(), [](const Hypothesis& a, const Hypothesis& b) {
             return a.score > b.score;
         });
@@ -326,30 +463,93 @@ public:
                 Hypothesis c;
                 c.type = type;
                 c.w = w_k;
+                c.parent1 = -1;
+                c.parent2 = -1;
+                c.birth_round = current_round;
+                c.family_id = -1; // set on admission
                 c.update_complexity(pop);
                 raw_candidates.push_back(c);
             }
         }
 
-        // Crossover between top hypothesis pairs
+        // Crossover between top hypothesis pairs using Roulette Wheel Selection
         if ((int)pop.size() >= 2) {
-            std::mt19937 rng_cx(seed++);
-            std::uniform_real_distribution<float> alpha_dist(0.3f, 0.7f);
-            int n_top = std::min((int)pop.size(), crossover_top_k);
-            for (int i = 0; i < n_top; i++) {
-                for (int j = i + 1; j < n_top; j++) {
-                    if (pop[i].type >= 2 || pop[j].type >= 2) continue; // skip product
-                    float alpha = alpha_dist(rng_cx);
-                    std::vector<float> w_child(D);
-                    for (int d = 0; d < D; d++)
-                        w_child[d] = alpha * pop[i].w[d] + (1.0f - alpha) * pop[j].w[d];
-                    w_child = sparsify(w_child, D_num);
-                    // child inherits the type of the fitter parent
-                    Hypothesis c;
-                    c.type = (pop[i].score >= pop[j].score) ? pop[i].type : pop[j].type;
-                    c.w = w_child;
-                    c.update_complexity(pop);
-                    raw_candidates.push_back(c);
+            struct ParentInfo {
+                int pop_idx;
+                float parent_score;
+            };
+            std::vector<ParentInfo> parents;
+            for (int p = 0; p < (int)pop.size(); p++) {
+                float parent_score = pop[p].fitness + breeding_beta * pop[p].breeding_value;
+                parents.push_back({p, parent_score});
+            }
+            std::sort(parents.begin(), parents.end(), [](const ParentInfo& a, const ParentInfo& b) {
+                return a.parent_score > b.parent_score;
+            });
+
+            int n_top = std::min((int)parents.size(), cx_top_k);
+            if (n_top >= 2) {
+                struct PairInfo {
+                    int p1_idx;
+                    int p2_idx;
+                    float weight;
+                };
+                std::vector<PairInfo> possible_pairs;
+                double total_weight = 0.0;
+
+                for (int i = 0; i < n_top; i++) {
+                    int idx_i = parents[i].pop_idx;
+                    int type_i = pop[idx_i].type;
+                    for (int j = i + 1; j < n_top; j++) {
+                        int idx_j = parents[j].pop_idx;
+                        int type_j = pop[idx_j].type;
+                        if (type_i >= 2 || type_j >= 2) continue; // skip product
+
+                        float birth = cx_births[type_i][type_j];
+                        float surv = cx_survivors[type_i][type_j];
+                        float weight = (surv + 1.0f) / (birth + 2.0f);
+                        possible_pairs.push_back({idx_i, idx_j, weight});
+                        total_weight += weight;
+                    }
+                }
+
+                if (!possible_pairs.empty() && total_weight > 0.0) {
+                    std::mt19937 rng_cx(seed++);
+                    std::uniform_real_distribution<double> dist_prob(0.0, total_weight);
+                    std::uniform_real_distribution<float> alpha_dist(0.3f, 0.7f);
+
+                    int num_to_sample = possible_pairs.size();
+                    for (int s = 0; s < num_to_sample; s++) {
+                        double r = dist_prob(rng_cx);
+                        double running_sum = 0.0;
+                        PairInfo selected_pair = possible_pairs[0];
+                        for (const auto& pair : possible_pairs) {
+                            running_sum += pair.weight;
+                            if (r <= running_sum) {
+                                selected_pair = pair;
+                                break;
+                            }
+                        }
+
+                        const auto& parent_a = pop[selected_pair.p1_idx];
+                        const auto& parent_b = pop[selected_pair.p2_idx];
+
+                        float alpha = alpha_dist(rng_cx);
+                        std::vector<float> w_child(D);
+                        for (int d = 0; d < D; d++)
+                            w_child[d] = alpha * parent_a.w[d] + (1.0f - alpha) * parent_b.w[d];
+                        w_child = sparsify(w_child, D_num);
+
+                        Hypothesis c;
+                        c.type = (parent_a.score >= parent_b.score) ? parent_a.type : parent_b.type;
+                        c.w = w_child;
+                        c.parent1 = parent_a.global_id;
+                        c.parent2 = parent_b.global_id;
+                        c.birth_round = current_round;
+                        c.family_id = (parent_a.score >= parent_b.score) ? parent_a.family_id : parent_b.family_id;
+                        c.update_complexity(pop);
+                        raw_candidates.push_back(c);
+                    }
                 }
             }
         }
@@ -421,7 +621,36 @@ public:
             if (cand_best_gain[ci] > 1e-5f) {
                 auto& c = raw_candidates[ci];
                 c.observe_fitness(cand_best_gain[ci], eta_penalty);
+
+                // Add to history and assign global_id and family_id
+                c.global_id = history.size();
+                if (c.family_id == -1) {
+                    c.family_id = c.global_id;
+                }
+
+                // Save to history (clear caches first to save memory)
+                Hypothesis hist_c = c;
+                hist_c.full_cache.clear();
+                hist_c.full_cache.shrink_to_fit();
+                hist_c.thresholds.clear();
+                hist_c.thresholds.shrink_to_fit();
+                history.push_back(std::move(hist_c));
+
                 admitted.push_back(c);
+            }
+        }
+
+        // Track births for Operator Transition Matrix
+        for (const auto& c : admitted) {
+            if (c.birth_round == current_round && c.parent1 != -1 && c.parent2 != -1 && c.type < 2) {
+                int p1_type = history[c.parent1].type;
+                int p2_type = history[c.parent2].type;
+                if (p1_type >= 0 && p1_type < 3 && p2_type >= 0 && p2_type < 3) {
+                    cx_births[p1_type][p2_type]++;
+                    if (p1_type != p2_type) {
+                        cx_births[p2_type][p1_type]++;
+                    }
+                }
             }
         }
 
@@ -431,7 +660,10 @@ public:
         }
 
         for (auto& h : pop) {
-            h.score = h.ucb_score(eta_penalty);
+            int gid = h.global_id;
+            float fam_fit = (gid >= 0 && gid < (int)history.size()) ? history[gid].family_fitness : h.fitness;
+            h.family_fitness = fam_fit;
+            h.score = h.ucb_score(eta_penalty) + family_lambda * fam_fit;
         }
         std::sort(pop.begin(), pop.end(), [](const Hypothesis& a, const Hypothesis& b) {
             return a.score > b.score;
@@ -492,8 +724,20 @@ public:
         int elite_cap = (elitism_k > 0) ? std::min(elitism_k, P) : 0;
         for (int i = 0; i < elite_cap; i++) kept.push_back(i);
 
+        // Apply family quota limit during eviction
+        std::unordered_map<int, int> family_counts;
+        for (int idx : kept) {
+            family_counts[pop[idx].family_id]++;
+        }
+
         for (int i = 0; i < P; i++) {
             if (i < elite_cap) continue;
+
+            int fid = pop[i].family_id;
+            if (family_max_size > 0 && family_counts[fid] >= family_max_size) {
+                continue;
+            }
+
             bool redundant = false;
             for (int j : kept) {
                 float thr_val = (pop[i].type == pop[j].type) ? 0.90f : 0.98f;
@@ -504,6 +748,7 @@ public:
             }
             if (!redundant) {
                 kept.push_back(i);
+                family_counts[fid]++;
                 if ((int)kept.size() >= max_size) break;
             }
         }
@@ -535,6 +780,20 @@ public:
             }
         }
         pop = std::move(survivor_pop);
+
+        // Track survivors for Operator Transition Matrix
+        for (const auto& h : pop) {
+            if (h.birth_round == current_round && h.parent1 != -1 && h.parent2 != -1 && h.type < 2) {
+                int p1_type = history[h.parent1].type;
+                int p2_type = history[h.parent2].type;
+                if (p1_type >= 0 && p1_type < 3 && p2_type >= 0 && p2_type < 3) {
+                    cx_survivors[p1_type][p2_type]++;
+                    if (p1_type != p2_type) {
+                        cx_survivors[p2_type][p1_type]++;
+                    }
+                }
+            }
+        }
     }
 
     void eval(const float* X, int N_in, float* out_Z) const {
@@ -1157,10 +1416,11 @@ void pool_evolve(
     int N_in, int Ns, int K,
     int D_num,
     float reg_lambda,
-    float eta_penalty
+    float eta_penalty,
+    int current_round
 ) {
     static_cast<HypForgePool*>(handle)->evolve(
-        X, G_full, H_full, sub_indices, N_in, Ns, K, D_num, reg_lambda, eta_penalty
+        X, G_full, H_full, sub_indices, N_in, Ns, K, D_num, reg_lambda, eta_penalty, current_round
     );
 }
 
@@ -1189,26 +1449,42 @@ void pool_update_use_counts(void* handle, const int* split_indices, int n_nodes)
     int P = pool->pop.size();
     for (int p = 0; p < P; p++) {
         pool->pop[p].rounds_since_last_use++;
+        
+        int gid = pool->pop[p].global_id;
+        if (gid >= 0 && gid < (int)pool->history.size()) {
+            pool->history[gid].rounds_since_last_use++;
+        }
     }
     for (int i = 0; i < n_nodes; i++) {
         int idx = split_indices[i];
         if (idx >= 0 && idx < P) {
             pool->pop[idx].use_count++;
             pool->pop[idx].rounds_since_last_use = 0;
+            
+            int gid = pool->pop[idx].global_id;
+            if (gid >= 0 && gid < (int)pool->history.size()) {
+                pool->history[gid].use_count++;
+                pool->history[gid].rounds_since_last_use = 0;
+            }
         }
     }
 }
 
 void pool_set_options(
     void* handle,
-    int op_mode, int crossover_top_k, int elitism_k, int alps_mode, int map_elites_slots
+    int op_mode, int crossover_top_k, int elitism_k, int alps_mode, int map_elites_slots,
+    int family_max_size, int enable_meta_evolution, float family_lambda, float breeding_beta
 ) {
     auto* pool = static_cast<HypForgePool*>(handle);
-    pool->op_mode           = op_mode;
-    pool->crossover_top_k   = crossover_top_k;
-    pool->elitism_k         = elitism_k;
-    pool->alps_mode         = alps_mode;
-    pool->map_elites_slots  = map_elites_slots;
+    pool->op_mode               = op_mode;
+    pool->crossover_top_k       = crossover_top_k;
+    pool->elitism_k             = elitism_k;
+    pool->alps_mode             = alps_mode;
+    pool->map_elites_slots      = map_elites_slots;
+    pool->family_max_size       = family_max_size;
+    pool->enable_meta_evolution = enable_meta_evolution;
+    pool->user_family_lambda    = family_lambda;
+    pool->user_breeding_beta    = breeding_beta;
 }
 
 void pool_export(
@@ -1224,7 +1500,13 @@ void pool_export(
     int* rounds_since_last_use,
     float* fitnesses,
     float* scores,
-    uint8_t* is_base
+    uint8_t* is_base,
+    int* parent1,
+    int* parent2,
+    int* birth_round,
+    int* family_id,
+    float* family_fitness,
+    float* breeding_value
 ) {
     auto* pool = static_cast<HypForgePool*>(handle);
     int P = pool->pop.size();
@@ -1242,6 +1524,13 @@ void pool_export(
         fitnesses[p] = h.fitness;
         scores[p] = h.score;
         is_base[p] = h.is_base ? 1 : 0;
+        
+        parent1[p] = h.parent1;
+        parent2[p] = h.parent2;
+        birth_round[p] = h.birth_round;
+        family_id[p] = h.family_id;
+        family_fitness[p] = h.family_fitness;
+        breeding_value[p] = h.breeding_value;
         
         if (h.type < 2) {
             std::memcpy(weights + p * D, h.w.data(), D * sizeof(float));
@@ -1264,7 +1553,13 @@ void* pool_import(
     const int* rounds_since_last_use,
     const float* fitnesses,
     const float* scores,
-    const uint8_t* is_base
+    const uint8_t* is_base,
+    const int* parent1,
+    const int* parent2,
+    const int* birth_round,
+    const int* family_id,
+    const float* family_fitness,
+    const float* breeding_value
 ) {
     auto* pool = new HypForgePool(D, max_size);
     pool->pop.clear();
@@ -1282,27 +1577,62 @@ void* pool_import(
         h.score = scores[p];
         h.is_base = is_base[p] != 0;
         
+        h.parent1 = parent1[p];
+        h.parent2 = parent2[p];
+        h.birth_round = birth_round[p];
+        h.family_id = family_id[p];
+        h.family_fitness = family_fitness[p];
+        h.breeding_value = breeding_value[p];
+        
         if (h.type < 2) {
             h.w.assign(weights + p * D, weights + (p + 1) * D);
         }
         h.update_complexity(pool->pop);
+        h.global_id = pool->history.size();
+        
+        // Save to history (clear caches first to save memory)
+        Hypothesis hist_h = h;
+        hist_h.full_cache.clear();
+        hist_h.full_cache.shrink_to_fit();
+        hist_h.thresholds.clear();
+        hist_h.thresholds.shrink_to_fit();
+        pool->history.push_back(std::move(hist_h));
+        
         pool->pop.push_back(std::move(h));
     }
     return static_cast<void*>(pool);
 }
 
+void pool_get_policy_stats(
+    void* handle,
+    int* use_counts,
+    double* mean_rewards,
+    int* active_idx
+) {
+    auto* pool = static_cast<HypForgePool*>(handle);
+    int num_policies = pool->policies.size();
+    for (int i = 0; i < num_policies; i++) {
+        use_counts[i] = pool->policies[i].use_count;
+        mean_rewards[i] = pool->policies[i].mean_reward;
+    }
+    *active_idx = pool->active_policy_idx;
+}
+
+void pool_get_transition_matrix(
+    void* handle,
+    float* births,
+    float* survivors
+) {
+    auto* pool = static_cast<HypForgePool*>(handle);
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            births[i * 3 + j] = pool->cx_births[i][j];
+            survivors[i * 3 + j] = pool->cx_survivors[i][j];
+        }
+    }
+}
+
 // ── Integrated: evolve + build + predict in one C++ call ─────────────────────
-//
-// Replaces the Python sequence:
-//   pool.evolve() → get_caches_and_thresholds() → bfstree_build() →
-//   tree.predict() → update_use_counts()
-//
-// Benefits:
-//   • Z_full [P×N] never allocated in Python (saves ~175 MB per round)
-//   • Prediction uses full_cache directly, avoiding a second Z_full copy
-//   • use_count update from actual tree splits (not deferred)
-//
-// Returns a BFSTree handle (same ownership semantics as bfstree_build).
 void* pool_build_tree(
     void*  pool_handle,
     const float* X,          // [N, D]
@@ -1314,21 +1644,44 @@ void* pool_build_tree(
     int D_num, int max_depth,
     float reg_lambda, float eta_penalty,
     int do_evolve,           // 1 = run evolve, 0 = skip (reuse last state)
-    float* out_pred          // [N, K], caller allocs, caller zero-inits
+    float* out_pred,         // [N, K], caller allocs, caller zero-inits
+    int current_round
 ) {
     auto* pool = static_cast<HypForgePool*>(pool_handle);
+
+    // ── Meta-Evolution: Select active policy ──────────────────────────────────
+    if (do_evolve && pool->enable_meta_evolution > 0 && !pool->policies.empty()) {
+        int best_idx = 0;
+        float best_ucb = -1e9f;
+        float total_n = (float)pool->total_policy_rounds;
+
+        for (int i = 0; i < (int)pool->policies.size(); i++) {
+            const auto& pol = pool->policies[i];
+            if (pol.use_count == 0) {
+                best_idx = i;
+                break;
+            }
+            float exploration = 2.0f * std::sqrt(std::log(total_n + 1.0f) / pol.use_count);
+            float ucb = pol.mean_reward + exploration;
+            if (ucb > best_ucb) {
+                best_ucb = ucb;
+                best_idx = i;
+            }
+        }
+        pool->active_policy_idx = best_idx;
+        pool->crossover_top_k = pool->policies[best_idx].crossover_top_k;
+    }
 
     // ── 1. Optionally evolve pool ─────────────────────────────────────────────
     if (do_evolve) {
         pool->evolve(X, G_full, H_full, evolve_sub,
-                     N, Ns_evolve, K, D_num, reg_lambda, eta_penalty);
+                     N, Ns_evolve, K, D_num, reg_lambda, eta_penalty, current_round);
     }
 
     int P = (int)pool->pop.size();
     if (P == 0) return nullptr;
 
     // ── 2. Build Z_sub [P, Ns_tree] from full_cache using persistent buffer ───
-    //    Reusing pool->Z_buf_ / G_buf_ / H_buf_ avoids ~30-50 MB malloc per round.
     size_t z_need = (size_t)P * Ns_tree;
     size_t gh_need = (size_t)Ns_tree * K;
     if (pool->Z_buf_.size() < z_need)  pool->Z_buf_.resize(z_need);
@@ -1353,8 +1706,6 @@ void* pool_build_tree(
     }
 
     // ── 4. Build BFS tree using 255-bin histogram splits ─────────────────────
-    //    bfs_build_hist uses pool->pop[p].bin_min/bin_max for uniform binning.
-    //    Split search cost: O(Ns + 255*K) vs old O(9*Ns*K) ≈ 78× faster at K=19.
     BFSTree* tree = bfs_build_hist(
         pool,
         Z_sub, G_sub, H_sub,
@@ -1362,21 +1713,48 @@ void* pool_build_tree(
         max_depth, 20, 10, reg_lambda
     );
 
+    // ── Update Meta-Evolution reward ─────────────────────────────────────────
+    if (do_evolve && pool->enable_meta_evolution > 0 && !pool->policies.empty()) {
+        float total_gain = 0.0f;
+        for (int t = 0; t < tree->total_nodes; t++) {
+            if (!tree->is_leaf[t]) {
+                total_gain += tree->split_gain[t];
+            }
+        }
+        
+        int idx = pool->active_policy_idx;
+        auto& pol = pool->policies[idx];
+        pol.use_count++;
+        pol.sum_reward += total_gain;
+        pol.mean_reward = pol.sum_reward / pol.use_count;
+        pool->total_policy_rounds++;
+    }
+
     // ── 5. Update use_counts from actual tree splits ─────────────────────────
     {
         int n_nodes = tree->total_nodes;
-        for (int p = 0; p < P; p++) pool->pop[p].rounds_since_last_use++;
+        for (int p = 0; p < P; p++) {
+            pool->pop[p].rounds_since_last_use++;
+            int gid = pool->pop[p].global_id;
+            if (gid >= 0 && gid < (int)pool->history.size()) {
+                pool->history[gid].rounds_since_last_use++;
+            }
+        }
         for (int t = 0; t < n_nodes; t++) {
             int idx = tree->split_hyp_idx[t];
             if (idx >= 0 && idx < P) {
                 pool->pop[idx].use_count++;
                 pool->pop[idx].rounds_since_last_use = 0;
+                int gid = pool->pop[idx].global_id;
+                if (gid >= 0 && gid < (int)pool->history.size()) {
+                    pool->history[gid].use_count++;
+                    pool->history[gid].rounds_since_last_use = 0;
+                }
             }
         }
     }
 
     // ── 6. Predict on full N using full_cache — no Z_full allocation ──────────
-    // Walk each sample through tree routing; full_cache[p][i] replaces Z[p*N+i].
     {
         std::vector<int> node_assign(N, 0);
         int max_d = tree->max_depth;

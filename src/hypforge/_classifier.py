@@ -77,6 +77,10 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         crossover_top_k: int = 3,
         elitism_k: int       = 20,
         map_elites_slots: int = 100,
+        family_max_size: int = 30,
+        meta_evolution: bool = True,
+        family_lambda: float = 0.1,
+        breeding_beta: float = 0.3,
     ):
         self.n_estimators          = n_estimators
         self.learning_rate         = learning_rate
@@ -93,6 +97,10 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         self.crossover_top_k       = crossover_top_k
         self.elitism_k             = elitism_k
         self.map_elites_slots      = map_elites_slots
+        self.family_max_size       = family_max_size
+        self.meta_evolution        = meta_evolution
+        self.family_lambda         = family_lambda
+        self.breeding_beta         = breeding_beta
 
     # ── public fit/predict ────────────────────────────────────────────────────
 
@@ -415,11 +423,17 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                 top_feats = f"[{_feat_str(h.h1)}] × [{_feat_str(h.h2)}]"
 
             rows.append({
-                "type":         h.hyp_type,
-                "fitness":      round(h.fitness, 6),
-                "use_count":    h.use_count,
-                "complexity":   h.complexity(),
-                "top_features": top_feats,
+                "type":           h.hyp_type,
+                "fitness":        round(h.fitness, 6),
+                "use_count":      h.use_count,
+                "complexity":     h.complexity(),
+                "top_features":   top_feats,
+                "family_id":      h.family_id,
+                "birth_round":    h.birth_round,
+                "parent1":        h.parent1,
+                "parent2":        h.parent2,
+                "family_fitness": round(h.family_fitness, 6),
+                "breeding_value": round(h.breeding_value, 6),
             })
 
         return pd.DataFrame(rows).sort_values("fitness", ascending=False).reset_index(drop=True)
@@ -517,6 +531,10 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             elitism_k=self.elitism_k,
             alps_mode=True,
             map_elites_slots=self.map_elites_slots,
+            family_max_size=self.family_max_size,
+            meta_evolution=self.meta_evolution,
+            family_lambda=self.family_lambda,
+            breeding_beta=self.breeding_beta,
         )
 
         rng             = np.random.default_rng(seed)
@@ -552,6 +570,7 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                 D_num, self.max_depth,
                 reg_lambda=self.reg_lambda,
                 do_evolve=do_evolve,
+                current_round=m,
             )
             Fsc  = Fsc + self.learning_rate * pred_np
             self.trees_.append(tree)
@@ -586,9 +605,17 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                 acc = (Pm.argmax(axis=1) == y).mean()
                 best_ucb = snap[0].score if snap else 0.0
                 best_mu  = snap[0].mu_fitness if snap else 0.0
+                
+                meta_str = ""
+                if self.meta_evolution:
+                    pstats = pool.get_policy_stats()
+                    active_id = pstats["active_idx"]
+                    mean_rew = pstats["mean_rewards"][active_id] if active_id >= 0 else 0.0
+                    meta_str = f" | Policy={active_id} (rew={mean_rew:.3f})"
+                
                 print(
                     f"  [HypForge] Round {m+1:3d} | Loss={ll:.4f} | Acc={acc:.4f} | "
-                    f"UCB={best_ucb:.4f} | μ={best_mu:.4f} | Pop={len(snap)}{val_str}"
+                    f"UCB={best_ucb:.4f} | μ={best_mu:.4f} | Pop={len(snap)}{meta_str}{val_str}"
                 )
 
             if X_val is not None and self.early_stopping_rounds is not None:

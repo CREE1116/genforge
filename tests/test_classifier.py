@@ -244,3 +244,66 @@ def test_clone():
     clf  = HypForgeClassifier(**TINY)
     clf2 = clone(clf)
     assert clf2.n_estimators == clf.n_estimators
+
+
+def test_genealogical_evolution(binary_data):
+    X, y = binary_data
+    clf = HypForgeClassifier(
+        n_estimators=10,
+        max_depth=3,
+        pool_size=40,
+        meta_evolution=True,
+        family_max_size=5,
+        random_state=42
+    )
+    clf.fit(X, y)
+    
+    # Check that pool hypotheses have genealogy stats populated
+    pool = clf.get_hypothesis_pool()
+    assert len(pool) > 0
+    
+    for h in pool:
+        assert hasattr(h, "parent1")
+        assert hasattr(h, "parent2")
+        assert hasattr(h, "birth_round")
+        assert hasattr(h, "family_id")
+        assert hasattr(h, "family_fitness")
+        assert hasattr(h, "breeding_value")
+        assert h.family_id >= 0
+
+    # Check that summary dataframe includes new columns
+    df = clf.get_hypothesis_summary()
+    assert "family_id" in df.columns
+    assert "birth_round" in df.columns
+    assert "parent1" in df.columns
+    assert "parent2" in df.columns
+    assert "family_fitness" in df.columns
+    assert "breeding_value" in df.columns
+
+
+def test_meta_evolution_telemetry(binary_data):
+    X, y = binary_data
+    clf = HypForgeClassifier(
+        n_estimators=15,
+        max_depth=3,
+        pool_size=50,
+        meta_evolution=True,
+        verbose=True
+    )
+    clf.fit(X, y)
+    
+    from hypforge._pool import HypForgePool
+    pool = HypForgePool(
+        X.shape[1], max_size=50,
+        meta_evolution=True,
+        family_max_size=10
+    )
+    
+    # Initial stats should be 0s
+    pstats = pool.get_policy_stats()
+    assert len(pstats["use_counts"]) == 4
+    assert len(pstats["mean_rewards"]) == 4
+    
+    births, survivors = pool.get_transition_matrix()
+    assert births.shape == (3, 3)
+    assert survivors.shape == (3, 3)

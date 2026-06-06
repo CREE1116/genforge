@@ -17,6 +17,7 @@ def _get_pool_lib():
     lib.pool_set_options.argtypes = [
         ctypes.c_void_p,
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # op_mode, crossover_top_k, elitism_k, alps_mode, map_elites_slots
+        ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float,            # family_max_size, enable_meta_evolution, family_lambda, breeding_beta
     ]
     lib.pool_set_options.restype = None
 
@@ -31,7 +32,8 @@ def _get_pool_lib():
         ctypes.POINTER(ctypes.c_int),    # sub_indices
         ctypes.c_int, ctypes.c_int, ctypes.c_int,  # N, Ns, K
         ctypes.c_int,                    # D_num
-        ctypes.c_float, ctypes.c_float   # reg_lambda, eta_penalty
+        ctypes.c_float, ctypes.c_float,  # reg_lambda, eta_penalty
+        ctypes.c_int                     # current_round
     ]
     lib.pool_evolve.restype = None
     
@@ -72,6 +74,7 @@ def _get_pool_lib():
         ctypes.c_float, ctypes.c_float,           # reg_lambda, eta_penalty
         ctypes.c_int,                             # do_evolve
         ctypes.POINTER(ctypes.c_float),           # out_pred [N, K]
+        ctypes.c_int                              # current_round
     ]
     lib.pool_build_tree.restype = ctypes.c_void_p
 
@@ -88,7 +91,13 @@ def _get_pool_lib():
         ctypes.POINTER(ctypes.c_int),      # rounds_since_last_use
         ctypes.POINTER(ctypes.c_float),    # fitnesses
         ctypes.POINTER(ctypes.c_float),    # scores
-        ctypes.POINTER(ctypes.c_uint8)     # is_base
+        ctypes.POINTER(ctypes.c_uint8),    # is_base
+        ctypes.POINTER(ctypes.c_int),      # parent1
+        ctypes.POINTER(ctypes.c_int),      # parent2
+        ctypes.POINTER(ctypes.c_int),      # birth_round
+        ctypes.POINTER(ctypes.c_int),      # family_id
+        ctypes.POINTER(ctypes.c_float),    # family_fitness
+        ctypes.POINTER(ctypes.c_float),    # breeding_value
     ]
     lib.pool_export.restype = None
     
@@ -105,9 +114,30 @@ def _get_pool_lib():
         ctypes.POINTER(ctypes.c_int),      # rounds_since_last_use
         ctypes.POINTER(ctypes.c_float),    # fitnesses
         ctypes.POINTER(ctypes.c_float),    # scores
-        ctypes.POINTER(ctypes.c_uint8)     # is_base
+        ctypes.POINTER(ctypes.c_uint8),    # is_base
+        ctypes.POINTER(ctypes.c_int),      # parent1
+        ctypes.POINTER(ctypes.c_int),      # parent2
+        ctypes.POINTER(ctypes.c_int),      # birth_round
+        ctypes.POINTER(ctypes.c_int),      # family_id
+        ctypes.POINTER(ctypes.c_float),    # family_fitness
+        ctypes.POINTER(ctypes.c_float),    # breeding_value
     ]
     lib.pool_import.restype = ctypes.c_void_p
+
+    lib.pool_get_policy_stats.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),      # use_counts
+        ctypes.POINTER(ctypes.c_double),   # mean_rewards
+        ctypes.POINTER(ctypes.c_int)       # active_idx
+    ]
+    lib.pool_get_policy_stats.restype = None
+
+    lib.pool_get_transition_matrix.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_float),    # births
+        ctypes.POINTER(ctypes.c_float)     # survivors
+    ]
+    lib.pool_get_transition_matrix.restype = None
     
     _pool_configured = True
     return lib
@@ -135,6 +165,14 @@ class Hypothesis:
         self.fitness  = 0.0      # last observed fitness (for display/compat)
         self.score    = 0.0      # UCB score
         self.is_base  = False
+
+        # ── genealogy / lineage meta ──────────────────────────────────────
+        self.parent1        = -1
+        self.parent2        = -1
+        self.birth_round    = 0
+        self.family_id      = -1
+        self.family_fitness = 0.0
+        self.breeding_value = 0.0
 
         # ── projection caches ─────────────────────────────────────────────
         self.cache          = None
@@ -201,7 +239,9 @@ class HypForgePool:
     def __init__(self, D, max_size=500, dev="cpu",
                  op_mode="all", crossover_top_k=6,
                  elitism_k=0, alps_mode=False,
-                 map_elites_slots=0):
+                 map_elites_slots=0,
+                 family_max_size=30, meta_evolution=True,
+                 family_lambda=0.1, breeding_beta=0.3):
         self.D = D
         self.max_size = max_size
         lib = _get_pool_lib()
@@ -219,9 +259,13 @@ class HypForgePool:
             int(elitism_k),
             int(alps_mode),
             int(map_elites_slots),
+            int(family_max_size),
+            1 if meta_evolution else 0,
+            float(family_lambda),
+            float(breeding_beta),
         )
 
-    def evolve(self, X_full, G_full, H_full, sub_indices, D_num, reg_lambda=1.0, eta_penalty=0.002):
+    def evolve(self, X_full, G_full, H_full, sub_indices, D_num, reg_lambda=1.0, eta_penalty=0.002, current_round=0):
         import ctypes
         lib = _get_pool_lib()
         
@@ -238,7 +282,7 @@ class HypForgePool:
             _ptr_f(X), _ptr_f(G), _ptr_f(H),
             _ptr_i(sub_indices),
             X.shape[0], len(sub_indices), G.shape[1],
-            D_num, reg_lambda, eta_penalty
+            D_num, reg_lambda, eta_penalty, int(current_round)
         )
 
     def eval(self, X):
@@ -284,7 +328,7 @@ class HypForgePool:
                    evolve_sub, tree_sub,
                    D_num, max_depth,
                    reg_lambda=1.0, eta_penalty=0.002,
-                   do_evolve=True):
+                   do_evolve=True, current_round=0):
         """Evolve pool + build BFS tree + predict on all N — no Z matrix in Python.
 
         Returns (BFSTree, pred_np) where pred_np is float32 [N, K].
@@ -318,6 +362,7 @@ class HypForgePool:
             ctypes.c_float(eta_penalty),
             ctypes.c_int(1 if do_evolve else 0),
             _pf(out_pred),
+            ctypes.c_int(current_round)
         )
 
         tree    = BFSTree.__new__(BFSTree)
@@ -343,6 +388,13 @@ class HypForgePool:
         scores = np.zeros(P, dtype=np.float32)
         is_base = np.zeros(P, dtype=np.uint8)
         
+        parent1 = np.zeros(P, dtype=np.int32)
+        parent2 = np.zeros(P, dtype=np.int32)
+        birth_round = np.zeros(P, dtype=np.int32)
+        family_id = np.zeros(P, dtype=np.int32)
+        family_fitness = np.zeros(P, dtype=np.float32)
+        breeding_value = np.zeros(P, dtype=np.float32)
+        
         def _ptr_i(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
         def _ptr_f(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         def _ptr_d(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
@@ -361,7 +413,13 @@ class HypForgePool:
             _ptr_i(rounds_since_last_use),
             _ptr_f(fitnesses),
             _ptr_f(scores),
-            _ptr_u8(is_base)
+            _ptr_u8(is_base),
+            _ptr_i(parent1),
+            _ptr_i(parent2),
+            _ptr_i(birth_round),
+            _ptr_i(family_id),
+            _ptr_f(family_fitness),
+            _ptr_f(breeding_value),
         )
         
         py_pop = []
@@ -386,6 +444,13 @@ class HypForgePool:
             h.fitness = float(fitnesses[p])
             h.score = float(scores[p])
             h.is_base = bool(is_base[p])
+            
+            h.parent1 = int(parent1[p])
+            h.parent2 = int(parent2[p])
+            h.birth_round = int(birth_round[p])
+            h.family_id = int(family_id[p])
+            h.family_fitness = float(family_fitness[p])
+            h.breeding_value = float(breeding_value[p])
             py_pop.append(h)
             
         return py_pop
@@ -408,6 +473,13 @@ class HypForgePool:
         scores = np.zeros(P, dtype=np.float32)
         is_base = np.zeros(P, dtype=np.uint8)
         
+        parent1 = np.zeros(P, dtype=np.int32)
+        parent2 = np.zeros(P, dtype=np.int32)
+        birth_round = np.zeros(P, dtype=np.int32)
+        family_id = np.zeros(P, dtype=np.int32)
+        family_fitness = np.zeros(P, dtype=np.float32)
+        breeding_value = np.zeros(P, dtype=np.float32)
+        
         id_to_idx = {id(h): idx for idx, h in enumerate(py_pop)}
         
         for p, h in enumerate(py_pop):
@@ -428,6 +500,13 @@ class HypForgePool:
             fitnesses[p] = h.fitness
             scores[p] = h.score
             is_base[p] = 1 if h.is_base else 0
+            
+            parent1[p] = h.parent1
+            parent2[p] = h.parent2
+            birth_round[p] = h.birth_round
+            family_id[p] = h.family_id
+            family_fitness[p] = h.family_fitness
+            breeding_value[p] = h.breeding_value
             
         def _ptr_i(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
         def _ptr_f(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
@@ -451,8 +530,45 @@ class HypForgePool:
             _ptr_i(rounds_since_last_use),
             _ptr_f(fitnesses),
             _ptr_f(scores),
-            _ptr_u8(is_base)
+            _ptr_u8(is_base),
+            _ptr_i(parent1),
+            _ptr_i(parent2),
+            _ptr_i(birth_round),
+            _ptr_i(family_id),
+            _ptr_f(family_fitness),
+            _ptr_f(breeding_value),
         )
+
+    def get_policy_stats(self):
+        import ctypes
+        lib = _get_pool_lib()
+        use_counts = np.zeros(4, dtype=np.int32)
+        mean_rewards = np.zeros(4, dtype=np.float64)
+        active_idx = ctypes.c_int(-1)
+        
+        lib.pool_get_policy_stats(
+            self._handle,
+            use_counts.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            mean_rewards.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            ctypes.byref(active_idx)
+        )
+        return {
+            "use_counts": use_counts.tolist(),
+            "mean_rewards": mean_rewards.tolist(),
+            "active_idx": active_idx.value
+        }
+
+    def get_transition_matrix(self):
+        lib = _get_pool_lib()
+        births = np.zeros((3, 3), dtype=np.float32)
+        survivors = np.zeros((3, 3), dtype=np.float32)
+        
+        lib.pool_get_transition_matrix(
+            self._handle,
+            births.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            survivors.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        )
+        return births, survivors
 
     @property
     def pop(self):
