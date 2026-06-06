@@ -25,10 +25,20 @@ def _lib_path() -> str:
 def _compiler() -> list[str]:
     system = platform.system()
     if system == "Darwin":
-        return ["clang++", "-O3", "-march=native", "-shared", "-fPIC", "-std=c++17"]
+        base = ["clang++", "-O3", "-march=native", "-shared", "-fPIC", "-std=c++17"]
+        # Add OpenMP if libomp is installed via Homebrew
+        import subprocess as _sp
+        try:
+            omp = _sp.check_output(["brew", "--prefix", "libomp"],
+                                   stderr=_sp.DEVNULL).decode().strip()
+            base += ["-Xpreprocessor", "-fopenmp",
+                     f"-I{omp}/include", f"-L{omp}/lib", "-lomp"]
+        except Exception:
+            pass
+        return base
     elif system == "Windows":
-        return ["cl", "/O2", "/LD", "/EHsc"]
-    return ["g++", "-O3", "-march=native", "-shared", "-fPIC", "-std=c++17"]
+        return ["cl", "/O2", "/LD", "/EHsc", "/openmp"]
+    return ["g++", "-O3", "-march=native", "-shared", "-fPIC", "-std=c++17", "-fopenmp"]
 
 
 def _get_lib():

@@ -130,6 +130,15 @@ class Hypothesis:
 
     def eval(self, X):
         import numpy as np
+        # Normalise w: old pickled models may have stored w as a torch.Tensor
+        w = self.w
+        try:
+            import torch
+            if isinstance(w, torch.Tensor):
+                w = w.detach().cpu().numpy()
+        except ImportError:
+            pass
+
         is_torch = False
         try:
             import torch
@@ -139,7 +148,7 @@ class Hypothesis:
             pass
 
         if is_torch:
-            w_t = torch.as_tensor(self.w, dtype=X.dtype, device=X.device)
+            w_t = torch.as_tensor(w, dtype=X.dtype, device=X.device)
             if self.hyp_type == "linear":
                 return X @ w_t
             elif self.hyp_type == "square":
@@ -150,11 +159,11 @@ class Hypothesis:
                 return self.h1.eval(X) * self.h2.eval(X)
         else:
             if self.hyp_type == "linear":
-                return X @ self.w
+                return X @ w
             elif self.hyp_type == "square":
-                return (X @ self.w) ** 2
+                return (X @ w) ** 2
             elif self.hyp_type == "abs":
-                return np.abs(X @ self.w)
+                return np.abs(X @ w)
             elif self.hyp_type == "product":
                 return self.h1.eval(X) * self.h2.eval(X)
         raise ValueError(f"Unknown hyp_type: {self.hyp_type}")

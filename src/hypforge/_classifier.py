@@ -542,7 +542,8 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             pred_np = tree.predict(Z_full_np)
             Fsc     = Fsc + self.learning_rate * pred_np
             self.trees_.append(tree)
-            self.pool_snaps_.append(pool.pop)  # snapshot for this tree's index space
+            snap = pool.pop                        # single export per round
+            self.pool_snaps_.append(snap)
 
             # ── update use_count from C++ split index array ───────────────────
             split_idx = tree.get_split_hyp_indices()
@@ -565,20 +566,19 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                     best_val_loss  = val_loss
                     no_improv      = 0
                     best_trees     = list(self.trees_)
-                    best_snaps     = list(self.pool_snaps_)   # per-tree snapshots
-                    best_pool_snap = pool.pop            # final pool at best round
+                    best_snaps     = list(self.pool_snaps_)
+                    best_pool_snap = pool.pop
                 else:
                     no_improv += 1
 
             if self.verbose:
                 ll  = -np.log(Pm[np.arange(N), y].clip(1e-8)).mean()
                 acc = (Pm.argmax(axis=1) == y).mean()
-                current_pop = pool.pop
-                best_ucb = current_pop[0].score if current_pop else 0.0
-                best_mu  = current_pop[0].mu_fitness if current_pop else 0.0
+                best_ucb = snap[0].score if snap else 0.0
+                best_mu  = snap[0].mu_fitness if snap else 0.0
                 print(
                     f"  [HypForge] Round {m+1:3d} | Loss={ll:.4f} | Acc={acc:.4f} | "
-                    f"UCB={best_ucb:.4f} | μ={best_mu:.4f} | Pop={len(current_pop)}{val_str}"
+                    f"UCB={best_ucb:.4f} | μ={best_mu:.4f} | Pop={len(snap)}{val_str}"
                 )
 
             if X_val is not None and self.early_stopping_rounds is not None:

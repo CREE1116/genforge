@@ -1,9 +1,11 @@
 // BFS Oblique Tree Engine — C++ backend for HypForge
 // Replaces Python BFSObliqueTree to eliminate GPU-CPU sync overhead.
 //
-// Compile:
+// Compile (with OpenMP on Mac):
+//   OMP=$(brew --prefix libomp)
 //   clang++ -O3 -march=native -shared -fPIC -std=c++17 \
-//           src/bfstree_engine.cpp -o models/libbfstree.dylib
+//           -Xpreprocessor -fopenmp -I$OMP/include -L$OMP/lib -lomp \
+//           bfstree.cpp -o libbfstree.dylib
 //
 // Layout conventions (all row-major):
 //   Z          : [P, N]           Z[p*N + i]
@@ -21,6 +23,9 @@
 #include <cstdint>
 #include <random>
 #include <unordered_set>
+#ifdef _OPENMP
+#  include <omp.h>
+#endif
 
 struct Hypothesis {
     int type; // 0=linear, 1=square, 2=abs, 3=product
@@ -593,21 +598,71 @@ void* bfstree_build(
             for (int k = 0; k < K; k++)
                 parent_score += G_tot[k] * G_tot[k] / (H_tot[k] + reg_lambda);
 
-            // ── Split search: iterate (p, q) ────────────────────────────────
+            // ── Split search: parallel over hypotheses ───────────────────────
             float best_gain = 1e-5f;
             int   best_p    = -1;
             float best_thr  = 0.0f;
 
-            // Pre-extract z-values for each hypothesis to improve cache hits
-            std::vector<float> z_buf(Ns);
+#ifdef _OPENMP
+            #pragma omp parallel
+            {
+                // Thread-local buffers — avoids false sharing
+                std::vector<float> z_buf_tl(Ns);
+                std::vector<float> G_L_tl(K, 0.0f), H_L_tl(K, 0.0f);
+                float tl_gain = 1e-5f;
+                int   tl_p    = -1;
+                float tl_thr  = 0.0f;
 
+                #pragma omp for nowait
+                for (int p = 0; p < P; p++) {
+                    const float* Z_p = Z + (size_t)p * N;
+                    for (int j = 0; j < Ns; j++) z_buf_tl[j] = Z_p[sp[j]];
+
+                    for (int q = 0; q < 9; q++) {
+                        float thr = thresholds[q * P + p];
+                        std::fill(G_L_tl.begin(), G_L_tl.end(), 0.0f);
+                        std::fill(H_L_tl.begin(), H_L_tl.end(), 0.0f);
+                        int n_left = 0;
+
+                        for (int j = 0; j < Ns; j++) {
+                            if (z_buf_tl[j] < thr) {
+                                ++n_left;
+                                const float* gi = G + (size_t)sp[j] * K;
+                                const float* hi = H + (size_t)sp[j] * K;
+                                for (int k = 0; k < K; k++) { G_L_tl[k] += gi[k]; H_L_tl[k] += hi[k]; }
+                            }
+                        }
+
+                        int n_right = Ns - n_left;
+                        if (n_left < min_samples_leaf || n_right < min_samples_leaf) continue;
+
+                        float gain = 0.0f;
+                        for (int k = 0; k < K; k++) {
+                            float GR = G_tot[k] - G_L_tl[k];
+                            float HR = H_tot[k] - H_L_tl[k];
+                            gain += G_L_tl[k] * G_L_tl[k] / (H_L_tl[k] + reg_lambda)
+                                  + GR * GR               / (HR         + reg_lambda);
+                        }
+                        gain = 0.5f * (gain - parent_score);
+
+                        if (gain > tl_gain) { tl_gain = gain; tl_p = p; tl_thr = thr; }
+                    }
+                }
+
+                #pragma omp critical
+                {
+                    if (tl_gain > best_gain) { best_gain = tl_gain; best_p = tl_p; best_thr = tl_thr; }
+                }
+            }
+#else
+            // Fallback: serial (no OpenMP)
+            std::vector<float> z_buf(Ns);
             for (int p = 0; p < P; p++) {
                 const float* Z_p = Z + (size_t)p * N;
                 for (int j = 0; j < Ns; j++) z_buf[j] = Z_p[sp[j]];
 
                 for (int q = 0; q < 9; q++) {
                     float thr = thresholds[q * P + p];
-
                     std::fill(G_L.begin(), G_L.end(), 0.0f);
                     std::fill(H_L.begin(), H_L.end(), 0.0f);
                     int n_left = 0;
@@ -629,17 +684,14 @@ void* bfstree_build(
                         float GR = G_tot[k] - G_L[k];
                         float HR = H_tot[k] - H_L[k];
                         gain += G_L[k] * G_L[k] / (H_L[k] + reg_lambda)
-                              + GR * GR             / (HR      + reg_lambda);
+                              + GR * GR           / (HR      + reg_lambda);
                     }
                     gain = 0.5f * (gain - parent_score);
 
-                    if (gain > best_gain) {
-                        best_gain = gain;
-                        best_p    = p;
-                        best_thr  = thr;
-                    }
+                    if (gain > best_gain) { best_gain = gain; best_p = p; best_thr = thr; }
                 }
             }
+#endif
 
             if (best_p < 0) {
                 tree->is_leaf[t] = 1;
