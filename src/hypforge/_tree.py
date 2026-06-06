@@ -6,7 +6,6 @@ import numpy as np
 
 _lib = None
 _EXT_DIR = os.path.join(os.path.dirname(__file__), "_ext")
-_SRC = os.path.join(_EXT_DIR, "bfstree.cpp")
 
 
 def _lib_filename() -> str:
@@ -22,25 +21,6 @@ def _lib_path() -> str:
     return os.path.join(_EXT_DIR, _lib_filename())
 
 
-def _compiler() -> list[str]:
-    system = platform.system()
-    if system == "Darwin":
-        base = ["clang++", "-O3", "-march=native", "-shared", "-fPIC", "-std=c++17"]
-        # Add OpenMP if libomp is installed via Homebrew
-        import subprocess as _sp
-        try:
-            omp = _sp.check_output(["brew", "--prefix", "libomp"],
-                                   stderr=_sp.DEVNULL).decode().strip()
-            base += ["-Xpreprocessor", "-fopenmp",
-                     f"-I{omp}/include", f"-L{omp}/lib", "-lomp"]
-        except Exception:
-            pass
-        return base
-    elif system == "Windows":
-        return ["cl", "/O2", "/LD", "/EHsc", "/openmp"]
-    return ["g++", "-O3", "-march=native", "-shared", "-fPIC", "-std=c++17", "-fopenmp"]
-
-
 def _get_lib():
     global _lib
     if _lib is not None:
@@ -48,18 +28,10 @@ def _get_lib():
 
     lib_p = _lib_path()
     if not os.path.exists(lib_p):
-        print("[hypforge] Compiling C++ BFS tree engine...")
-        cmd = _compiler() + [_SRC, "-o", lib_p]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"[hypforge] C++ compilation failed.\n"
-                f"  Command: {' '.join(cmd)}\n"
-                f"  stderr:  {e.stderr.decode()}\n"
-                "  Install a C++ compiler (clang++/g++) and retry."
-            ) from e
-        print("[hypforge] Done.")
+        raise FileNotFoundError(
+            f"[hypforge] Compiled C++ binary not found at {lib_p}.\n"
+            "Please build/install the package first (e.g., using `pip install .` or `uv pip install -e .`)."
+        )
 
     lib = ctypes.CDLL(lib_p)
 

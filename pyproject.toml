@@ -38,7 +38,7 @@ Issues     = "https://github.com/cree1116/hypforge/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"hypforge" = ["_ext/bfstree.cpp", "*.pyi"]
+"hypforge" = ["_ext/libbfstree.dylib", "_ext/libbfstree.so", "_ext/bfstree.dll", "*.pyi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
