@@ -262,12 +262,31 @@ Early experiments with product hypotheses `h1.eval(X) × h2.eval(X)` showed they
 
 ---
 
+## Architecture: C++ Pool (current)
+
+The entire `HypForgePool` — UCB scoring, gradient flow, gradient ascent, candidate scoring, diversity pruning, and survival — runs in C++ (`bfstree.cpp`, 921 lines). Python calls it via a ctypes bridge (`_pool.py`).
+
+**C exports** (via `libbfstree.dylib`):
+
+| Symbol | Purpose |
+|---|---|
+| `pool_create(D, max_size)` | Allocate pool with D axis-aligned base hypotheses |
+| `pool_evolve(…)` | Full evolve pipeline (UCB → gradient → admit → prune → survive) |
+| `pool_eval(…)` | Batch inference: `Z[P, N] = apply all hypotheses to X` |
+| `pool_get_caches_and_thresholds(…)` | Return pre-computed projections + quantile thresholds for tree build |
+| `pool_update_use_counts(…)` | Increment use_count for indices selected as tree splits |
+| `pool_export(…)` | Serialize C++ pool state → 13 numpy arrays (for pickling) |
+| `pool_import(…)` | Deserialize numpy arrays → new C++ pool handle |
+| `pool_free(handle)` | Release C++ pool memory |
+
+**Pickle compatibility**: `HypForgePool.pop` property serializes to/from Python `Hypothesis` objects via `export_pop()` / `import_pop()`. Each `Hypothesis` stores only `h.w` (float32 weight vector, D elements) for inference; all training caches (`full_cache`, `thresholds`) are cleared before `joblib.dump()`.
+
+---
+
 ## Planned Improvements
 
-1. **C++ rewrite of `evolve()`** — the bottleneck is Python-level pool management. The algorithm is now simple enough (two candidate sources, one UCB formula, one diversity prune) that a full C++ port would reduce per-round cost by 10–50×.
+1. **Fitness normalization** — split-gain values are non-stationary (large in early rounds, small in late rounds). Dividing by the per-round mean fitness before Welford update would make UCB scores comparable across rounds and hypotheses.
 
-2. **Fitness normalization** — split-gain values are non-stationary (large in early rounds, small in late rounds). Dividing by the per-round mean fitness before Welford update would make UCB scores comparable across rounds and hypotheses.
+2. **More gradient flow directions** — currently K directions (one per class). Using top-M singular vectors of `G` would generate more diverse candidates without adding tunable parameters.
 
-3. **More gradient flow directions** — currently K directions (one per class). Using top-M singular vectors of `G` would generate more diverse candidates without adding tunable parameters.
-
-4. **XGBoost pipeline** — the final hypothesis pool can be exported to XGBoost as engineered features: `clf.embed(X)` produces an `[N, P]` matrix of learned projections that a downstream XGBoost can use.
+3. **XGBoost pipeline** — the final hypothesis pool can be exported to XGBoost as engineered features: `clf.embed(X)` produces an `[N, P]` matrix of learned projections that a downstream XGBoost can use.

@@ -8,16 +8,6 @@ from ._pool import Hypothesis, HypForgePool
 from ._tree import BFSTree
 
 
-def _detect_device(device: str) -> torch.device:
-    if device == "auto":
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
-    return torch.device(device)
-
-
 class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
     """
     HypForge: Hypothesis Pool Evolution for Oblique GBDT.
