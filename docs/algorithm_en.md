@@ -1,4 +1,4 @@
-# HypForge — Algorithm Reference
+# HypForge — Algorithm Reference (English)
 
 ## Overview
 
@@ -229,7 +229,7 @@ Each tree is paired with its own pool snapshot because C++ trees store *integer 
 All pool operations run in `bfstree.cpp` (C++17, OpenMP). Python calls via ctypes (`_pool.py`).
 
 | Export | Purpose |
-|------|---------|
+|--------|---------|
 | `pool_create(D, max_size, evolve_mode)` | Allocate pool with D base hypotheses |
 | `pool_set_options(…)` | Set pool configuration options (op_mode, crossover_top_k, elitism_k, alps_mode, map_elites_slots, family_max_size, enable_meta_evolution, family_lambda, breeding_beta) |
 | `pool_evolve(…)` | Full evolve pipeline |
