@@ -141,7 +141,7 @@ def test_hypothesis_summary(multi_data):
     clf.fit(X, y)
     df = clf.get_hypothesis_summary()
     assert "type" in df.columns
-    assert "fitness" in df.columns
+    assert "credit" in df.columns
     assert "top_features" in df.columns
     assert len(df) == len(clf.get_hypothesis_pool())
 
@@ -252,80 +252,168 @@ def test_genealogical_evolution(binary_data):
         n_estimators=10,
         max_depth=3,
         pool_size=40,
-        meta_evolution=True,
-        family_max_size=5,
         random_state=42
     )
     clf.fit(X, y)
-    
-    # Check that pool hypotheses have genealogy stats populated
+
     pool = clf.get_hypothesis_pool()
     assert len(pool) > 0
-    
+
     for h in pool:
         assert hasattr(h, "parent1")
         assert hasattr(h, "parent2")
         assert hasattr(h, "birth_round")
         assert hasattr(h, "family_id")
-        assert hasattr(h, "family_fitness")
-        assert hasattr(h, "breeding_value")
-        assert hasattr(h, "ancestor_credit")
+        assert hasattr(h, "credit")
         assert h.family_id >= 0
 
-    # Check that summary dataframe includes new columns
     df = clf.get_hypothesis_summary()
     assert "family_id" in df.columns
     assert "birth_round" in df.columns
     assert "parent1" in df.columns
     assert "parent2" in df.columns
-    assert "family_fitness" in df.columns
-    assert "breeding_value" in df.columns
-    assert "ancestor_credit" in df.columns
+    assert "credit" in df.columns
 
 
-def test_meta_evolution_telemetry(binary_data):
-    X, y = binary_data
-    clf = HypForgeClassifier(
-        n_estimators=15,
-        max_depth=3,
-        pool_size=50,
-        meta_evolution=True,
-        verbose=True
-    )
-    clf.fit(X, y)
-    
-    from hypforge._pool import HypForgePool
-    pool = HypForgePool(
-        X.shape[1], max_size=50,
-        meta_evolution=True,
-        family_max_size=10
-    )
-    
-    # Initial stats should be 0s
-    pstats = pool.get_policy_stats()
-    assert len(pstats["use_counts"]) == 4
-    assert len(pstats["mean_rewards"]) == 4
-    
-    births, survivors = pool.get_transition_matrix()
-    assert births.shape == (3, 3)
-    assert survivors.shape == (3, 3)
-
-
-def test_ancestor_credit_backpropagation(binary_data):
+def test_credit_accumulation(binary_data):
+    """Hypotheses used in splits should accumulate positive credit."""
     X, y = binary_data
     clf = HypForgeClassifier(
         n_estimators=30,
         max_depth=3,
         pool_size=50,
-        meta_evolution=True,
-        family_lambda=0.5,
-        breeding_beta=0.8,
-        random_state=42
+        random_state=42,
     )
     clf.fit(X, y)
-    
+
     pool = clf.get_hypothesis_pool()
-    # Check that ancestor_credit is populated and behaves correctly
     df = clf.get_hypothesis_summary()
-    assert "ancestor_credit" in df.columns
-    assert df["ancestor_credit"].max() >= 0.0
+    assert "credit" in df.columns
+    # At least some hypotheses should have accumulated credit
+    assert df["credit"].max() >= 0.0
+    used = [h for h in pool if h.use_count > 0]
+    assert all(h.credit >= 0.0 for h in used)
+
+
+def test_dag_combination_evaluation():
+    from hypforge import Hypothesis
+    # 1. Create a synthetic dataset
+    np.random.seed(42)
+    X = np.random.randn(10, 5).astype(np.float32)
+    
+    # 2. Construct three hypotheses manually:
+    # h1: base linear projection on feature 0 (w = [1, 0, 0, 0, 0])
+    # h2: base linear projection on feature 1 (w = [0, 1, 0, 0, 0])
+    # h3: crossover linear combination of h1 and h2 with weights [0.3, 0.7]
+    h1 = Hypothesis(hyp_type="linear", w=np.array([1, 0, 0, 0, 0], dtype=np.float32))
+    h1.is_base = True
+    h1.global_id = 0
+    h1.parent1 = -1
+    h1.parent2 = -1
+    
+    h2 = Hypothesis(hyp_type="linear", w=np.array([0, 1, 0, 0, 0], dtype=np.float32))
+    h2.is_base = True
+    h2.global_id = 1
+    h2.parent1 = -1
+    h2.parent2 = -1
+    
+    h3 = Hypothesis(hyp_type="linear", w=np.array([0.3, 0.7, 0.0, 0.0, 0.0], dtype=np.float32), h1=h1, h2=h2)
+    h3.is_base = False
+    h3.global_id = 2
+    h3.parent1 = 0
+    h3.parent2 = 1
+    
+    # 3. Test Python evaluation
+    val_h1 = h1.eval(X)
+    val_h2 = h2.eval(X)
+    val_h3 = h3.eval(X)
+    
+    expected_h3 = 0.3 * val_h1 + 0.7 * val_h2
+    assert np.allclose(val_h3, expected_h3, atol=1e-5)
+    
+    # 4. Import the pop to C++ and test C++ evaluation
+    from hypforge._pool import HypForgePool
+    pool = HypForgePool(D=5, max_size=10)
+    # import active population containing [h1, h2, h3]
+    pool.import_pop([h1, h2, h3])
+    
+    # Evaluate using the C++ pool
+    out_Z = pool.eval(X) # shape (3, 10)
+    
+    assert np.allclose(out_Z[0], val_h1, atol=1e-5)
+    assert np.allclose(out_Z[1], val_h2, atol=1e-5)
+    assert np.allclose(out_Z[2], val_h3, atol=1e-5)
+
+
+def test_pool_mechanics():
+    """Credit accumulates; crossover children are generated; base features survive eviction."""
+    from hypforge import Hypothesis
+    from hypforge._pool import HypForgePool
+    import numpy as np
+
+    np.random.seed(42)
+    X = np.random.randn(10, 5).astype(np.float32)
+    G = np.random.randn(10, 1).astype(np.float32)
+    H = np.ones((10, 1), dtype=np.float32)
+    sub_indices = np.arange(10, dtype=np.int32)
+
+    h1 = Hypothesis(hyp_type="linear", w=np.array([1, 0, 0, 0, 0], dtype=np.float32))
+    h1.is_base = True; h1.parent1 = -1; h1.parent2 = -1; h1.birth_round = 0
+    h1.credit = 0.8
+
+    h2 = Hypothesis(hyp_type="linear", w=np.array([0, 1, 0, 0, 0], dtype=np.float32))
+    h2.is_base = True; h2.parent1 = -1; h2.parent2 = -1; h2.birth_round = 0
+    h2.credit = 0.4
+
+    pool = HypForgePool(D=5, max_size=10)
+    pool.import_pop([h1, h2])
+    pool.evolve(X, G, H, sub_indices, D_num=2, current_round=1)
+
+    pop = pool.export_pop()
+    children = [h for h in pop if h.parent1 >= 0 and h.parent2 >= 0]
+    assert len(children) > 0, "Crossover child should be generated."
+
+    # Newborn protection during eviction
+    X2 = np.random.randn(10, 2).astype(np.float32)
+    G2 = np.random.randn(10, 1).astype(np.float32)
+    H2 = np.ones((10, 1), dtype=np.float32)
+    sub2 = np.arange(10, dtype=np.int32)
+    pool3 = HypForgePool(D=2, max_size=5)
+    old_hyps = []
+    for i in range(10):
+        angle = i * np.pi / 10
+        w = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+        w /= np.linalg.norm(w) + 1e-8
+        h = Hypothesis(hyp_type="linear", w=w)
+        h.is_base = False; h.parent1 = -1; h.parent2 = -1
+        h.credit = 0.0; h.birth_round = 0; h.rounds_since_last_use = 50
+        old_hyps.append(h)
+    base2_a = Hypothesis(hyp_type="linear", w=np.array([1.0, 0.0], dtype=np.float32))
+    base2_a.is_base = True; base2_a.parent1 = -1; base2_a.parent2 = -1; base2_a.birth_round = 0
+    base2_b = Hypothesis(hyp_type="linear", w=np.array([0.0, 1.0], dtype=np.float32))
+    base2_b.is_base = True; base2_b.parent1 = -1; base2_b.parent2 = -1; base2_b.birth_round = 0
+
+    pool3.import_pop(old_hyps + [base2_a, base2_b])
+    pool3.evolve(X2, G2, H2, sub2, D_num=2, current_round=1)
+    pop3 = pool3.export_pop()
+
+    retained_base = [h for h in pop3 if h.is_base]
+    assert len(retained_base) > 0, "Base hyps should survive eviction."
+    newborns3 = [h for h in pop3 if h.birth_round == 1]
+    assert len(newborns3) > 0, "Newborn hypotheses should be admitted."
+
+    # Tree selection: used hypotheses should have accumulated credit
+    from hypforge import HypForgeClassifier
+    clf = HypForgeClassifier(n_estimators=3, max_depth=2, pool_size=10, random_state=42)
+    clf.fit(X, (G > 0).astype(int).ravel())
+
+    pool4 = clf.get_hypothesis_pool()
+    assert len(pool4) > 0
+
+    used_hyps = [h for h in pool4 if h.use_count > 0]
+    for h in used_hyps:
+        assert h.rounds_since_last_use == 0, (
+            f"Used hyp should have rounds_since_last_use==0, got {h.rounds_since_last_use}"
+        )
+        assert h.credit >= 0.0, f"Used hyp should have non-negative credit, got {h.credit}"
+

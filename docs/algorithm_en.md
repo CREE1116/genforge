@@ -244,9 +244,36 @@ All pool operations run in `bfstree.cpp` (C++17, OpenMP). Python calls via ctype
 
 ---
 
+## C++ Engine
+
+All pool evolution and tree build operations run in `_ext/bfstree.cpp` (C++17, OpenMP). Python calls via ctypes (`_pool.py`).
+
+### Gain evaluation — prefix-sum optimisation (v0.1.2+)
+
+The inner hot loop evaluates split gain at 9 quantile positions per hypothesis. The naïve approach re-scanned all `Ns` samples for each threshold — O(9 × Ns × K).
+
+**Optimised path:**
+1. Argsort samples by hypothesis value: O(Ns log Ns)
+2. Build cumulative G/H prefix sums in sorted order: O(Ns × K)
+3. Read off gain at each of 9 positions: O(9 × K)
+
+Net: O(Ns log Ns + Ns × K) vs. O(9 × Ns × K). Typical speedup on the scan step: **~9×**.
+
+All prefix buffers are `thread_local` — allocated once per OpenMP thread and reused; no per-hypothesis heap allocation inside the parallel region.
+
+### Other optimisations
+
+| Area | Before | After |
+|------|--------|-------|
+| Candidate z-value storage | `vector<vector<float>>` (C heap allocs) | Eliminated — sort order used directly |
+| Similarity dedup cache | `vector<vector<float>>` (P allocs) | Flat `vector<float>` (P×Ns_sim) |
+| `is_kept` membership test | `O(|kept|)` `std::find` | `O(1)` `vector<bool>` |
+
+---
+
 ## Performance
 
-Ablation benchmark (3 datasets: spiral-2D, checker-2D, hiD-20D; 3 seeds each):
+### Ablation (pool feature additions, 3 datasets, 3 seeds)
 
 | Configuration | Avg Accuracy |
 |--------------|-------------|
@@ -258,18 +285,42 @@ Ablation benchmark (3 datasets: spiral-2D, checker-2D, hiD-20D; 3 seeds each):
 | + subsample=0.8 | 0.9376 |
 | + pool_size=400 | **0.9394** |
 
-Final comparison (same 3 datasets, n_estimators=300):
+### Cross-framework benchmark (9 datasets, n_estimators=100)
 
-| Model | Avg Accuracy |
-|-------|-------------|
-| **HypForge** | **0.9338** |
-| XGBoost | 0.9318 |
-| LightGBM | 0.9308 |
-| ExtraTrees | 0.9306 |
-| GradBoost-sklearn | 0.9282 |
-| RandomForest | 0.9236 |
+Run `python scripts/benchmark.py` to reproduce. Datasets live in `data/benchmarks/`.
 
-HypForge leads on high-dimensional data (hiD-20D: 0.9160 vs XGBoost 0.8967) where oblique splits uncover linear combinations of features that axis-aligned splits cannot.
+| Dataset | HypForge | XGBoost | LightGBM | RandomForest |
+|---------|----------|---------|----------|--------------|
+| iris (4-D, 3-cls) | 0.9000 | 0.9667 | 0.9667 | 0.9000 |
+| wine (13-D, 3-cls) | 0.9167 | 0.9722 | **1.0000** | **1.0000** |
+| breast_cancer (30-D, 2-cls) | 0.9474 | 0.9474 | 0.9561 | 0.9561 |
+| moons (2-D, 2-cls) | **0.9113** | 0.9038 | 0.9075 | 0.9025 |
+| circles (2-D, 2-cls) | **0.8925** | 0.8875 | 0.8862 | 0.8675 |
+| hiD 20-D 4-cls | **0.8031** | 0.7712 | 0.7863 | 0.8544 |
+| binary 30-D | **0.9125** | 0.8750 | 0.8800 | 0.9437 |
+| multiclass 50-D 6-cls | 0.6090 | 0.6085 | **0.6350** | 0.7765 |
+| oblique 20-D 4-cls | **0.8656** | 0.7031 | 0.7244 | 0.7738 |
+| **Average** | **0.8620** | 0.8484 | 0.8602 | 0.8861 |
+
+HypForge leads on oblique-structure datasets (oblique 20-D: **+23 pp** over XGBoost) where split gain is maximised by learned linear combinations rather than axis-aligned cuts.
+
+---
+
+## Benchmarking
+
+```bash
+# Generate datasets (one-time, ~2 sec)
+python scripts/generate_datasets.py
+
+# Full benchmark
+python scripts/benchmark.py
+
+# Quick smoke-test
+python scripts/benchmark.py --quick
+
+# Single dataset
+python scripts/benchmark.py --dataset oblique_20d_4cls
+```
 
 ---
 

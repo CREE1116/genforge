@@ -462,8 +462,6 @@ class TestForgePool {
     }
   }
 
-  // ── SALOT: Shared-Axis Leaf-wise Oblique Tree (RSOB Engine 마스터 코어)
-  // ──────
   BFSTree* salot_build_tree(const float* X, const float* G, const float* H,
                             const int* tree_sub, int Ns, int N_in, int K,
                             int D_num, int max_depth, float reg_lambda,
@@ -508,9 +506,7 @@ class TestForgePool {
       }
       if (active_nodes.empty()) break;
 
-      // ── Step 2–3: Per-class diagonal WLS (parallel over classes) ────────
-      // Σ_k G[i,k] = 0 (softmax) → all-class sum always cancels to zero.
-      // Compute K separate axes and pick max-norm. OpenMP over K classes.
+      // ── Step 2–3: Per-class diagonal WLS ────────
       std::vector<int> p_layer_axes;
       {
         int nl = (int)layer_samp.size();
@@ -573,127 +569,137 @@ class TestForgePool {
           pop.push_back(std::move(h_ax));
         }
       }
-      if (p_layer_axes.empty()) continue;  // no valid WLS axis at this depth
+      if (p_layer_axes.empty()) continue;
 
-      // ── Step 5: Multi-Axis Histogram Swarm Scan ──
+      // ── Step 5: True Oblivious Oblique Scan (축과 임계값의 동시 전역 동기화)
+      // ──
       int n_active = (int)active_nodes.size();
+      int best_global_axis = -1;
+      float best_layer_total_gain = -1e30f;
+      float best_global_threshold = 0.0f;
 
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1)
-#endif
-      for (int a_idx = 0; a_idx < n_active; a_idx++) {
-        int t_node = active_nodes[a_idx];
-        auto& samp = node_samp[t_node];
-        int ns = (int)samp.size();
+      // 노드별 Gt, Ht, 독립 잔차 이득 기본값(total_base) 사전 연산
+      std::vector<std::vector<float>> node_Gt(max_nodes,
+                                              std::vector<float>(K, 0.0f));
+      std::vector<std::vector<float>> node_Ht(max_nodes,
+                                              std::vector<float>(K, 0.0f));
+      std::vector<float> node_base(max_nodes, 0.0f);
 
-        int tl = 2 * t_node + 1, tr_node = 2 * t_node + 2;
-
-        std::vector<float> Gt(K, 0.0f), Ht(K, 0.0f);
-        for (int j : samp) {
-          const float* gj = G + (size_t)j * K;
-          const float* hj = H + (size_t)j * K;
+      for (int t_node : active_nodes) {
+        for (int j : node_samp[t_node]) {
           for (int c = 0; c < K; c++) {
-            Gt[c] += gj[c];
-            Ht[c] += hj[c];
+            node_Gt[t_node][c] += G[(size_t)j * K + c];
+            node_Ht[t_node][c] += H[(size_t)j * K + c];
           }
         }
+        for (int c = 0; c < K; c++) {
+          node_base[t_node] -= 0.5f * node_Gt[t_node][c] * node_Gt[t_node][c] /
+                               (node_Ht[t_node][c] + reg_lambda + EPS);
+        }
+      }
 
-        float total_base = 0.0f;
-        for (int c = 0; c < K; c++)
-          total_base -= 0.5f * Gt[c] * Gt[c] / (Ht[c] + reg_lambda + EPS);
+      for (int p_idx : p_layer_axes) {
+        const float* fc = pop[p_idx].full_cache.data();
 
-        float best_gain = 0.0f, best_thr = 0.0f;
-        int best_axis_idx = -1;
-        bool found = false;
+        // [빼기의 핵심] 레이어 전체 샘플을 아우르는 단 하나의 공통 스케일링
+        // 범위 확정
+        float layer_min_v = 1e30f, layer_max_v = -1e30f;
+        for (int j : layer_samp) {
+          float v = fc[j];
+          if (v < layer_min_v) layer_min_v = v;
+          if (v > layer_max_v) layer_max_v = v;
+        }
+        if (layer_max_v - layer_min_v < 1e-5f) continue;
+        float scale = (float)HIST_BINS / (layer_max_v - layer_min_v + EPS);
 
-        // [FIXED] OpenMP 메모리 격리를 위해 스레드 워커 내부 공간에 로컬 백
-        // 생성 (Segfault 완벽 박멸)
-        std::vector<float> thread_bin_G((size_t)HIST_BINS * K, 0.0f);
-        std::vector<float> thread_bin_H((size_t)HIST_BINS * K, 0.0f);
-        std::vector<int> thread_bin_cnt(HIST_BINS, 0);
+        // 메모리 경리를 유지하면서 전역 히스토그램을 빌드하기 위한 플래트닝
+        // 버퍼
+        std::vector<float> layer_bin_G((size_t)max_nodes * HIST_BINS * K, 0.0f);
+        std::vector<float> layer_bin_H((size_t)max_nodes * HIST_BINS * K, 0.0f);
+        std::vector<int> layer_bin_cnt((size_t)max_nodes * HIST_BINS, 0);
 
-        for (int p_idx : p_layer_axes) {
-          const float* fc = pop[p_idx].full_cache.data();
-
-          float min_v = 1e30f, max_v = -1e30f;
-          for (int j : samp) {
-            float v = fc[j];
-            if (v < min_v) min_v = v;
-            if (v > max_v) max_v = v;
-          }
-          if (max_v - min_v < 1e-5f) continue;
-
-          std::fill(thread_bin_G.begin(), thread_bin_G.end(), 0.0f);
-          std::fill(thread_bin_H.begin(), thread_bin_H.end(), 0.0f);
-          std::fill(thread_bin_cnt.begin(), thread_bin_cnt.end(), 0);
-
-          float scale = (float)HIST_BINS / (max_v - min_v + EPS);
-          for (int j : samp) {
-            int b = (int)((fc[j] - min_v) * scale);
+        for (int t_node : active_nodes) {
+          size_t n_offset = (size_t)t_node * HIST_BINS;
+          for (int j : node_samp[t_node]) {
+            int b = (int)((fc[j] - layer_min_v) * scale);
             if (b < 0) b = 0;
             if (b >= HIST_BINS) b = HIST_BINS - 1;
 
-            thread_bin_cnt[b]++;
-            size_t b_offset = (size_t)b * K;
-            const float* gj = G + (size_t)j * K;
-            const float* hj = H + (size_t)j * K;
+            layer_bin_cnt[n_offset + b]++;
+            size_t b_offset = (n_offset + b) * K;
             for (int c = 0; c < K; c++) {
-              thread_bin_G[b_offset + c] += gj[c];
-              thread_bin_H[b_offset + c] += hj[c];
-            }
-          }
-
-          std::vector<float> Gc(K, 0.0f), Hc(K, 0.0f);
-          int cum_left_cnt = 0;
-
-          for (int b = 0; b < HIST_BINS - 1; b++) {
-            cum_left_cnt += thread_bin_cnt[b];
-            size_t b_offset = (size_t)b * K;
-            for (int c = 0; c < K; c++) {
-              Gc[c] += thread_bin_G[b_offset + c];
-              Hc[c] += thread_bin_H[b_offset + c];
-            }
-            int cum_right_cnt = (int)samp.size() - cum_left_cnt;
-            if (cum_left_cnt < 10 || cum_right_cnt < 10) continue;
-
-            // Check total hessian across classes (not per-class).
-            // Per-class check was too strict for imbalanced multiclass: one
-            // rare class failing MIN_CHILD_W would reject otherwise valid
-            // splits.
-            float Hc_sum = 0.0f, Hr_sum = 0.0f;
-            for (int c = 0; c < K; c++) {
-              Hc_sum += Hc[c];
-              Hr_sum += Ht[c] - Hc[c];
-            }
-            if (Hc_sum < MIN_CHILD_W || Hr_sum < MIN_CHILD_W) continue;
-
-            float gain = total_base;
-            for (int c = 0; c < K; c++) {
-              float Gr = Gt[c] - Gc[c], Hr = Ht[c] - Hc[c];
-              gain += 0.5f * (Gc[c] * Gc[c] / (Hc[c] + reg_lambda + EPS) +
-                              Gr * Gr / (Hr + reg_lambda + EPS));
-            }
-
-            if (gain > best_gain) {
-              best_gain = gain;
-              best_thr =
-                  min_v + ((float)(b + 1) / (float)HIST_BINS) * (max_v - min_v);
-              best_axis_idx = p_idx;
-              found = true;
+              layer_bin_G[b_offset + c] += G[(size_t)j * K + c];
+              layer_bin_H[b_offset + c] += H[(size_t)j * K + c];
             }
           }
         }
 
-        if (found) {
-          tree->is_leaf[t_node] = 0;
-          tree->split_hyp_idx[t_node] = best_axis_idx;
-          tree->split_threshold[t_node] = best_thr;
-          tree->split_gain[t_node] = best_gain;
+        // 특정 전역 임계값(b)에 대해 레이어 전체 노드들이 얻는 '결합 이득'의
+        // 총합을 평가
+        for (int b = 0; b < HIST_BINS - 1; b++) {
+          float current_bin_layer_gain = 0.0f;
+          bool valid_split_for_layer = false;
 
-          const float* best_fc = pop[best_axis_idx].full_cache.data();
+          for (int t_node : active_nodes) {
+            size_t n_offset = (size_t)t_node * HIST_BINS;
+            std::vector<float> Gc(K, 0.0f), Hc(K, 0.0f);
+            int cum_left_cnt = 0;
+
+            for (int bb = 0; bb <= b; bb++) {
+              cum_left_cnt += layer_bin_cnt[n_offset + bb];
+              size_t b_offset = (n_offset + bb) * K;
+              for (int c = 0; c < K; c++) {
+                Gc[c] += layer_bin_G[b_offset + c];
+                Hc[c] += layer_bin_H[b_offset + c];
+              }
+            }
+
+            int cum_right_cnt = (int)node_samp[t_node].size() - cum_left_cnt;
+            if (cum_left_cnt < 10 || cum_right_cnt < 10) continue;
+
+            float Hc_sum = 0.0f, Hr_sum = 0.0f;
+            for (int c = 0; c < K; c++) {
+              Hc_sum += Hc[c];
+              Hr_sum += node_Ht[t_node][c] - Hc[c];
+            }
+            if (Hc_sum < MIN_CHILD_W || Hr_sum < MIN_CHILD_W) continue;
+
+            float node_gain = node_base[t_node];
+            for (int c = 0; c < K; c++) {
+              float Gr = node_Gt[t_node][c] - Gc[c];
+              float Hr = node_Ht[t_node][c] - Hc[c];
+              node_gain += 0.5f * (Gc[c] * Gc[c] / (Hc[c] + reg_lambda + EPS) +
+                                   Gr * Gr / (Hr + reg_lambda + EPS));
+            }
+            current_bin_layer_gain += node_gain;
+            valid_split_for_layer = true;
+          }
+
+          if (valid_split_for_layer &&
+              current_bin_layer_gain > best_layer_total_gain) {
+            best_layer_total_gain = current_bin_layer_gain;
+            best_global_axis = p_idx;
+            best_global_threshold =
+                layer_min_v + ((float)(b + 1) / (float)HIST_BINS) *
+                                  (layer_max_v - layer_min_v);
+          }
+        }
+      }
+
+      // 결정된 '단 하나의 불변의 초평면'으로 모든 활성 노드를 완전히 똑같이
+      // 일괄 분할 적용
+      if (best_global_axis != -1) {
+        const float* best_fc = pop[best_global_axis].full_cache.data();
+        for (int t_node : active_nodes) {
+          int tl = 2 * t_node + 1, tr_node = 2 * t_node + 2;
+          tree->is_leaf[t_node] = 0;
+          tree->split_hyp_idx[t_node] = best_global_axis;
+          tree->split_threshold[t_node] = best_global_threshold;
+          tree->split_gain[t_node] = best_layer_total_gain / n_active;
+
           std::vector<int> left_sub, right_sub;
-          for (int j : samp) {
-            if (best_fc[j] < best_thr)
+          for (int j : node_samp[t_node]) {
+            if (best_fc[j] < best_global_threshold)
               left_sub.push_back(j);
             else
               right_sub.push_back(j);
@@ -1074,21 +1080,16 @@ static std::vector<bool> local_bundle_check(const std::vector<int>& wls_samp,
   return excl_local;
 }
 
-// Per-node block WLS on a single representative class.
-// Uses Gershgorin Bound Adaptive Oblique Regularization (GBAOR):
-//   estimates λ_min via Gershgorin circles in O(d²), adds adaptive ridge
-//   so cond(A) ≤ 1/gbaor_alpha — no SVD, no extra passes.
 static std::vector<float> node_block_wls(
     const std::vector<int>& wls_samp, const std::vector<int>& feat_sub, int D,
     int D_num, const float* X, const float* G, const float* H, int K,
     float reg_lambda, float energy_frac, float gbaor_alpha,
-    const std::vector<bool>& excl,        // global D_num×D_num, may be empty
-    const std::vector<bool>& excl_local)  // local d×d, may be empty
+    const std::vector<bool>& excl,
+    const std::vector<bool>& excl_local)
 {
   int nw = (int)wls_samp.size();
   int d = (int)feat_sub.size();
 
-  // Pick representative class: highest sum of |g_i|
   int best_c = 0;
   float best_g_mass = 0.0f;
   for (int c = 0; c < K; c++) {
@@ -1128,9 +1129,6 @@ static std::vector<float> node_block_wls(
     }
   }
 
-  // ── GBAOR: Gershgorin-bound adaptive regularization ──────────────────────
-  // λ_adapt = max(0, (α·λ̂_max - λ̂_min) / (1 - α))
-  // Cost: O(d²) row-sum scan — no eigendecomposition needed.
   if (gbaor_alpha > 0.0f) {
     float lam_max_est = -1e30f, lam_min_est = 1e30f;
     for (int j = 0; j < d; j++) {
@@ -1191,9 +1189,6 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
   // d_sub: number of features sampled per node for WLS
   int d_sub =
       std::max(2, std::min(d_sub_max, (int)std::ceil(std::sqrt((float)D_num))));
-
-  // Pre-compute bundle exclusivity matrix (one-time, O(D²) but only if D≤150)
-  std::vector<bool> excl = compute_bundle_matrix(X, D, D_num, sub, Ns);
 
   std::vector<std::vector<int>> node_samp(max_nodes);
   node_samp[0].assign(sub, sub + Ns);
@@ -1260,6 +1255,8 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
       float best_gain = 0.0f, best_thr = 0.0f;
       std::vector<float> best_w;
 
+      std::vector<bool> excl = compute_bundle_matrix(X, D, D_num, sub, Ns);
+
       for (int cand = 0; cand < n_candidates; cand++) {
         // Each candidate draws a fresh feature subset
         std::vector<int> feat_sub(D_num);
@@ -1273,9 +1270,9 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
         if (D_num > 150)
           excl_local = local_bundle_check(wls_samp, feat_sub, D, X);
 
-        std::vector<float> w_c =
-            node_block_wls(wls_samp, feat_sub, D, D_num, X, G, H, K, reg_lambda,
-                           energy_frac, gbaor_alpha, excl, excl_local);
+        std::vector<float> w_c = node_block_wls(
+            wls_samp, feat_sub, D, D_num, X, G, H, K, reg_lambda, energy_frac,
+            gbaor_alpha, excl, excl_local);
         if (w_c.empty()) continue;
 
         // Project estimation set; honest: samp_e only, standard: samp_e == samp
@@ -1342,13 +1339,83 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
         }
       }  // end candidate loop
 
+      // ── Categorical axis-aligned scan: features [D_num, D)
+      // ────────────────── Each categorical feature is scanned independently
+      // (axis-aligned split). Winning direction is a unit vector e_cf; routing
+      // uses the full D-dim dot.
+      {
+        int ne = (int)samp_e.size();
+        for (int cf = D_num; cf < D; cf++) {
+          float min_v = 1e30f, max_v = -1e30f;
+          std::vector<float> proj_e(ne);
+          for (int si = 0; si < ne; si++) {
+            float v = X[(size_t)samp_e[si] * D + cf];
+            proj_e[si] = v;
+            if (v < min_v) min_v = v;
+            if (v > max_v) max_v = v;
+          }
+          if (max_v - min_v < 0.5f) continue;
+
+          std::vector<float> bin_G((size_t)HIST_BINS * K, 0.0f);
+          std::vector<float> bin_H((size_t)HIST_BINS * K, 0.0f);
+          std::vector<int> bin_cnt(HIST_BINS, 0);
+          float scale = (float)HIST_BINS / (max_v - min_v + EPS);
+          for (int si = 0; si < ne; si++) {
+            int j = samp_e[si];
+            int b = (int)((proj_e[si] - min_v) * scale);
+            if (b < 0) b = 0;
+            if (b >= HIST_BINS) b = HIST_BINS - 1;
+            bin_cnt[b]++;
+            size_t bo = (size_t)b * K;
+            for (int c = 0; c < K; c++) {
+              bin_G[bo + c] += G[(size_t)j * K + c];
+              bin_H[bo + c] += H[(size_t)j * K + c];
+            }
+          }
+
+          std::vector<float> Gc(K, 0.0f), Hc(K, 0.0f);
+          int n_left = 0;
+          for (int b = 0; b < HIST_BINS - 1; b++) {
+            n_left += bin_cnt[b];
+            size_t bo = (size_t)b * K;
+            for (int c = 0; c < K; c++) {
+              Gc[c] += bin_G[bo + c];
+              Hc[c] += bin_H[bo + c];
+            }
+            int n_right = ns - n_left;
+            if (n_left < 10 || n_right < 10) continue;
+
+            float Hc_sum = 0.0f, Hr_sum = 0.0f;
+            for (int c = 0; c < K; c++) {
+              Hc_sum += Hc[c];
+              Hr_sum += Ht[c] - Hc[c];
+            }
+            if (Hc_sum < MIN_CHILD_W || Hr_sum < MIN_CHILD_W) continue;
+
+            float gain = total_base;
+            for (int c = 0; c < K; c++) {
+              float Gr = Gt[c] - Gc[c], Hr = Ht[c] - Hc[c];
+              gain += 0.5f * (Gc[c] * Gc[c] / (Hc[c] + reg_lambda + EPS) +
+                              Gr * Gr / (Hr + reg_lambda + EPS));
+            }
+            if (gain > best_gain) {
+              best_gain = gain;
+              best_thr = min_v + ((float)(b + 1) / HIST_BINS) * (max_v - min_v);
+              best_w.assign(D, 0.0f);
+              best_w[cf] = 1.0f;
+            }
+          }
+        }
+      }  // end categorical scan
+
       if (!best_w.empty()) {
-        // Re-project with winning direction for sample routing
+        // Re-project with winning direction for sample routing (covers all D
+        // dims so categorical unit-vector splits are routed correctly)
         std::vector<float> node_proj(ns);
         for (int si = 0; si < ns; si++) {
           const float* xi = X + (size_t)samp[si] * D;
           float proj = 0.0f;
-          for (int f = 0; f < D_num; f++) proj += best_w[f] * xi[f];
+          for (int f = 0; f < D; f++) proj += best_w[f] * xi[f];
           node_proj[si] = proj;
         }
 

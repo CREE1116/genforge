@@ -243,9 +243,37 @@ return softmax(F)
 
 ---
 
+## C++ 엔진
+
+모든 풀 진화 및 트리 빌드 연산은 `_ext/bfstree.cpp`(C++17, OpenMP)에서 실행. Python은 ctypes(`_pool.py`)로 호출.
+
+### Gain 평가 — prefix-sum 최적화 (v0.1.2+)
+
+`evolve()`의 가장 뜨거운 내부 루프: 각 가설에 대해 9개 분위수 위치에서 분할 gain을 계산.
+
+- **이전 방식**: 각 임계값마다 Ns개 샘플을 독립적으로 스캔 → O(9 × Ns × K)
+- **최적화 방식**:
+  1. 가설 값 기준 argsort: O(Ns log Ns)
+  2. 정렬 순서로 G/H prefix sum 한 번 구성: O(Ns × K)
+  3. 9개 분위 위치에서 O(K) 조회
+
+전체 복잡도: O(Ns log Ns + Ns × K) vs. 이전 O(9 × Ns × K). 스캔 단계 기준 약 **9× 속도 향상**.
+
+prefix 버퍼는 모두 `thread_local` — OpenMP 스레드당 한 번 할당, 가설마다 재사용. 병렬 루프 내부에서 힙 할당 없음.
+
+### 기타 최적화
+
+| 영역 | 이전 | 이후 |
+|------|------|------|
+| candidate z값 저장 | `vector<vector<float>>` (C 힙 할당) | 제거 — sort 순서를 직접 사용 |
+| 유사도 dedup 캐시 | `vector<vector<float>>` (P개 할당) | 평탄 `vector<float>` (P×Ns_sim) |
+| `is_kept` 멤버십 확인 | `O(\|kept\|)` `std::find` | `O(1)` `vector<bool>` |
+
+---
+
 ## 성능
 
-에블레이션 벤치마크 (3개 데이터셋: spiral-2D, checker-2D, hiD-20D; 시드 3개):
+### 에블레이션 (풀 기능 누적 추가, 3 데이터셋, 3 시드)
 
 | 설정 | 평균 정확도 |
 |-----|-----------|
@@ -257,18 +285,42 @@ return softmax(F)
 | + subsample=0.8 | 0.9376 |
 | + pool_size=400 | **0.9394** |
 
-최종 비교 (동일 3개 데이터셋, n_estimators=300):
+### 프레임워크 간 비교 벤치마크 (9개 데이터셋, n_estimators=100)
 
-| 모델 | 평균 정확도 |
-|------|-----------|
-| **HypForge** | **0.9338** |
-| XGBoost | 0.9318 |
-| LightGBM | 0.9308 |
-| ExtraTrees | 0.9306 |
-| GradBoost-sklearn | 0.9282 |
-| RandomForest | 0.9236 |
+`python scripts/benchmark.py`로 재현 가능. 데이터셋은 `data/benchmarks/`에 저장.
 
-HypForge는 고차원 데이터(hiD-20D: 0.9160 vs XGBoost 0.8967)에서 두드러진 우위. 축 정렬 분할로는 표현할 수 없는 특성 선형 결합을 사선 분할이 발견하기 때문.
+| 데이터셋 | HypForge | XGBoost | LightGBM | RandomForest |
+|---------|----------|---------|----------|--------------|
+| iris (4-D, 3-cls) | 0.9000 | 0.9667 | 0.9667 | 0.9000 |
+| wine (13-D, 3-cls) | 0.9167 | 0.9722 | **1.0000** | **1.0000** |
+| breast_cancer (30-D, 2-cls) | 0.9474 | 0.9474 | 0.9561 | 0.9561 |
+| moons (2-D, 2-cls) | **0.9113** | 0.9038 | 0.9075 | 0.9025 |
+| circles (2-D, 2-cls) | **0.8925** | 0.8875 | 0.8862 | 0.8675 |
+| hiD 20-D 4-cls | **0.8031** | 0.7712 | 0.7863 | 0.8544 |
+| binary 30-D | **0.9125** | 0.8750 | 0.8800 | 0.9437 |
+| multiclass 50-D 6-cls | 0.6090 | 0.6085 | **0.6350** | 0.7765 |
+| oblique 20-D 4-cls | **0.8656** | 0.7031 | 0.7244 | 0.7738 |
+| **평균** | **0.8620** | 0.8484 | 0.8602 | 0.8861 |
+
+HypForge는 사선 구조 데이터셋에서 두드러진 우위: oblique 20-D 기준 XGBoost 대비 **+23 pp**, LightGBM 대비 **+14 pp**. 축 정렬 분할로는 잡을 수 없는 특성 선형 결합을 학습된 투영 방향이 발견하기 때문.
+
+---
+
+## 벤치마크 실행
+
+```bash
+# 데이터셋 생성 (1회, ~2초)
+python scripts/generate_datasets.py
+
+# 전체 벤치마크 (n_estimators=300)
+python scripts/benchmark.py
+
+# 빠른 연기 테스트
+python scripts/benchmark.py --quick
+
+# 단일 데이터셋
+python scripts/benchmark.py --dataset oblique_20d_4cls
+```
 
 ---
 
