@@ -19,22 +19,23 @@ def _get_salot_lib():
     _pi = ctypes.POINTER(ctypes.c_int)
 
     lib.salot_build.argtypes = [
-        _pf,                   # X         [N, D]
+        _pf,                   # X             [N, D]
         ctypes.c_int,          # N
         ctypes.c_int,          # D
         ctypes.c_int,          # D_num
-        _pf,                   # G         [N, K]
-        _pf,                   # H         [N, K]
+        _pf,                   # G             [N, K]
+        _pf,                   # H             [N, K]
         ctypes.c_int,          # K
-        _pi,                   # sub       [Ns]
+        _pi,                   # sub           [Ns]
         ctypes.c_int,          # Ns
         ctypes.c_int,          # max_depth
         ctypes.c_float,        # reg_lambda
         ctypes.c_int,          # n_wls_max
         ctypes.c_int,          # d_sub_max
         ctypes.c_float,        # energy_frac
+        ctypes.c_float,        # gbaor_alpha
         ctypes.c_uint,         # seed
-        _pf,                   # out_pred  [N, K]  (may be NULL)
+        _pf,                   # out_pred      [N, K]  (may be NULL)
     ]
     lib.salot_build.restype = ctypes.c_void_p
 
@@ -63,11 +64,12 @@ class SALOTTree:
     Parameters
     ----------
     max_depth      : int
-    reg_lambda     : float   L2 regularisation
+    reg_lambda     : float   base L2 regularisation (λ₀)
     prune_strength : float   energy pruning: 0 = none, 1 = aggressive
     n_wls_max      : int     max instances used for WLS per node (default 512)
     d_sub_max      : int     max features for WLS block; 0 → ceil(sqrt(D))
     subsample      : float   fraction of training samples used
+    gbaor_alpha    : float   Gershgorin bound ratio target; 0 = disabled
     random_state   : int | None
     """
 
@@ -79,6 +81,7 @@ class SALOTTree:
         n_wls_max:      int   = 512,
         d_sub_max:      int   = 32,
         subsample:      float = 1.0,
+        gbaor_alpha:    float = 0.05,
         random_state:   int | None = None,
     ):
         self.max_depth      = max_depth
@@ -87,6 +90,7 @@ class SALOTTree:
         self.n_wls_max      = n_wls_max
         self.d_sub_max      = d_sub_max
         self.subsample      = subsample
+        self.gbaor_alpha    = gbaor_alpha
         self.random_state   = random_state
         self._tree_handle   = None
         self._N             = None
@@ -147,6 +151,7 @@ class SALOTTree:
             ctypes.c_int(self.n_wls_max),
             ctypes.c_int(self.d_sub_max),
             ctypes.c_float(energy_frac),
+            ctypes.c_float(self.gbaor_alpha),
             ctypes.c_uint(seed),
             _pf(out_pred),
         )

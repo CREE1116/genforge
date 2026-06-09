@@ -1074,15 +1074,13 @@ static std::vector<bool> local_bundle_check(
 }
 
 // Per-node block WLS on a single representative class.
-// Instead of K independent Cholesky solves, pick the class with the highest
-// total |gradient| mass — O(K) scan cost, then one O(d³) solve.
-//
-// For global excl (D_num ≤ 150): index as excl[fi_real * D_num + fj_real].
-// For high-D: pass empty excl + non-empty excl_local (d×d, local indices).
+// Uses Gershgorin Bound Adaptive Oblique Regularization (GBAOR):
+//   estimates λ_min via Gershgorin circles in O(d²), adds adaptive ridge
+//   so cond(A) ≤ 1/gbaor_alpha — no SVD, no extra passes.
 static std::vector<float> node_block_wls(
     const std::vector<int>& wls_samp, const std::vector<int>& feat_sub,
     int D, int D_num, const float* X, const float* G, const float* H, int K,
-    float reg_lambda, float energy_frac,
+    float reg_lambda, float energy_frac, float gbaor_alpha,
     const std::vector<bool>& excl,        // global D_num×D_num, may be empty
     const std::vector<bool>& excl_local)  // local d×d, may be empty
 {
@@ -1111,7 +1109,6 @@ static std::vector<float> node_block_wls(
       r[fi] -= xfi * gk;
       A[fi * d + fi] += hk * xfi * xfi;
       for (int fj = fi + 1; fj < d; fj++) {
-        // Zero-cross-term bundling: skip exclusive pairs
         bool is_excl = false;
         if (!excl_local.empty()) {
           is_excl = excl_local[(size_t)fi * d + fj];
@@ -1126,7 +1123,29 @@ static std::vector<float> node_block_wls(
       }
     }
   }
-  for (int fi = 0; fi < d; fi++) A[fi * d + fi] += reg_lambda;
+
+  // ── GBAOR: Gershgorin-bound adaptive regularization ──────────────────────
+  // λ_adapt = max(0, (α·λ̂_max - λ̂_min) / (1 - α))
+  // Cost: O(d²) row-sum scan — no eigendecomposition needed.
+  if (gbaor_alpha > 0.0f) {
+    float lam_max_est = -1e30f, lam_min_est = 1e30f;
+    for (int j = 0; j < d; j++) {
+      float Rj = 0.0f;
+      for (int k = 0; k < d; k++) if (k != j) Rj += std::abs(A[j * d + k]);
+      float diag = A[j * d + j];
+      lam_max_est = std::max(lam_max_est, diag + Rj);
+      lam_min_est = std::min(lam_min_est, diag - Rj);
+    }
+    float lam_adapt = 0.0f;
+    if (lam_max_est > 0.0f) {
+      float needed = gbaor_alpha * lam_max_est;
+      if (lam_min_est < needed)
+        lam_adapt = (needed - lam_min_est) / (1.0f - gbaor_alpha);
+    }
+    for (int j = 0; j < d; j++) A[j * d + j] += reg_lambda + lam_adapt;
+  } else {
+    for (int j = 0; j < d; j++) A[j * d + j] += reg_lambda;
+  }
 
   std::vector<float> w_d = cholesky_solve(A, r, d);
 
@@ -1142,7 +1161,6 @@ static std::vector<float> node_block_wls(
 
 // salot_build — Pool-less Local Stochastic Oblique GBDT tree builder
 //
-// Parameters added vs old version:
 //   n_wls_max   : max instance subsample for WLS per node (e.g. 512)
 //   d_sub_max   : max feature dimension for WLS block (e.g. 32)
 //   energy_frac : energy-pruning threshold (e.g. 0.90)
@@ -1150,7 +1168,8 @@ static std::vector<float> node_block_wls(
 void* salot_build(const float* X, int N, int D, int D_num, const float* G,
                   const float* H, int K, const int* sub, int Ns, int max_depth,
                   float reg_lambda, int n_wls_max, int d_sub_max,
-                  float energy_frac, unsigned int seed, float* out_pred) {
+                  float energy_frac, float gbaor_alpha, unsigned int seed,
+                  float* out_pred) {
   int max_nodes = (1 << (max_depth + 1)) - 1;
   auto* tree = new BFSTree();
   tree->K = K;
@@ -1224,7 +1243,7 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
       // ── Block WLS: find best oblique direction for this node ───────────────
       std::vector<float> best_w = node_block_wls(
           wls_samp, feat_sub, D, D_num, X, G, H, K,
-          reg_lambda, energy_frac, excl, excl_local);
+          reg_lambda, energy_frac, gbaor_alpha, excl, excl_local);
       if (best_w.empty()) continue;
 
       // ── Compute Gt/Ht using full node data ────────────────────────────────
