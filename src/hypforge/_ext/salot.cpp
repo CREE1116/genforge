@@ -1174,7 +1174,7 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
                   const float* H, int K, const int* sub, int Ns, int max_depth,
                   float reg_lambda, int n_wls_max, int d_sub_max,
                   float energy_frac, float gbaor_alpha, int n_candidates,
-                  unsigned int seed, float* out_pred) {
+                  int honest_split, unsigned int seed, float* out_pred) {
   int max_nodes = (1 << (max_depth + 1)) - 1;
   auto* tree = new BFSTree();
   tree->K = K;
@@ -1201,10 +1201,11 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
   for (int depth = 0; depth < max_depth; depth++) {
     int first_node = (1 << depth) - 1, n_at_depth = 1 << depth;
 
+    int min_node = honest_split ? 40 : 20;
     std::vector<int> active_nodes;
     for (int local = 0; local < n_at_depth; local++) {
       int t = first_node + local;
-      if ((int)node_samp[t].size() < 20) continue;
+      if ((int)node_samp[t].size() < min_node) continue;
       active_nodes.push_back(t);
     }
     if (active_nodes.empty()) break;
@@ -1222,19 +1223,31 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
       // Independent per-node RNG
       std::mt19937 rng(seed ^ (unsigned)t_node ^ (unsigned)(depth * 1000003u));
 
-      // ── Instance subsampling for WLS (shared across all candidates) ────────
-      std::vector<int> wls_samp;
-      if (ns > n_wls_max) {
-        wls_samp = samp;
-        std::shuffle(wls_samp.begin(), wls_samp.end(), rng);
-        wls_samp.resize(n_wls_max);
+      // ── Honest split: separate structure (WLS) and estimation (gain) sets ──
+      // samp_s → WLS direction;  samp_e → Gt/Ht, histogram gain, threshold
+      // Routing always uses the full samp (both halves).
+      std::vector<int> samp_s, samp_e;
+      if (honest_split) {
+        std::vector<int> shuffled = samp;
+        std::shuffle(shuffled.begin(), shuffled.end(), rng);
+        int n_s = ns / 2;
+        samp_s.assign(shuffled.begin(), shuffled.begin() + n_s);
+        samp_e.assign(shuffled.begin() + n_s, shuffled.end());
       } else {
-        wls_samp = samp;
+        samp_s = samp;
+        samp_e = samp;
       }
 
-      // ── Compute Gt/Ht using full node data (shared across candidates) ──────
+      // ── Instance subsampling for WLS (from structure set only) ────────────
+      std::vector<int> wls_samp = samp_s;
+      if ((int)wls_samp.size() > n_wls_max) {
+        std::shuffle(wls_samp.begin(), wls_samp.end(), rng);
+        wls_samp.resize(n_wls_max);
+      }
+
+      // ── Compute Gt/Ht from estimation set (shared across candidates) ───────
       std::vector<float> Gt(K, 0.0f), Ht(K, 0.0f);
-      for (int j : samp)
+      for (int j : samp_e)
         for (int c = 0; c < K; c++) {
           Gt[c] += G[(size_t)j * K + c];
           Ht[c] += H[(size_t)j * K + c];
@@ -1265,14 +1278,15 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
                            energy_frac, gbaor_alpha, excl, excl_local);
         if (w_c.empty()) continue;
 
-        // Project and histogram scan for this candidate
+        // Project estimation set; honest: samp_e only, standard: samp_e == samp
+        int ne = (int)samp_e.size();
         float min_v = 1e30f, max_v = -1e30f;
-        std::vector<float> proj_c(ns);
-        for (int si = 0; si < ns; si++) {
-          const float* xi = X + (size_t)samp[si] * D;
+        std::vector<float> proj_e(ne);
+        for (int si = 0; si < ne; si++) {
+          const float* xi = X + (size_t)samp_e[si] * D;
           float proj = 0.0f;
           for (int f = 0; f < D_num; f++) proj += w_c[f] * xi[f];
-          proj_c[si] = proj;
+          proj_e[si] = proj;
           if (proj < min_v) min_v = proj;
           if (proj > max_v) max_v = proj;
         }
@@ -1282,9 +1296,9 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
         std::vector<float> bin_H((size_t)HIST_BINS * K, 0.0f);
         std::vector<int> bin_cnt(HIST_BINS, 0);
         float scale = (float)HIST_BINS / (max_v - min_v + EPS);
-        for (int si = 0; si < ns; si++) {
-          int j = samp[si];
-          int b = (int)((proj_c[si] - min_v) * scale);
+        for (int si = 0; si < ne; si++) {
+          int j = samp_e[si];
+          int b = (int)((proj_e[si] - min_v) * scale);
           if (b < 0) b = 0;
           if (b >= HIST_BINS) b = HIST_BINS - 1;
           bin_cnt[b]++;
