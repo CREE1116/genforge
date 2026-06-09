@@ -648,6 +648,7 @@ class SALOTClassifier(HypForgeClassifier):
         gbaor_alpha:           float = 0.05,
         n_candidates:          int   = 3,
         honest_split:          bool  = False,
+        quant_levels:          int   = 0,
     ):
         super().__init__(
             n_estimators          = n_estimators,
@@ -670,6 +671,7 @@ class SALOTClassifier(HypForgeClassifier):
         self.gbaor_alpha      = gbaor_alpha
         self.n_candidates     = n_candidates
         self.honest_split     = honest_split
+        self.quant_levels     = quant_levels
 
     def _fit_core(self, X, y, X_val, y_val, D_num):
         from ._salot import SALOTTree
@@ -724,6 +726,7 @@ class SALOTClassifier(HypForgeClassifier):
                 gbaor_alpha    = self.gbaor_alpha,
                 n_candidates   = self.n_candidates,
                 honest_split   = self.honest_split,
+                quant_levels   = self.quant_levels,
                 random_state   = seed + m,
             )
             out_pred = t.fit_predict(X, G_w, H_w, D_num=D_num, subset=tree_sub)

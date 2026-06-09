@@ -1085,7 +1085,8 @@ static std::vector<float> node_block_wls(
     int D_num, const float* X, const float* G, const float* H, int K,
     float reg_lambda, float energy_frac, float gbaor_alpha,
     const std::vector<bool>& excl,
-    const std::vector<bool>& excl_local)
+    const std::vector<bool>& excl_local,
+    int quant_levels = 0)
 {
   int nw = (int)wls_samp.size();
   int d = (int)feat_sub.size();
@@ -1152,6 +1153,18 @@ static std::vector<float> node_block_wls(
 
   std::vector<float> w_d = cholesky_solve(A, r, d);
 
+  // Weight quantization: snap each component to nearest k/quant_levels.
+  // quant_levels=0 → disabled; 1 → ternary {-1,0,+1}; 2 → {-1,-½,0,½,1}
+  if (quant_levels > 0) {
+    float max_abs = 0.0f;
+    for (int fi = 0; fi < d; fi++) max_abs = std::max(max_abs, std::abs(w_d[fi]));
+    if (max_abs > EPS) {
+      float q = 1.0f / (float)quant_levels;
+      for (int fi = 0; fi < d; fi++)
+        w_d[fi] = std::round(w_d[fi] / max_abs / q) * q * max_abs;
+    }
+  }
+
   std::vector<float> w(D, 0.0f);
   for (int fi = 0; fi < d; fi++) w[feat_sub[fi]] = w_d[fi];
 
@@ -1172,7 +1185,8 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
                   const float* H, int K, const int* sub, int Ns, int max_depth,
                   float reg_lambda, int n_wls_max, int d_sub_max,
                   float energy_frac, float gbaor_alpha, int n_candidates,
-                  int honest_split, unsigned int seed, float* out_pred) {
+                  int honest_split, unsigned int seed, float* out_pred,
+                  int quant_levels = 0) {
   int max_nodes = (1 << (max_depth + 1)) - 1;
   auto* tree = new BFSTree();
   tree->K = K;
@@ -1272,7 +1286,7 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
 
         std::vector<float> w_c = node_block_wls(
             wls_samp, feat_sub, D, D_num, X, G, H, K, reg_lambda, energy_frac,
-            gbaor_alpha, excl, excl_local);
+            gbaor_alpha, excl, excl_local, quant_levels);
         if (w_c.empty()) continue;
 
         // Project estimation set; honest: samp_e only, standard: samp_e == samp

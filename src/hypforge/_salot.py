@@ -38,6 +38,7 @@ def _get_salot_lib():
         ctypes.c_int,          # honest_split
         ctypes.c_uint,         # seed
         _pf,                   # out_pred      [N, K]  (may be NULL)
+        ctypes.c_int,          # quant_levels  (0=off, 1=ternary, 2=5-level)
     ]
     lib.salot_build.restype = ctypes.c_void_p
 
@@ -87,6 +88,7 @@ class SALOTTree:
         gbaor_alpha:    float = 0.05,
         n_candidates:   int   = 3,
         honest_split:   bool  = False,
+        quant_levels:   int   = 0,
         random_state:   int | None = None,
     ):
         self.max_depth      = max_depth
@@ -98,6 +100,7 @@ class SALOTTree:
         self.gbaor_alpha    = gbaor_alpha
         self.n_candidates   = n_candidates
         self.honest_split   = honest_split
+        self.quant_levels   = quant_levels
         self.random_state   = random_state
         self._tree_handle   = None
         self._N             = None
@@ -163,6 +166,7 @@ class SALOTTree:
             ctypes.c_int(1 if self.honest_split else 0),
             ctypes.c_uint(seed),
             _pf(out_pred),
+            ctypes.c_int(self.quant_levels),
         )
         return out_pred
 
