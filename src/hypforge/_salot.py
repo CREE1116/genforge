@@ -34,6 +34,7 @@ def _get_salot_lib():
         ctypes.c_int,          # d_sub_max
         ctypes.c_float,        # energy_frac
         ctypes.c_float,        # gbaor_alpha
+        ctypes.c_int,          # n_candidates
         ctypes.c_uint,         # seed
         _pf,                   # out_pred      [N, K]  (may be NULL)
     ]
@@ -70,6 +71,7 @@ class SALOTTree:
     d_sub_max      : int     max features for WLS block; 0 → ceil(sqrt(D))
     subsample      : float   fraction of training samples used
     gbaor_alpha    : float   Gershgorin bound ratio target; 0 = disabled
+미    n_candidates   : int     WLS direction candidates per node; best by gain wins
     random_state   : int | None
     """
 
@@ -82,6 +84,7 @@ class SALOTTree:
         d_sub_max:      int   = 32,
         subsample:      float = 1.0,
         gbaor_alpha:    float = 0.05,
+        n_candidates:   int   = 3,
         random_state:   int | None = None,
     ):
         self.max_depth      = max_depth
@@ -91,6 +94,7 @@ class SALOTTree:
         self.d_sub_max      = d_sub_max
         self.subsample      = subsample
         self.gbaor_alpha    = gbaor_alpha
+        self.n_candidates   = n_candidates
         self.random_state   = random_state
         self._tree_handle   = None
         self._N             = None
@@ -152,6 +156,7 @@ class SALOTTree:
             ctypes.c_int(self.d_sub_max),
             ctypes.c_float(energy_frac),
             ctypes.c_float(self.gbaor_alpha),
+            ctypes.c_int(self.n_candidates),
             ctypes.c_uint(seed),
             _pf(out_pred),
         )

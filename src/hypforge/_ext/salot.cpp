@@ -989,9 +989,10 @@ void* tpool_build_salot_tree(void* pool_handle, const float* X,
   return static_cast<void*>(tree);
 }
 
-// ── Pool-less Local Stochastic Oblique Boosting ───────────────────────────────
-// Per-node: block WLS (true oblique) + instance subsampling + feature
-// subsampling + zero-cross-term bundling.  No persistent pool, no global cache.
+// ── Pool-less Local Stochastic Oblique Boosting
+// ─────────────────────────────── Per-node: block WLS (true oblique) + instance
+// subsampling + feature subsampling + zero-cross-term bundling.  No persistent
+// pool, no global cache.
 
 static void _salot_route(const BFSTree* tree, const float* X, int N,
                          float* out_pred) {
@@ -1047,10 +1048,10 @@ static std::vector<bool> compute_bundle_matrix(const float* X, int D, int D_num,
 
 // Local bundling for high-D: check co-occurrence only among d_sub sampled
 // features using node's own WLS subsample.  Returns d×d exclusivity matrix.
-static std::vector<bool> local_bundle_check(
-    const std::vector<int>& wls_samp, const std::vector<int>& feat_sub,
-    int D, const float* X) {
-  int d  = (int)feat_sub.size();
+static std::vector<bool> local_bundle_check(const std::vector<int>& wls_samp,
+                                            const std::vector<int>& feat_sub,
+                                            int D, const float* X) {
+  int d = (int)feat_sub.size();
   int ns = (int)wls_samp.size();
   std::vector<int> cooccur(d * d, 0);
   for (int i = 0; i < ns; i++) {
@@ -1078,14 +1079,14 @@ static std::vector<bool> local_bundle_check(
 //   estimates λ_min via Gershgorin circles in O(d²), adds adaptive ridge
 //   so cond(A) ≤ 1/gbaor_alpha — no SVD, no extra passes.
 static std::vector<float> node_block_wls(
-    const std::vector<int>& wls_samp, const std::vector<int>& feat_sub,
-    int D, int D_num, const float* X, const float* G, const float* H, int K,
+    const std::vector<int>& wls_samp, const std::vector<int>& feat_sub, int D,
+    int D_num, const float* X, const float* G, const float* H, int K,
     float reg_lambda, float energy_frac, float gbaor_alpha,
     const std::vector<bool>& excl,        // global D_num×D_num, may be empty
     const std::vector<bool>& excl_local)  // local d×d, may be empty
 {
   int nw = (int)wls_samp.size();
-  int d  = (int)feat_sub.size();
+  int d = (int)feat_sub.size();
 
   // Pick representative class: highest sum of |g_i|
   int best_c = 0;
@@ -1093,7 +1094,10 @@ static std::vector<float> node_block_wls(
   for (int c = 0; c < K; c++) {
     float mass = 0.0f;
     for (int i : wls_samp) mass += std::abs(G[(size_t)i * K + c]);
-    if (mass > best_g_mass) { best_g_mass = mass; best_c = c; }
+    if (mass > best_g_mass) {
+      best_g_mass = mass;
+      best_c = c;
+    }
   }
 
   std::vector<float> A(d * d, 0.0f);
@@ -1131,7 +1135,8 @@ static std::vector<float> node_block_wls(
     float lam_max_est = -1e30f, lam_min_est = 1e30f;
     for (int j = 0; j < d; j++) {
       float Rj = 0.0f;
-      for (int k = 0; k < d; k++) if (k != j) Rj += std::abs(A[j * d + k]);
+      for (int k = 0; k < d; k++)
+        if (k != j) Rj += std::abs(A[j * d + k]);
       float diag = A[j * d + j];
       lam_max_est = std::max(lam_max_est, diag + Rj);
       lam_min_est = std::min(lam_min_est, diag - Rj);
@@ -1168,8 +1173,8 @@ static std::vector<float> node_block_wls(
 void* salot_build(const float* X, int N, int D, int D_num, const float* G,
                   const float* H, int K, const int* sub, int Ns, int max_depth,
                   float reg_lambda, int n_wls_max, int d_sub_max,
-                  float energy_frac, float gbaor_alpha, unsigned int seed,
-                  float* out_pred) {
+                  float energy_frac, float gbaor_alpha, int n_candidates,
+                  unsigned int seed, float* out_pred) {
   int max_nodes = (1 << (max_depth + 1)) - 1;
   auto* tree = new BFSTree();
   tree->K = K;
@@ -1184,8 +1189,8 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
   tree->split_weights.assign((size_t)max_nodes * D, 0.0f);
 
   // d_sub: number of features sampled per node for WLS
-  int d_sub = std::max(2, std::min(d_sub_max,
-                                   (int)std::ceil(std::sqrt((float)D_num))));
+  int d_sub =
+      std::max(2, std::min(d_sub_max, (int)std::ceil(std::sqrt((float)D_num))));
 
   // Pre-compute bundle exclusivity matrix (one-time, O(D²) but only if D≤150)
   std::vector<bool> excl = compute_bundle_matrix(X, D, D_num, sub, Ns);
@@ -1217,15 +1222,7 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
       // Independent per-node RNG
       std::mt19937 rng(seed ^ (unsigned)t_node ^ (unsigned)(depth * 1000003u));
 
-      // ── Feature subsampling: pick d_sub features ──────────────────────────
-      std::vector<int> feat_sub(D_num);
-      std::iota(feat_sub.begin(), feat_sub.end(), 0);
-      if (d_sub < D_num) {
-        std::shuffle(feat_sub.begin(), feat_sub.end(), rng);
-        feat_sub.resize(d_sub);
-      }
-
-      // ── Instance subsampling for WLS ──────────────────────────────────────
+      // ── Instance subsampling for WLS (shared across all candidates) ────────
       std::vector<int> wls_samp;
       if (ns > n_wls_max) {
         wls_samp = samp;
@@ -1235,18 +1232,7 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
         wls_samp = samp;
       }
 
-      // ── Local bundle check for high-D (only among d_sub selected features)
-      std::vector<bool> excl_local;
-      if (D_num > 150)
-        excl_local = local_bundle_check(wls_samp, feat_sub, D, X);
-
-      // ── Block WLS: find best oblique direction for this node ───────────────
-      std::vector<float> best_w = node_block_wls(
-          wls_samp, feat_sub, D, D_num, X, G, H, K,
-          reg_lambda, energy_frac, gbaor_alpha, excl, excl_local);
-      if (best_w.empty()) continue;
-
-      // ── Compute Gt/Ht using full node data ────────────────────────────────
+      // ── Compute Gt/Ht using full node data (shared across candidates) ──────
       std::vector<float> Gt(K, 0.0f), Ht(K, 0.0f);
       for (int j : samp)
         for (int c = 0; c < K; c++) {
@@ -1257,81 +1243,111 @@ void* salot_build(const float* X, int N, int D, int D_num, const float* G,
       for (int c = 0; c < K; c++)
         total_base -= 0.5f * Gt[c] * Gt[c] / (Ht[c] + reg_lambda + EPS);
 
-      // ── Project full node data → 1-D histogram scan ───────────────────────
-      std::vector<float> node_proj(ns);
-      float min_v = 1e30f, max_v = -1e30f;
-      for (int si = 0; si < ns; si++) {
-        const float* xi = X + (size_t)samp[si] * D;
-        float proj = 0.0f;
-        for (int f = 0; f < D_num; f++) proj += best_w[f] * xi[f];
-        node_proj[si] = proj;
-        if (proj < min_v) min_v = proj;
-        if (proj > max_v) max_v = proj;
-      }
-      if (max_v - min_v < 1e-5f) continue;
-
-      std::vector<float> bin_G((size_t)HIST_BINS * K, 0.0f);
-      std::vector<float> bin_H((size_t)HIST_BINS * K, 0.0f);
-      std::vector<int>   bin_cnt(HIST_BINS, 0);
-      float scale = (float)HIST_BINS / (max_v - min_v + EPS);
-      for (int si = 0; si < ns; si++) {
-        int j = samp[si];
-        int b = (int)((node_proj[si] - min_v) * scale);
-        if (b < 0) b = 0;
-        if (b >= HIST_BINS) b = HIST_BINS - 1;
-        bin_cnt[b]++;
-        size_t bo = (size_t)b * K;
-        for (int c = 0; c < K; c++) {
-          bin_G[bo + c] += G[(size_t)j * K + c];
-          bin_H[bo + c] += H[(size_t)j * K + c];
-        }
-      }
-
-      std::vector<float> Gc(K, 0.0f), Hc(K, 0.0f);
-      int n_left = 0;
+      // ── Multi-candidate WLS: try n_candidates feature subsets, pick best ───
       float best_gain = 0.0f, best_thr = 0.0f;
-      bool split_found = false;
-      for (int b = 0; b < HIST_BINS - 1; b++) {
-        n_left += bin_cnt[b];
-        size_t bo = (size_t)b * K;
-        for (int c = 0; c < K; c++) {
-          Gc[c] += bin_G[bo + c];
-          Hc[c] += bin_H[bo + c];
-        }
-        int n_right = ns - n_left;
-        if (n_left < 10 || n_right < 10) continue;
+      std::vector<float> best_w;
 
-        float Hc_sum = 0.0f, Hr_sum = 0.0f;
-        for (int c = 0; c < K; c++) {
-          Hc_sum += Hc[c];
-          Hr_sum += Ht[c] - Hc[c];
+      for (int cand = 0; cand < n_candidates; cand++) {
+        // Each candidate draws a fresh feature subset
+        std::vector<int> feat_sub(D_num);
+        std::iota(feat_sub.begin(), feat_sub.end(), 0);
+        if (d_sub < D_num) {
+          std::shuffle(feat_sub.begin(), feat_sub.end(), rng);
+          feat_sub.resize(d_sub);
         }
-        if (Hc_sum < MIN_CHILD_W || Hr_sum < MIN_CHILD_W) continue;
 
-        float gain = total_base;
-        for (int c = 0; c < K; c++) {
-          float Gr = Gt[c] - Gc[c], Hr = Ht[c] - Hc[c];
-          gain += 0.5f * (Gc[c] * Gc[c] / (Hc[c] + reg_lambda + EPS) +
-                          Gr * Gr / (Hr + reg_lambda + EPS));
-        }
-        if (gain > best_gain) {
-          best_gain    = gain;
-          best_thr     = min_v + ((float)(b + 1) / HIST_BINS) * (max_v - min_v);
-          split_found  = true;
-        }
-      }
+        std::vector<bool> excl_local;
+        if (D_num > 150)
+          excl_local = local_bundle_check(wls_samp, feat_sub, D, X);
 
-      if (split_found) {
-        tree->is_leaf[t_node]         = 0;
+        std::vector<float> w_c =
+            node_block_wls(wls_samp, feat_sub, D, D_num, X, G, H, K, reg_lambda,
+                           energy_frac, gbaor_alpha, excl, excl_local);
+        if (w_c.empty()) continue;
+
+        // Project and histogram scan for this candidate
+        float min_v = 1e30f, max_v = -1e30f;
+        std::vector<float> proj_c(ns);
+        for (int si = 0; si < ns; si++) {
+          const float* xi = X + (size_t)samp[si] * D;
+          float proj = 0.0f;
+          for (int f = 0; f < D_num; f++) proj += w_c[f] * xi[f];
+          proj_c[si] = proj;
+          if (proj < min_v) min_v = proj;
+          if (proj > max_v) max_v = proj;
+        }
+        if (max_v - min_v < 1e-5f) continue;
+
+        std::vector<float> bin_G((size_t)HIST_BINS * K, 0.0f);
+        std::vector<float> bin_H((size_t)HIST_BINS * K, 0.0f);
+        std::vector<int> bin_cnt(HIST_BINS, 0);
+        float scale = (float)HIST_BINS / (max_v - min_v + EPS);
+        for (int si = 0; si < ns; si++) {
+          int j = samp[si];
+          int b = (int)((proj_c[si] - min_v) * scale);
+          if (b < 0) b = 0;
+          if (b >= HIST_BINS) b = HIST_BINS - 1;
+          bin_cnt[b]++;
+          size_t bo = (size_t)b * K;
+          for (int c = 0; c < K; c++) {
+            bin_G[bo + c] += G[(size_t)j * K + c];
+            bin_H[bo + c] += H[(size_t)j * K + c];
+          }
+        }
+
+        std::vector<float> Gc(K, 0.0f), Hc(K, 0.0f);
+        int n_left = 0;
+        for (int b = 0; b < HIST_BINS - 1; b++) {
+          n_left += bin_cnt[b];
+          size_t bo = (size_t)b * K;
+          for (int c = 0; c < K; c++) {
+            Gc[c] += bin_G[bo + c];
+            Hc[c] += bin_H[bo + c];
+          }
+          int n_right = ns - n_left;
+          if (n_left < 10 || n_right < 10) continue;
+
+          float Hc_sum = 0.0f, Hr_sum = 0.0f;
+          for (int c = 0; c < K; c++) {
+            Hc_sum += Hc[c];
+            Hr_sum += Ht[c] - Hc[c];
+          }
+          if (Hc_sum < MIN_CHILD_W || Hr_sum < MIN_CHILD_W) continue;
+
+          float gain = total_base;
+          for (int c = 0; c < K; c++) {
+            float Gr = Gt[c] - Gc[c], Hr = Ht[c] - Hc[c];
+            gain += 0.5f * (Gc[c] * Gc[c] / (Hc[c] + reg_lambda + EPS) +
+                            Gr * Gr / (Hr + reg_lambda + EPS));
+          }
+          if (gain > best_gain) {
+            best_gain = gain;
+            best_thr = min_v + ((float)(b + 1) / HIST_BINS) * (max_v - min_v);
+            best_w = w_c;
+          }
+        }
+      }  // end candidate loop
+
+      if (!best_w.empty()) {
+        // Re-project with winning direction for sample routing
+        std::vector<float> node_proj(ns);
+        for (int si = 0; si < ns; si++) {
+          const float* xi = X + (size_t)samp[si] * D;
+          float proj = 0.0f;
+          for (int f = 0; f < D_num; f++) proj += best_w[f] * xi[f];
+          node_proj[si] = proj;
+        }
+
+        tree->is_leaf[t_node] = 0;
         tree->split_threshold[t_node] = best_thr;
-        tree->split_gain[t_node]      = best_gain;
+        tree->split_gain[t_node] = best_gain;
         std::copy(best_w.begin(), best_w.end(),
                   tree->split_weights.data() + (size_t)t_node * D);
 
         std::vector<int> left_sub, right_sub;
         for (int si = 0; si < ns; si++)
           (node_proj[si] < best_thr ? left_sub : right_sub).push_back(samp[si]);
-        node_samp[tl]      = std::move(left_sub);
+        node_samp[tl] = std::move(left_sub);
         node_samp[tr_node] = std::move(right_sub);
       }
     }
