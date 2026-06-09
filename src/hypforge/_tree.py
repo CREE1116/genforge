@@ -96,11 +96,12 @@ def _ptr(a: np.ndarray):
 class BFSTree:
     """C++-backed BFS oblique tree — zero GPU-CPU sync during build."""
 
-    __slots__ = ("_handle", "K")
+    __slots__ = ("_handle", "K", "max_depth")
 
     def __init__(self):
-        self._handle = None
-        self.K = 0
+        self._handle   = None
+        self.K         = 0
+        self.max_depth = 0
 
     def build(
         self,
@@ -116,8 +117,9 @@ class BFSTree:
         lib = _get_lib()
         P, N = Z.shape
         K = G.shape[1]
-        self.K = K
-        self._handle = lib.bfstree_build(
+        self.K         = K
+        self.max_depth = max_depth
+        self._handle   = lib.bfstree_build(
             _ptr(Z), _ptr(thresholds), _ptr(G), _ptr(H),
             P, N, K, max_depth, min_samples_split, min_samples_leaf,
             ctypes.c_float(reg_lambda),
@@ -146,7 +148,7 @@ class BFSTree:
 
     def __getstate__(self):
         if self._handle is None:
-            return {"handle": None, "K": self.K}
+            return {"handle": None, "K": self.K, "max_depth": self.max_depth}
         lib        = _get_lib()
         n_nodes    = lib.bfstree_get_total_nodes(self._handle)
         max_depth  = lib.bfstree_get_max_depth(self._handle)
@@ -174,7 +176,8 @@ class BFSTree:
         }
 
     def __setstate__(self, state):
-        self.K = state["K"]
+        self.K         = state["K"]
+        self.max_depth = state.get("max_depth", 0)  # 구버전 pickle 호환
         if state["handle"] is None:
             self._handle = None
             return

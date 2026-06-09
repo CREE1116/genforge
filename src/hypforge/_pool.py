@@ -11,13 +11,13 @@ def _get_pool_lib():
     if _pool_configured:
         return lib
         
-    lib.pool_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]  # D, max_size, evolve_mode
+    lib.pool_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.pool_create.restype = ctypes.c_void_p
 
     lib.pool_set_options.argtypes = [
         ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # op_mode, crossover_top_k, elitism_k, alps_mode, map_elites_slots
-        ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float,            # family_max_size, enable_meta_evolution, family_lambda, breeding_beta
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float
     ]
     lib.pool_set_options.restype = None
 
@@ -47,6 +47,12 @@ def _get_pool_lib():
     
     lib.pool_get_size.argtypes = [ctypes.c_void_p]
     lib.pool_get_size.restype = ctypes.c_int
+
+    lib.pool_get_history_size.argtypes = [ctypes.c_void_p]
+    lib.pool_get_history_size.restype = ctypes.c_int
+
+    lib.pool_get_active_indices.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    lib.pool_get_active_indices.restype = None
     
     lib.pool_get_caches_and_thresholds.argtypes = [
         ctypes.c_void_p,
@@ -63,18 +69,18 @@ def _get_pool_lib():
     lib.pool_update_use_counts.restype = None
 
     lib.pool_build_tree.argtypes = [
-        ctypes.c_void_p,                          # pool_handle
-        ctypes.POINTER(ctypes.c_float),           # X [N, D]
-        ctypes.POINTER(ctypes.c_float),           # G [N, K]
-        ctypes.POINTER(ctypes.c_float),           # H [N, K]
-        ctypes.c_int, ctypes.c_int,               # N, K
-        ctypes.POINTER(ctypes.c_int), ctypes.c_int,  # evolve_sub, Ns_evolve
-        ctypes.POINTER(ctypes.c_int), ctypes.c_int,  # tree_sub, Ns_tree
-        ctypes.c_int, ctypes.c_int,               # D_num, max_depth
-        ctypes.c_float, ctypes.c_float,           # reg_lambda, eta_penalty
-        ctypes.c_int,                             # do_evolve
-        ctypes.POINTER(ctypes.c_float),           # out_pred [N, K]
-        ctypes.c_int                              # current_round
+        ctypes.c_void_p,                              # pool_handle
+        ctypes.POINTER(ctypes.c_float),               # X [N, D]
+        ctypes.POINTER(ctypes.c_float),               # G [N, K]
+        ctypes.POINTER(ctypes.c_float),               # H [N, K]
+        ctypes.c_int, ctypes.c_int,                   # N, K
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,   # evolve_sub, Ns_evolve
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,   # tree_sub, Ns_tree
+        ctypes.c_int, ctypes.c_int,                   # D_num, max_depth
+        ctypes.c_float, ctypes.c_float,               # reg_lambda, eta_penalty
+        ctypes.c_int,                                 # do_evolve
+        ctypes.POINTER(ctypes.c_float),               # out_pred [N, K]
+        ctypes.c_int                                  # current_round
     ]
     lib.pool_build_tree.restype = ctypes.c_void_p
 
@@ -84,53 +90,35 @@ def _get_pool_lib():
         ctypes.POINTER(ctypes.c_float),    # weights
         ctypes.POINTER(ctypes.c_int),      # h1_indices
         ctypes.POINTER(ctypes.c_int),      # h2_indices
-        ctypes.POINTER(ctypes.c_int),      # n_obs
-        ctypes.POINTER(ctypes.c_double),   # mu_fitness
-        ctypes.POINTER(ctypes.c_double),   # M2_fitness
         ctypes.POINTER(ctypes.c_int),      # use_counts
         ctypes.POINTER(ctypes.c_int),      # rounds_since_last_use
-        ctypes.POINTER(ctypes.c_float),    # fitnesses
-        ctypes.POINTER(ctypes.c_float),    # scores
+        ctypes.POINTER(ctypes.c_float),    # credits
         ctypes.POINTER(ctypes.c_uint8),    # is_base
-        ctypes.POINTER(ctypes.c_int),      # parent1
-        ctypes.POINTER(ctypes.c_int),      # parent2
-        ctypes.POINTER(ctypes.c_int),      # birth_round
-        ctypes.POINTER(ctypes.c_int),      # family_id
-        ctypes.POINTER(ctypes.c_float),    # family_fitness
-        ctypes.POINTER(ctypes.c_float),    # breeding_value
+        ctypes.POINTER(ctypes.c_int),      # parent1  (unused stub)
+        ctypes.POINTER(ctypes.c_int),      # parent2  (unused stub)
+        ctypes.POINTER(ctypes.c_int),      # birth_round (unused stub)
+        ctypes.POINTER(ctypes.c_int),      # family_id (unused stub)
     ]
     lib.pool_export.restype = None
-    
+
     lib.pool_import.argtypes = [
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.POINTER(ctypes.c_int),      # types
         ctypes.POINTER(ctypes.c_float),    # weights
         ctypes.POINTER(ctypes.c_int),      # h1_indices
         ctypes.POINTER(ctypes.c_int),      # h2_indices
-        ctypes.POINTER(ctypes.c_int),      # n_obs
-        ctypes.POINTER(ctypes.c_double),   # mu_fitness
-        ctypes.POINTER(ctypes.c_double),   # M2_fitness
         ctypes.POINTER(ctypes.c_int),      # use_counts
         ctypes.POINTER(ctypes.c_int),      # rounds_since_last_use
-        ctypes.POINTER(ctypes.c_float),    # fitnesses
-        ctypes.POINTER(ctypes.c_float),    # scores
+        ctypes.POINTER(ctypes.c_float),    # credits
         ctypes.POINTER(ctypes.c_uint8),    # is_base
-        ctypes.POINTER(ctypes.c_int),      # parent1
-        ctypes.POINTER(ctypes.c_int),      # parent2
-        ctypes.POINTER(ctypes.c_int),      # birth_round
-        ctypes.POINTER(ctypes.c_int),      # family_id
-        ctypes.POINTER(ctypes.c_float),    # family_fitness
-        ctypes.POINTER(ctypes.c_float),    # breeding_value
+        ctypes.POINTER(ctypes.c_int),      # parent1  (unused stub)
+        ctypes.POINTER(ctypes.c_int),      # parent2  (unused stub)
+        ctypes.POINTER(ctypes.c_int),      # birth_round (unused stub)
+        ctypes.POINTER(ctypes.c_int),      # family_id (unused stub)
+        ctypes.c_int,                      # P
+        ctypes.POINTER(ctypes.c_int),      # active_indices
     ]
     lib.pool_import.restype = ctypes.c_void_p
-
-    lib.pool_get_policy_stats.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_int),      # use_counts
-        ctypes.POINTER(ctypes.c_double),   # mean_rewards
-        ctypes.POINTER(ctypes.c_int)       # active_idx
-    ]
-    lib.pool_get_policy_stats.restype = None
 
     lib.pool_get_transition_matrix.argtypes = [
         ctypes.c_void_p,
@@ -152,36 +140,14 @@ class Hypothesis:
         self.h1       = h1
         self.h2       = h2
 
-        # ── UCB bandit statistics (Welford online mean/variance) ────────────
-        self.n_obs      = 0      # number of fitness observations
-        self.mu_fitness = 0.0    # running mean
-        self.M2_fitness = 0.0    # running sum of squared deviations (Welford)
-
-        # ── usage stats ────────────────────────────────────────────────────
         self.use_count             = 0
         self.rounds_since_last_use = 0
+        self.credit                = 0.0
+        self.is_base               = False
 
-        # ── meta ───────────────────────────────────────────────────────────
-        self.fitness  = 0.0      # last observed fitness (for display/compat)
-        self.score    = 0.0      # UCB score
-        self.is_base  = False
-
-        # ── genealogy / lineage meta ──────────────────────────────────────
-        self.parent1        = -1
-        self.parent2        = -1
-        self.birth_round    = 0
-        self.family_id      = -1
-        self.family_fitness = 0.0
-        self.breeding_value = 0.0
-        self.ancestor_credit = 0.0
-
-        # ── projection caches ─────────────────────────────────────────────
-        self.cache          = None
-        self.full_cache     = None
-        self.full_cache_cpu = None
-        self.thresholds     = None
-        self.thresholds_cpu = None
-        self.val_cache_cpu  = None
+        # projection cache (cleared before pickling)
+        self.full_cache = None
+        self.thresholds = None
 
     def complexity(self):
         if self.hyp_type == "product":
@@ -190,7 +156,6 @@ class Hypothesis:
 
     def eval(self, X):
         import numpy as np
-        # Normalise w: old pickled models may have stored w as a torch.Tensor
         w = self.w
         try:
             import torch
@@ -207,42 +172,33 @@ class Hypothesis:
         except ImportError:
             pass
 
+        if self.hyp_type == "product" and self.h1 is not None and self.h2 is not None:
+            return self.h1.eval(X) * self.h2.eval(X)
+
         if is_torch:
+            import torch
             w_t = torch.as_tensor(w, dtype=X.dtype, device=X.device)
-            if self.hyp_type == "linear":
-                return X @ w_t
-            elif self.hyp_type == "leaky_relu":
-                z = X @ w_t; return torch.where(z > 0, z, 0.01 * z)
-            elif self.hyp_type == "product":
-                return self.h1.eval(X) * self.h2.eval(X)
+            z = X @ w_t
+            if self.hyp_type == "leaky_relu":
+                return torch.where(z > 0, z, 0.01 * z)
+            return z
         else:
-            if self.hyp_type == "linear":
-                return X @ w
-            elif self.hyp_type == "leaky_relu":
-                z = X @ w; return np.where(z > 0, z, 0.01 * z)
-            elif self.hyp_type == "product":
-                return self.h1.eval(X) * self.h2.eval(X)
-        raise ValueError(f"Unknown hyp_type: {self.hyp_type}")
+            z = X @ w
+            if self.hyp_type == "leaky_relu":
+                return np.where(z > 0, z, 0.01 * z)
+            return z
 
     def clear_runtime_caches(self):
-        self.full_cache     = None
-        self.full_cache_cpu = None
-        self.thresholds     = None
-        self.thresholds_cpu = None
-        self.cache          = None
-        self.val_cache_cpu  = None
+        self.full_cache = None
+        self.thresholds = None
 
 
 class HypForgePool:
-    OP_MODES          = {"all": 0, "linear_only": 1, "lrelu_only": 2}
-    TYPE_NAMES        = {0: "linear", 1: "leaky_relu", 2: "product"}
+    OP_MODES   = {"all": 0, "linear_only": 1, "lrelu_only": 2}
+    TYPE_NAMES = {0: "linear", 1: "leaky_relu", 2: "product"}
 
     def __init__(self, D, max_size=500, dev="cpu",
-                 op_mode="all", crossover_top_k=6,
-                 elitism_k=0, alps_mode=False,
-                 map_elites_slots=0,
-                 family_max_size=30, meta_evolution=True,
-                 family_lambda=0.1, breeding_beta=0.3):
+                 op_mode="all", crossover_top_k=6):
         self.D = D
         self.max_size = max_size
         lib = _get_pool_lib()
@@ -250,103 +206,97 @@ class HypForgePool:
         def _resolve(val, mapping):
             return mapping.get(val, val) if isinstance(val, str) else int(val)
 
-        # evolve_mode is hardcoded to 1 (crossover)
-        self._handle = lib.pool_create(D, max_size, 1)
+        self._op_mode         = _resolve(op_mode, self.OP_MODES)
+        self._crossover_top_k = int(crossover_top_k)
 
+        self._handle = lib.pool_create(D, max_size, 1)
+        self._apply_options(lib)
+
+    def _apply_options(self, lib=None):
+        if lib is None:
+            lib = _get_pool_lib()
+        # C++ pool_set_options uses only op_mode, crossover_top_k, elitism_k;
+        # the remaining 6 args are stub slots kept for ABI compatibility.
         lib.pool_set_options(
             self._handle,
-            _resolve(op_mode,       self.OP_MODES),
-            int(crossover_top_k),
-            int(elitism_k),
-            int(alps_mode),
-            int(map_elites_slots),
-            int(family_max_size),
-            1 if meta_evolution else 0,
-            float(family_lambda),
-            float(breeding_beta),
+            self._op_mode,
+            self._crossover_top_k,
+            0,    # elitism_k (hardcoded — no Python-side knob needed)
+            0, 0, 0, 0, 0.0, 0.0,  # stub slots
         )
 
-    def evolve(self, X_full, G_full, H_full, sub_indices, D_num, reg_lambda=1.0, eta_penalty=0.002, current_round=0):
-        import ctypes
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _pf(a):
+        return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+    @staticmethod
+    def _pi(a):
+        return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+
+    @staticmethod
+    def _pu8(a):
+        return a.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def evolve(self, X_full, G_full, H_full, sub_indices, D_num,
+               reg_lambda=1.0, eta_penalty=0.002, current_round=0):
         lib = _get_pool_lib()
-        
-        X = np.ascontiguousarray(X_full, dtype=np.float32)
-        G = np.ascontiguousarray(G_full, dtype=np.float32)
-        H = np.ascontiguousarray(H_full, dtype=np.float32)
-        sub_indices = np.ascontiguousarray(sub_indices, dtype=np.int32)
-        
-        def _ptr_f(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        def _ptr_i(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
-        
+        X   = np.ascontiguousarray(X_full,      dtype=np.float32)
+        G   = np.ascontiguousarray(G_full,      dtype=np.float32)
+        H   = np.ascontiguousarray(H_full,      dtype=np.float32)
+        sub = np.ascontiguousarray(sub_indices,  dtype=np.int32)
         lib.pool_evolve(
             self._handle,
-            _ptr_f(X), _ptr_f(G), _ptr_f(H),
-            _ptr_i(sub_indices),
-            X.shape[0], len(sub_indices), G.shape[1],
-            D_num, reg_lambda, eta_penalty, int(current_round)
+            self._pf(X), self._pf(G), self._pf(H),
+            self._pi(sub),
+            X.shape[0], len(sub), G.shape[1],
+            D_num, reg_lambda, eta_penalty, int(current_round),
         )
 
     def eval(self, X):
-        import ctypes
         lib = _get_pool_lib()
         X = np.ascontiguousarray(X, dtype=np.float32)
         P = lib.pool_get_size(self._handle)
         N = X.shape[0]
         out_Z = np.empty((P, N), dtype=np.float32)
-        lib.pool_eval(
-            self._handle,
-            X.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            N,
-            out_Z.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        )
+        lib.pool_eval(self._handle, self._pf(X), N, self._pf(out_Z))
         return out_Z
 
     def get_caches_and_thresholds(self, N):
-        import ctypes
         lib = _get_pool_lib()
-        P = lib.pool_get_size(self._handle)
-        Z_full = np.empty((P, N), dtype=np.float32)
-        thresholds = np.empty((9, P), dtype=np.float32)
-        
+        P          = lib.pool_get_size(self._handle)
+        Z_full     = np.empty((P, N),    dtype=np.float32)
+        thresholds = np.empty((9, P),    dtype=np.float32)
         lib.pool_get_caches_and_thresholds(
-            self._handle,
-            Z_full.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            thresholds.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        )
+            self._handle, self._pf(Z_full), self._pf(thresholds))
         return Z_full, thresholds
 
     def update_use_counts(self, split_indices):
-        import ctypes
-        lib = _get_pool_lib()
-        split_indices = np.ascontiguousarray(split_indices, dtype=np.int32)
-        lib.pool_update_use_counts(
-            self._handle,
-            split_indices.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            len(split_indices)
-        )
+        lib  = _get_pool_lib()
+        idxs = np.ascontiguousarray(split_indices, dtype=np.int32)
+        lib.pool_update_use_counts(self._handle, self._pi(idxs), len(idxs))
 
     def build_tree(self, X_full, G_full, H_full,
                    evolve_sub, tree_sub,
                    D_num, max_depth,
                    reg_lambda=1.0, eta_penalty=0.002,
                    do_evolve=True, current_round=0):
-        """Evolve pool + build BFS tree + predict on all N — no Z matrix in Python.
+        """Evolve pool + build BFS tree + predict on all N.
 
         Returns (BFSTree, pred_np) where pred_np is float32 [N, K].
         """
-        import ctypes
         from ._tree import BFSTree, _get_lib as _get_tree_lib
 
         lib = _get_pool_lib()
 
-        X         = np.ascontiguousarray(X_full,    dtype=np.float32)
-        G         = np.ascontiguousarray(G_full,    dtype=np.float32)
-        H         = np.ascontiguousarray(H_full,    dtype=np.float32)
-        ev_sub    = np.ascontiguousarray(evolve_sub, dtype=np.int32)
-        tr_sub    = np.ascontiguousarray(tree_sub,   dtype=np.int32)
-
-        def _pf(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        def _pi(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        X      = np.ascontiguousarray(X_full,     dtype=np.float32)
+        G      = np.ascontiguousarray(G_full,     dtype=np.float32)
+        H      = np.ascontiguousarray(H_full,     dtype=np.float32)
+        ev_sub = np.ascontiguousarray(evolve_sub,  dtype=np.int32)
+        tr_sub = np.ascontiguousarray(tree_sub,    dtype=np.int32)
 
         N        = X.shape[0]
         K        = G.shape[1]
@@ -354,221 +304,165 @@ class HypForgePool:
 
         tree_handle = lib.pool_build_tree(
             self._handle,
-            _pf(X), _pf(G), _pf(H),
+            self._pf(X), self._pf(G), self._pf(H),
             N, K,
-            _pi(ev_sub), len(ev_sub),
-            _pi(tr_sub), len(tr_sub),
+            self._pi(ev_sub), len(ev_sub),
+            self._pi(tr_sub), len(tr_sub),
             D_num, max_depth,
             ctypes.c_float(reg_lambda),
             ctypes.c_float(eta_penalty),
             ctypes.c_int(1 if do_evolve else 0),
-            _pf(out_pred),
-            ctypes.c_int(current_round)
+            self._pf(out_pred),
+            ctypes.c_int(current_round),
         )
 
-        tree    = BFSTree.__new__(BFSTree)
-        tree._handle = tree_handle
-        tree.K       = _get_tree_lib().bfstree_get_K(tree_handle)
+        tlib = _get_tree_lib()
+        tree           = BFSTree.__new__(BFSTree)
+        tree._handle   = tree_handle
+        tree.K         = tlib.bfstree_get_K(tree_handle)
+        tree.max_depth = tlib.bfstree_get_max_depth(tree_handle)
         return tree, out_pred
 
+    # ── export / import ───────────────────────────────────────────────────────
+
     def export_pop(self):
-        import ctypes
         lib = _get_pool_lib()
-        P = lib.pool_get_size(self._handle)
-        
-        types = np.zeros(P, dtype=np.int32)
-        weights = np.zeros(P * self.D, dtype=np.float32)
-        h1_indices = np.zeros(P, dtype=np.int32)
-        h2_indices = np.zeros(P, dtype=np.int32)
-        n_obs = np.zeros(P, dtype=np.int32)
-        mu_fitness = np.zeros(P, dtype=np.float64)
-        M2_fitness = np.zeros(P, dtype=np.float64)
-        use_counts = np.zeros(P, dtype=np.int32)
-        rounds_since_last_use = np.zeros(P, dtype=np.int32)
-        fitnesses = np.zeros(P, dtype=np.float32)
-        scores = np.zeros(P, dtype=np.float32)
-        is_base = np.zeros(P, dtype=np.uint8)
-        
-        parent1 = np.zeros(P, dtype=np.int32)
-        parent2 = np.zeros(P, dtype=np.int32)
-        birth_round = np.zeros(P, dtype=np.int32)
-        family_id = np.zeros(P, dtype=np.int32)
-        family_fitness = np.zeros(P, dtype=np.float32)
-        breeding_value = np.zeros(P, dtype=np.float32)
-        
-        def _ptr_i(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
-        def _ptr_f(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        def _ptr_d(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-        def _ptr_u8(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
-        
+        P   = lib.pool_get_size(self._handle)
+        H   = lib.pool_get_history_size(self._handle)
+
+        types                 = np.zeros(H, dtype=np.int32)
+        weights               = np.zeros(H * self.D, dtype=np.float32)
+        h1_indices            = np.zeros(H, dtype=np.int32)
+        h2_indices            = np.zeros(H, dtype=np.int32)
+        use_counts            = np.zeros(H, dtype=np.int32)
+        rounds_since_last_use = np.zeros(H, dtype=np.int32)
+        credits               = np.zeros(H, dtype=np.float32)
+        is_base               = np.zeros(H, dtype=np.uint8)
+        _stub_i               = np.zeros(H, dtype=np.int32)
+
         lib.pool_export(
             self._handle,
-            _ptr_i(types),
-            _ptr_f(weights),
-            _ptr_i(h1_indices),
-            _ptr_i(h2_indices),
-            _ptr_i(n_obs),
-            _ptr_d(mu_fitness),
-            _ptr_d(M2_fitness),
-            _ptr_i(use_counts),
-            _ptr_i(rounds_since_last_use),
-            _ptr_f(fitnesses),
-            _ptr_f(scores),
-            _ptr_u8(is_base),
-            _ptr_i(parent1),
-            _ptr_i(parent2),
-            _ptr_i(birth_round),
-            _ptr_i(family_id),
-            _ptr_f(family_fitness),
-            _ptr_f(breeding_value),
+            self._pi(types),
+            self._pf(weights),
+            self._pi(h1_indices),
+            self._pi(h2_indices),
+            self._pi(use_counts),
+            self._pi(rounds_since_last_use),
+            self._pf(credits),
+            self._pu8(is_base),
+            self._pi(_stub_i),  # parent1  — stub
+            self._pi(_stub_i),  # parent2  — stub
+            self._pi(_stub_i),  # birth_round — stub
+            self._pi(_stub_i),  # family_id — stub
         )
-        
-        py_pop = []
-        type_names = {0: "linear", 1: "leaky_relu", 2: "product"}
-        for p in range(P):
-            t_name = type_names.get(types[p], f"type_{types[p]}")
-            w = None
-            h1 = None
-            h2 = None
+
+        active_indices = np.zeros(P, dtype=np.int32)
+        lib.pool_get_active_indices(self._handle, self._pi(active_indices))
+
+        py_history: list["Hypothesis"] = []
+        for p in range(H):
+            t_name = self.TYPE_NAMES.get(int(types[p]), f"type_{types[p]}")
+
             if types[p] != 2:
-                w = weights[p * self.D : (p + 1) * self.D].copy()
+                w  = weights[p * self.D : (p + 1) * self.D].copy()
+                h1 = None
+                h2 = None
             else:
-                h1 = py_pop[h1_indices[p]]
-                h2 = py_pop[h2_indices[p]]
-            
-            h = Hypothesis(hyp_type=t_name, w=w, h1=h1, h2=h2)
-            h.n_obs = int(n_obs[p])
-            h.mu_fitness = float(mu_fitness[p])
-            h.M2_fitness = float(M2_fitness[p])
-            h.use_count = int(use_counts[p])
+                w      = None
+                h1_id  = int(h1_indices[p])
+                h2_id  = int(h2_indices[p])
+                h1 = py_history[h1_id] if 0 <= h1_id < len(py_history) else None
+                h2 = py_history[h2_id] if 0 <= h2_id < len(py_history) else None
+
+            h                       = Hypothesis(hyp_type=t_name, w=w, h1=h1, h2=h2)
+            h.use_count             = int(use_counts[p])
             h.rounds_since_last_use = int(rounds_since_last_use[p])
-            h.fitness = float(fitnesses[p])
-            h.score = float(scores[p])
-            h.is_base = bool(is_base[p])
-            
-            h.parent1 = int(parent1[p])
-            h.parent2 = int(parent2[p])
-            h.birth_round = int(birth_round[p])
-            h.family_id = int(family_id[p])
-            h.family_fitness = float(family_fitness[p])
-            h.breeding_value = float(breeding_value[p])
-            h.ancestor_credit = float(family_fitness[p])
-            py_pop.append(h)
-            
-        return py_pop
+            h.credit                = float(credits[p])
+            h.is_base               = bool(is_base[p])
+            py_history.append(h)
+
+        return [py_history[idx] for idx in active_indices if 0 <= idx < H]
 
     def import_pop(self, py_pop):
-        import ctypes
-        P = len(py_pop)
         type_map = {"linear": 0, "leaky_relu": 1, "product": 2}
-        
-        types = np.zeros(P, dtype=np.int32)
-        weights = np.zeros(P * self.D, dtype=np.float32)
-        h1_indices = np.zeros(P, dtype=np.int32)
-        h2_indices = np.zeros(P, dtype=np.int32)
-        n_obs = np.zeros(P, dtype=np.int32)
-        mu_fitness = np.zeros(P, dtype=np.float64)
-        M2_fitness = np.zeros(P, dtype=np.float64)
-        use_counts = np.zeros(P, dtype=np.int32)
-        rounds_since_last_use = np.zeros(P, dtype=np.int32)
-        fitnesses = np.zeros(P, dtype=np.float32)
-        scores = np.zeros(P, dtype=np.float32)
-        is_base = np.zeros(P, dtype=np.uint8)
-        
-        parent1 = np.zeros(P, dtype=np.int32)
-        parent2 = np.zeros(P, dtype=np.int32)
-        birth_round = np.zeros(P, dtype=np.int32)
-        family_id = np.zeros(P, dtype=np.int32)
-        family_fitness = np.zeros(P, dtype=np.float32)
-        breeding_value = np.zeros(P, dtype=np.float32)
-        
-        id_to_idx = {id(h): idx for idx, h in enumerate(py_pop)}
-        
-        for p, h in enumerate(py_pop):
-            types[p] = type_map[h.hyp_type]
+
+        unique_hyps: list["Hypothesis"] = []
+        seen: set = set()
+
+        def _collect(h):
+            if h is None or id(h) in seen:
+                return
+            if h.hyp_type == "product":
+                _collect(h.h1)
+                _collect(h.h2)
+            seen.add(id(h))
+            unique_hyps.append(h)
+
+        for h in py_pop:
+            _collect(h)
+
+        id_to_idx = {id(h): i for i, h in enumerate(unique_hyps)}
+
+        U                     = len(unique_hyps)
+        types                 = np.zeros(U, dtype=np.int32)
+        weights               = np.zeros(U * self.D, dtype=np.float32)
+        h1_indices            = np.full(U, -1, dtype=np.int32)
+        h2_indices            = np.full(U, -1, dtype=np.int32)
+        use_counts            = np.zeros(U, dtype=np.int32)
+        rounds_since_last_use = np.zeros(U, dtype=np.int32)
+        credits               = np.zeros(U, dtype=np.float32)
+        is_base               = np.zeros(U, dtype=np.uint8)
+        _stub_i               = np.full(U, -1, dtype=np.int32)
+
+        for u, h in enumerate(unique_hyps):
+            types[u] = type_map[h.hyp_type]
             if h.hyp_type != "product":
-                weights[p * self.D : (p + 1) * self.D] = h.w
-                h1_indices[p] = -1
-                h2_indices[p] = -1
+                weights[u * self.D : (u + 1) * self.D] = h.w
             else:
-                h1_indices[p] = id_to_idx[id(h.h1)]
-                h2_indices[p] = id_to_idx[id(h.h2)]
-            
-            n_obs[p] = h.n_obs
-            mu_fitness[p] = h.mu_fitness
-            M2_fitness[p] = h.M2_fitness
-            use_counts[p] = h.use_count
-            rounds_since_last_use[p] = h.rounds_since_last_use
-            fitnesses[p] = h.fitness
-            scores[p] = h.score
-            is_base[p] = 1 if h.is_base else 0
-            
-            parent1[p] = h.parent1
-            parent2[p] = h.parent2
-            birth_round[p] = h.birth_round
-            family_id[p] = h.family_id
-            family_fitness[p] = h.ancestor_credit
-            breeding_value[p] = h.breeding_value
-            
-        def _ptr_i(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
-        def _ptr_f(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        def _ptr_d(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-        def _ptr_u8(a): return a.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
-        
+                if h.h1 is not None and id(h.h1) in id_to_idx:
+                    h1_indices[u] = id_to_idx[id(h.h1)]
+                if h.h2 is not None and id(h.h2) in id_to_idx:
+                    h2_indices[u] = id_to_idx[id(h.h2)]
+
+            use_counts[u]            = h.use_count
+            rounds_since_last_use[u] = h.rounds_since_last_use
+            credits[u]               = h.credit
+            is_base[u]               = 1 if h.is_base else 0
+
+        P              = len(py_pop)
+        active_indices = np.array([id_to_idx[id(h)] for h in py_pop], dtype=np.int32)
+
         lib = _get_pool_lib()
         if self._handle is not None:
             lib.pool_free(self._handle)
-            
-        self._handle = lib.pool_import(
-            self.D, self.max_size, P,
-            _ptr_i(types),
-            _ptr_f(weights),
-            _ptr_i(h1_indices),
-            _ptr_i(h2_indices),
-            _ptr_i(n_obs),
-            _ptr_d(mu_fitness),
-            _ptr_d(M2_fitness),
-            _ptr_i(use_counts),
-            _ptr_i(rounds_since_last_use),
-            _ptr_f(fitnesses),
-            _ptr_f(scores),
-            _ptr_u8(is_base),
-            _ptr_i(parent1),
-            _ptr_i(parent2),
-            _ptr_i(birth_round),
-            _ptr_i(family_id),
-            _ptr_f(family_fitness),
-            _ptr_f(breeding_value),
-        )
 
-    def get_policy_stats(self):
-        import ctypes
-        lib = _get_pool_lib()
-        use_counts = np.zeros(4, dtype=np.int32)
-        mean_rewards = np.zeros(4, dtype=np.float64)
-        active_idx = ctypes.c_int(-1)
-        
-        lib.pool_get_policy_stats(
-            self._handle,
-            use_counts.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            mean_rewards.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            ctypes.byref(active_idx)
+        self._handle = lib.pool_import(
+            self.D, self.max_size, U,
+            self._pi(types),
+            self._pf(weights),
+            self._pi(h1_indices),
+            self._pi(h2_indices),
+            self._pi(use_counts),
+            self._pi(rounds_since_last_use),
+            self._pf(credits),
+            self._pu8(is_base),
+            self._pi(_stub_i),  # parent1
+            self._pi(_stub_i),  # parent2
+            self._pi(_stub_i),  # birth_round
+            self._pi(_stub_i),  # family_id
+            P,
+            self._pi(active_indices),
         )
-        return {
-            "use_counts": use_counts.tolist(),
-            "mean_rewards": mean_rewards.tolist(),
-            "active_idx": active_idx.value
-        }
+        self._apply_options()
 
     def get_transition_matrix(self):
-        lib = _get_pool_lib()
-        births = np.zeros((3, 3), dtype=np.float32)
+        lib       = _get_pool_lib()
+        births    = np.zeros((3, 3), dtype=np.float32)
         survivors = np.zeros((3, 3), dtype=np.float32)
-        
         lib.pool_get_transition_matrix(
             self._handle,
-            births.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            survivors.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            self._pf(births),
+            self._pf(survivors),
         )
         return births, survivors
 

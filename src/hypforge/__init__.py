@@ -13,9 +13,13 @@ Quickstart
 >>> clf.predict_proba(X_test)
 """
 
-from ._classifier import HypForgeClassifier
+from ._classifier import HypForgeClassifier, SALOTClassifier, GOSClassifier
+from ._classifier import TestForgeClassifier  # backwards compat alias
 from ._pool import Hypothesis, HypForgePool
+from ._testforge import SALOTPool
+from ._testforge import TestForgePool  # backwards compat alias
 from ._tree import BFSTree
+from ._salot import SALOTTree
 
 
 def load_model(path: str) -> HypForgeClassifier:
@@ -24,4 +28,12 @@ def load_model(path: str) -> HypForgeClassifier:
 
 
 __version__ = "0.1.0"
-__all__ = ["HypForgeClassifier", "Hypothesis", "HypForgePool", "BFSTree", "load_model"]
+__all__ = [
+    # Primary API
+    "HypForgeClassifier", "SALOTClassifier", "GOSClassifier",
+    "Hypothesis", "HypForgePool", "SALOTPool",
+    "BFSTree", "SALOTTree",
+    "load_model",
+    # Backwards compat
+    "TestForgeClassifier", "TestForgePool",
+]

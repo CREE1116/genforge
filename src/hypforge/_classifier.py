@@ -529,13 +529,6 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             D, max_size=self.pool_size,
             op_mode="all",
             crossover_top_k=self.crossover_top_k,
-            elitism_k=self.elitism_k,
-            alps_mode=True,
-            map_elites_slots=self.map_elites_slots,
-            family_max_size=self.family_max_size,
-            meta_evolution=self.meta_evolution,
-            family_lambda=self.family_lambda,
-            breeding_beta=self.breeding_beta,
         )
 
         rng             = np.random.default_rng(seed)
@@ -604,19 +597,9 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
             if self.verbose:
                 ll  = -np.log(Pm[np.arange(N), y].clip(1e-8)).mean()
                 acc = (Pm.argmax(axis=1) == y).mean()
-                best_ucb = snap[0].score if snap else 0.0
-                best_mu  = snap[0].mu_fitness if snap else 0.0
-                
-                meta_str = ""
-                if self.meta_evolution:
-                    pstats = pool.get_policy_stats()
-                    active_id = pstats["active_idx"]
-                    mean_rew = pstats["mean_rewards"][active_id] if active_id >= 0 else 0.0
-                    meta_str = f" | Policy={active_id} (rew={mean_rew:.3f})"
-                
                 print(
                     f"  [HypForge] Round {m+1:3d} | Loss={ll:.4f} | Acc={acc:.4f} | "
-                    f"UCB={best_ucb:.4f} | μ={best_mu:.4f} | Pop={len(snap)}{meta_str}{val_str}"
+                    f"Pop={len(snap)}{val_str}"
                 )
 
             if X_val is not None and self.early_stopping_rounds is not None:
@@ -631,3 +614,340 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         self._pool_hypotheses_ = best_pool_snap if best_pool_snap else pool.pop
         for h in self._pool_hypotheses_:
             h.clear_runtime_caches()
+
+
+# ── SALOTClassifier ──────────────────────────────────────────────────────────
+
+class SALOTClassifier(HypForgeClassifier):
+    """
+    SALOT: Pool-less Local Stochastic Oblique Tree boosting.
+
+    Per-node block WLS with instance subsampling, feature subsampling, and
+    zero-cross-term feature bundling.  No hypothesis pool, no global cache.
+    Split weight vectors are stored inside each tree node.
+    """
+
+    def __init__(
+        self,
+        n_estimators:          int   = 500,
+        learning_rate:         float = 0.05,
+        max_depth:             int   = 4,
+        reg_lambda:            float = 1.0,
+        pool_size:             int   = 0,     # unused, kept for API compat
+        subsample:             float = 0.8,
+        colsample_bytree:      float = 1.0,
+        early_stopping_rounds: int | None = 50,
+        device:                str   = "auto",
+        n_jobs:                int   = -1,
+        random_state:          int | None = None,
+        verbose:               bool  = False,
+        cat_features:          list | None = None,
+        prune_strength:        float = 0.1,
+        n_wls_max:             int   = 512,
+        d_sub_max:             int   = 32,
+    ):
+        super().__init__(
+            n_estimators          = n_estimators,
+            learning_rate         = learning_rate,
+            max_depth             = max_depth,
+            reg_lambda            = reg_lambda,
+            pool_size             = 0,
+            subsample             = subsample,
+            early_stopping_rounds = early_stopping_rounds,
+            device                = device,
+            random_state          = random_state,
+            verbose               = verbose,
+            cat_features          = cat_features,
+        )
+        self.colsample_bytree = colsample_bytree
+        self.n_jobs           = n_jobs
+        self.prune_strength   = prune_strength
+        self.n_wls_max        = n_wls_max
+        self.d_sub_max        = d_sub_max
+
+    def _fit_core(self, X, y, X_val, y_val, D_num):
+        from ._salot import SALOTTree
+
+        N    = X.shape[0]
+        K    = int(y.max()) + 1
+        seed = self.random_state if self.random_state is not None else 42
+
+        cnt = np.bincount(y, minlength=K).astype(np.float32)
+        cw  = N / (K * cnt.clip(min=1))
+        sw  = cw[y]
+
+        lp  = np.log(cnt / N + 1e-8); lp -= lp.mean()
+        self.F_init_ = lp.tolist()
+
+        Fsc   = np.tile(lp, (N, 1))
+        F_val = np.tile(lp, (X_val.shape[0], 1)) if X_val is not None else None
+
+        rng = np.random.default_rng(seed)
+
+        # 저차원(D_num ≤ 4)에서는 energy pruning 비활성화
+        adaptive_prune = self.prune_strength if D_num > 4 else 0.0
+
+        best_val_loss = float("inf")
+        best_trees:   list = []
+        no_improv = 0
+
+        self.trees_: list = []   # list of SALOTTree
+
+        for m in range(self.n_estimators):
+            Fsh = Fsc - Fsc.max(axis=1, keepdims=True)
+            Pm  = np.exp(Fsh); Pm /= Pm.sum(axis=1, keepdims=True)
+
+            oh  = np.zeros((N, K), dtype=np.float32)
+            oh[np.arange(N), y] = 1.0
+            G_w = (sw[:, None] * (Pm - oh)).astype(np.float32)
+            H_w = (sw[:, None] * Pm * (1.0 - Pm)).astype(np.float32)
+
+            if self.subsample < 1.0:
+                sub_size = min(N, max(1000, int(N * self.subsample)))
+                tree_sub = rng.choice(N, size=sub_size, replace=False).astype(np.int32)
+            else:
+                tree_sub = np.arange(N, dtype=np.int32)
+
+            t = SALOTTree(
+                max_depth      = self.max_depth,
+                reg_lambda     = self.reg_lambda,
+                prune_strength = adaptive_prune,
+                n_wls_max      = self.n_wls_max,
+                d_sub_max      = self.d_sub_max,
+                subsample      = 1.0,
+                random_state   = seed + m,
+            )
+            out_pred = t.fit_predict(X, G_w, H_w, D_num=D_num, subset=tree_sub)
+            self.trees_.append(t)
+            Fsc += self.learning_rate * out_pred
+
+            val_str = ""
+            if X_val is not None:
+                pred_val = t.predict(X_val)
+                F_val    = F_val + self.learning_rate * pred_val
+                Fv_sh    = F_val - F_val.max(axis=1, keepdims=True)
+                P_val    = np.exp(Fv_sh); P_val /= P_val.sum(axis=1, keepdims=True)
+                val_loss = -np.log(P_val[np.arange(len(y_val)), y_val].clip(1e-8)).mean()
+                val_acc  = (P_val.argmax(axis=1) == y_val).mean()
+                val_str  = f" | ValLoss={val_loss:.4f} | ValAcc={val_acc:.4f}"
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    no_improv     = 0
+                    best_trees    = list(self.trees_)
+                else:
+                    no_improv += 1
+
+            if self.verbose:
+                ll  = -np.log(Pm[np.arange(N), y].clip(1e-8)).mean()
+                acc = (Pm.argmax(axis=1) == y).mean()
+                print(
+                    f"  [SALOTClassifier] Round {m+1:3d} | Loss={ll:.4f} | "
+                    f"Acc={acc:.4f}{val_str}"
+                )
+
+            if X_val is not None and self.early_stopping_rounds is not None:
+                if no_improv >= self.early_stopping_rounds:
+                    if self.verbose:
+                        print(f"  [SALOTClassifier] Early stopping at round {m+1}")
+                    self.trees_ = best_trees
+                    break
+
+    def predict_proba(self, X):
+        if hasattr(X, "values"):
+            X = X.values
+        X = np.ascontiguousarray(X, dtype=np.float32)
+        N = X.shape[0]
+
+        F = np.tile(np.array(self.F_init_, dtype=np.float32), (N, 1))
+        for t in self.trees_:
+            F += self.learning_rate * t.predict(X)
+
+        Fsh = F - F.max(axis=1, keepdims=True)
+        P   = np.exp(Fsh); P /= P.sum(axis=1, keepdims=True)
+        return P
+
+    def __del__(self):
+        pass
+
+
+TestForgeClassifier = SALOTClassifier
+
+
+# ── GOSClassifier ─────────────────────────────────────────────────────────────
+
+class GOSClassifier:
+    """
+    d-GOS (Differentiable Gradient Ordering Search) boosted classifier.
+
+    Each round: evolve B particles via differentiable H-functional gradient,
+    then build a BFSTree using the evolved particle projections as split axes.
+    """
+
+    def __init__(
+        self,
+        n_estimators:          int   = 300,
+        B:                     int   = 32,
+        M:                     int   = 32,
+        tau:                   float = 1.0,
+        gos_steps:             int   = 10,
+        gos_eta:               float = 0.05,
+        gos_lam:               float = 0.01,
+        gos_gamma:             float = 0.1,
+        max_depth:             int   = 8,
+        learning_rate:         float = 0.1,
+        subsample:             float = 0.9,
+        reg_lambda:            float = 1.0,
+        early_stopping_rounds: int | None = 50,
+        random_state:          int | None = 42,
+    ):
+        self.n_estimators          = n_estimators
+        self.B                     = B
+        self.M                     = M
+        self.tau                   = tau
+        self.gos_steps             = gos_steps
+        self.gos_eta               = gos_eta
+        self.gos_lam               = gos_lam
+        self.gos_gamma             = gos_gamma
+        self.max_depth             = max_depth
+        self.learning_rate         = learning_rate
+        self.subsample             = subsample
+        self.reg_lambda            = reg_lambda
+        self.early_stopping_rounds = early_stopping_rounds
+        self.random_state          = random_state
+
+        self._tree_ptrs_:   list = []
+        self._pool_snaps_:  list = []
+        self.F_init_:       list = []
+        self.classes_       = None
+
+    def fit(self, X, y, eval_set=None, verbose: bool = False):
+        from ._gos import GOSPool
+
+        if hasattr(X, "values"):
+            X = X.values
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.int64)
+
+        N, D = X.shape
+        K    = int(y.max()) + 1
+        self.classes_ = np.arange(K)
+        seed = self.random_state if self.random_state is not None else 42
+
+        cnt = np.bincount(y, minlength=K).astype(np.float32)
+        cw  = N / (K * cnt.clip(min=1))
+        sw  = cw[y]
+
+        lp  = np.log(cnt / N + 1e-8); lp -= lp.mean()
+        self.F_init_ = lp.tolist()
+
+        Fsc   = np.tile(lp, (N, 1)).astype(np.float32)
+        F_val = None
+        X_val, y_val = None, None
+        if eval_set:
+            X_val, y_val = eval_set[0]
+            if hasattr(X_val, "values"):
+                X_val = X_val.values
+            X_val = np.asarray(X_val, dtype=np.float32)
+            y_val = np.asarray(y_val, dtype=np.int64)
+            F_val = np.tile(lp, (len(X_val), 1)).astype(np.float32)
+
+        rng = np.random.default_rng(seed)
+        pool = GOSPool(D, B=self.B, M=self.M, tau=self.tau,
+                       n_steps=self.gos_steps, eta=self.gos_eta,
+                       lam=self.gos_lam, gamma=self.gos_gamma, seed=seed)
+
+        best_val_loss = float("inf")
+        best_ptrs:  list = []
+        best_snaps: list = []
+        no_improv = 0
+
+        self._tree_ptrs_  = []
+        self._pool_snaps_ = []
+
+        for m in range(self.n_estimators):
+            Fsh = Fsc - Fsc.max(axis=1, keepdims=True)
+            Pm  = np.exp(Fsh); Pm /= Pm.sum(axis=1, keepdims=True)
+
+            oh  = np.zeros((N, K), dtype=np.float32)
+            oh[np.arange(N), y] = 1.0
+            G_w = (sw[:, None] * (Pm - oh)).astype(np.float32)
+            H_w = (sw[:, None] * Pm * (1.0 - Pm)).astype(np.float32)
+
+            if self.subsample < 1.0:
+                ns  = max(1, int(N * self.subsample))
+                sub = rng.choice(N, ns, replace=False).astype(np.int32)
+            else:
+                sub = np.arange(N, dtype=np.int32)
+
+            pool.evolve(X, G_w, H_w, sub=sub, round_num=m)
+
+            out_pred = np.zeros((N, K), dtype=np.float32)
+            tree_ptr = pool.build_tree(X, G_w, H_w, sub, self.max_depth,
+                                       self.reg_lambda, out_pred)
+            if not tree_ptr:
+                continue
+
+            self._tree_ptrs_.append(tree_ptr)
+            self._pool_snaps_.append(pool.snapshot())
+            Fsc += self.learning_rate * out_pred
+
+            val_str = ""
+            if X_val is not None:
+                pred_val = np.zeros((len(X_val), K), dtype=np.float32)
+                pool.predict_tree(tree_ptr, X_val, pred_val)
+                F_val = F_val + self.learning_rate * pred_val
+                Fv_sh = F_val - F_val.max(axis=1, keepdims=True)
+                P_val = np.exp(Fv_sh); P_val /= P_val.sum(axis=1, keepdims=True)
+                val_loss = -np.log(P_val[np.arange(len(y_val)), y_val].clip(1e-8)).mean()
+                val_acc  = (P_val.argmax(axis=1) == y_val).mean()
+                val_str  = f" | ValLoss={val_loss:.4f} | ValAcc={val_acc:.4f}"
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    no_improv     = 0
+                    best_ptrs     = list(self._tree_ptrs_)
+                    best_snaps    = list(self._pool_snaps_)
+                else:
+                    no_improv += 1
+
+            if verbose and ((m + 1) % 50 == 0 or m == 0):
+                ll  = -np.log(Pm[np.arange(N), y].clip(1e-8)).mean()
+                acc = (Pm.argmax(axis=1) == y).mean()
+                print(f"  [GOS] Round {m+1:3d} | Loss={ll:.4f} | Acc={acc:.4f}{val_str}")
+
+            if X_val is not None and self.early_stopping_rounds is not None:
+                if no_improv >= self.early_stopping_rounds:
+                    self._tree_ptrs_  = best_ptrs
+                    self._pool_snaps_ = best_snaps
+                    break
+
+        return self
+
+    def predict_proba(self, X):
+        from ._gos import GOSPool
+
+        if hasattr(X, "values"):
+            X = X.values
+        X  = np.ascontiguousarray(X, dtype=np.float32)
+        N  = X.shape[0]
+        K  = len(self.classes_)
+
+        F = np.tile(np.array(self.F_init_, dtype=np.float32), (N, 1))
+        for ptr, W_snap in zip(self._tree_ptrs_, self._pool_snaps_):
+            B  = W_snap.shape[0]
+            D  = W_snap.shape[1]
+            # Reconstruct a minimal pool snapshot for prediction
+            pool_snap = GOSPool.__new__(GOSPool)
+            pool_snap.D = D; pool_snap.B = B; pool_snap.M = self.M
+            pool_snap.tau = self.tau; pool_snap.W = W_snap
+            pred = np.zeros((N, K), dtype=np.float32)
+            pool_snap.predict_tree(ptr, X, pred)
+            F += self.learning_rate * pred
+
+        Fsh = F - F.max(axis=1, keepdims=True)
+        P   = np.exp(Fsh); P /= P.sum(axis=1, keepdims=True)
+        return P
+
+    def predict(self, X):
+        return self.predict_proba(X).argmax(axis=1)
