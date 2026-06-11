@@ -3,15 +3,15 @@ requires = ["setuptools>=68", "numpy>=1.24"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hypforge"
+name = "genforge"
 version = "0.1.1"
-description = "Hypothesis Pool Evolution for Oblique GBDT — high-performance C++ tree backend"
+description = "GG-SRP hereditary oblique GBDT — native NaN/categorical, high-performance C++ backend"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
-keywords = ["gradient-boosting", "oblique-trees", "machine-learning"]
+keywords = ["gradient-boosting", "oblique-trees", "machine-learning", "tabular-data", "random-projection"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -32,15 +32,16 @@ dev  = ["pytest>=8.0", "pytest-cov", "pandas", "matplotlib"]
 full = ["pandas", "matplotlib"]
 
 [project.urls]
-Homepage   = "https://github.com/cree1116/hypforge"
-Repository = "https://github.com/cree1116/hypforge"
-Issues     = "https://github.com/cree1116/hypforge/issues"
+Homepage      = "https://github.com/cree1116/genforge"
+Repository    = "https://github.com/cree1116/genforge"
+Issues        = "https://github.com/cree1116/genforge/issues"
+Documentation = "https://github.com/cree1116/genforge/tree/main/docs"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-"hypforge" = ["_ext/libbfstree.dylib", "_ext/libbfstree.so", "_ext/bfstree.dll", "*.pyi"]
+"genforge" = ["_ext/libbfstree.dylib", "_ext/libbfstree.so", "_ext/bfstree.dll", "*.pyi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -4,21 +4,21 @@ import ctypes
 import numpy as np
 from ._tree import _get_lib as _get_tree_lib
 
-# ── Standalone SALOT C bindings (pool-free, v9) ───────────────────────────────
+# ── Standalone Genforge C bindings (pool-free) ─────────────────────────────
 
-_salot_configured = False
+_genforge_configured = False
 
 _pf = ctypes.POINTER(ctypes.c_float)
 _pi = ctypes.POINTER(ctypes.c_int)
 
 
-def _get_salot_lib():
-    global _salot_configured
+def _get_genforge_lib():
+    global _genforge_configured
     lib = _get_tree_lib()
-    if _salot_configured:
+    if _genforge_configured:
         return lib
 
-    lib.salot_ctx_create.argtypes = [
+    lib.gf_ctx_create.argtypes = [
         _pf,           # X     [N, D]   (copied; need not stay alive)
         ctypes.c_int,  # N
         ctypes.c_int,  # D
@@ -26,12 +26,12 @@ def _get_salot_lib():
         _pi,           # sub   [Ns]     (stats subsample)
         ctypes.c_int,  # Ns
     ]
-    lib.salot_ctx_create.restype = ctypes.c_void_p
+    lib.gf_ctx_create.restype = ctypes.c_void_p
 
-    lib.salot_ctx_free.argtypes = [ctypes.c_void_p]
-    lib.salot_ctx_free.restype = None
+    lib.gf_ctx_free.argtypes = [ctypes.c_void_p]
+    lib.gf_ctx_free.restype = None
 
-    lib.salot_build_v8.argtypes = [
+    lib.gf_build.argtypes = [
         ctypes.c_void_p,  # ctx
         _pf,              # X (unused in v9; context copy is authoritative)
         _pf,              # G        [N, K]
@@ -41,35 +41,49 @@ def _get_salot_lib():
         ctypes.c_int,     # Ns
         ctypes.c_int,     # max_depth
         ctypes.c_float,   # reg_lambda
+        ctypes.c_float,   # inherited_rp_ratio
+        ctypes.c_float,   # mutation_rate
+        ctypes.c_float,   # mutation_strength
         _pf,              # out_pred [N, K]  (may be NULL)
     ]
-    lib.salot_build_v8.restype = ctypes.c_void_p
+    lib.gf_build.restype = ctypes.c_void_p
 
-    lib.salot_predict.argtypes = [
+    lib.gf_predict.argtypes = [
         ctypes.c_void_p,  # tree_handle
         _pf,              # X     [N, D]  raw (NaN / cat values allowed)
         ctypes.c_int,     # N
         ctypes.c_int,     # K
         _pf,              # out_pred [N, K]
     ]
-    lib.salot_predict.restype = None
+    lib.gf_predict.restype = None
 
-    lib.salot_tree_free.argtypes = [ctypes.c_void_p]
-    lib.salot_tree_free.restype = None
+    lib.gf_predict_ensemble.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),  # tree handles [n_trees]
+        ctypes.c_int,                     # n_trees
+        _pf,                              # X        [N, D] raw
+        ctypes.c_int,                     # N
+        ctypes.c_int,                     # K
+        ctypes.c_float,                   # lr (leaf value scale)
+        _pf,                              # out_pred [N, K] pre-filled F_init
+    ]
+    lib.gf_predict_ensemble.restype = None
 
-    lib.salot_tree_meta_sizes.argtypes = [ctypes.c_void_p, _pi]
-    lib.salot_tree_meta_sizes.restype = None
+    lib.gf_tree_free.argtypes = [ctypes.c_void_p]
+    lib.gf_tree_free.restype = None
 
-    lib.salot_tree_export_meta.argtypes = [ctypes.c_void_p, _pf, _pi, _pi, _pf]
-    lib.salot_tree_export_meta.restype = None
+    lib.gf_tree_meta_sizes.argtypes = [ctypes.c_void_p, _pi]
+    lib.gf_tree_meta_sizes.restype = None
 
-    lib.salot_tree_import_meta.argtypes = [
+    lib.gf_tree_export_meta.argtypes = [ctypes.c_void_p, _pf, _pi, _pi, _pf]
+    lib.gf_tree_export_meta.restype = None
+
+    lib.gf_tree_import_meta.argtypes = [
         ctypes.c_void_p, ctypes.c_int, _pf, ctypes.c_int,
         _pi, ctypes.c_int, _pi, _pf,
     ]
-    lib.salot_tree_import_meta.restype = None
+    lib.gf_tree_import_meta.restype = None
 
-    _salot_configured = True
+    _genforge_configured = True
     return lib
 
 
@@ -81,8 +95,29 @@ def _iptr(a: np.ndarray):
     return a.ctypes.data_as(_pi)
 
 
-class SALOTTree:
-    """Single pool-free SALOT tree (v9).
+def predict_ensemble(trees: list, X: np.ndarray, K: int, lr: float,
+                     F_init: np.ndarray) -> np.ndarray:
+    """Accumulate lr-scaled predictions of fitted trees in one C call.
+
+    The numeric NaN transform is computed once and shared across trees;
+    only categorical re-encoding is per-tree.  ~n_trees× fewer FFI
+    crossings and transform passes than looping ``tree.predict``.
+    """
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    N = X.shape[0]
+    out = np.tile(np.asarray(F_init, dtype=np.float32), (N, 1))
+    handles = [t._tree_handle for t in trees if t._tree_handle is not None]
+    if not handles:
+        return out
+    arr = (ctypes.c_void_p * len(handles))(*handles)
+    lib = _get_genforge_lib()
+    lib.gf_predict_ensemble(arr, len(handles), _fptr(X), N, K,
+                            ctypes.c_float(lr), _fptr(out))
+    return out
+
+
+class GenforgeTree:
+    """Single pool-free Genforge tree.
 
     Deterministic two-hyperparameter oblique booster round: global 256-bin
     histogram axis tournament + per-node CD oblique directions, with native
@@ -132,10 +167,13 @@ class SALOTTree:
         H:      np.ndarray,
         D_num:  int | None = None,
         subset: np.ndarray | None = None,
+        inherited_rp_ratio: float = 1.0,
+        mutation_rate: float = 0.1,
+        mutation_strength: float = 0.5,
     ) -> np.ndarray:
         """One-shot build (creates and frees a binning context internally).
 
-        For boosting loops use :class:`SalotContext` instead — it bins X once
+        For boosting loops use :class:`GenforgeContext` instead — it bins X once
         and reuses the codes across every round.
         """
         X = np.ascontiguousarray(X, dtype=np.float32)
@@ -152,10 +190,13 @@ class SALOTTree:
             else:
                 subset = np.arange(N, dtype=np.int32)
 
-        ctx = SalotContext(X, D_num=D_num)
+        ctx = GenforgeContext(X, D_num=D_num)
         try:
             tree, out_pred = ctx.build(
-                G, H, subset, self.max_depth, self.reg_lambda
+                G, H, subset, self.max_depth, self.reg_lambda,
+                inherited_rp_ratio=inherited_rp_ratio,
+                mutation_rate=mutation_rate,
+                mutation_strength=mutation_strength
             )
         finally:
             ctx.close()
@@ -171,8 +212,8 @@ class SALOTTree:
         X   = np.ascontiguousarray(X, dtype=np.float32)
         N   = X.shape[0]
         out = np.zeros((N, self._K), dtype=np.float32)
-        lib = _get_salot_lib()
-        lib.salot_predict(self._tree_handle, _fptr(X), N, self._K, _fptr(out))
+        lib = _get_genforge_lib()
+        lib.gf_predict(self._tree_handle, _fptr(X), N, self._K, _fptr(out))
         return out
 
     # ── pickling: structure via bfstree arrays + v9 meta ─────────────────────
@@ -188,7 +229,7 @@ class SALOTTree:
         }
         if self._tree_handle is None:
             return base
-        lib     = _get_salot_lib()
+        lib     = _get_genforge_lib()
         h       = self._tree_handle
         n_nodes = lib.bfstree_get_total_nodes(h)
         K       = self._K
@@ -206,13 +247,13 @@ class SALOTTree:
         lib.bfstree_get_split_weights(h, _fptr(split_weights))
 
         sizes = np.zeros(4, dtype=np.int32)
-        lib.salot_tree_meta_sizes(h, _iptr(sizes))
+        lib.gf_tree_meta_sizes(h, _iptr(sizes))
         D_num, D_cat, n_entries, na_len = (int(v) for v in sizes)
         na_means  = np.zeros(max(na_len, 1),    dtype=np.float32)
         cat_sizes = np.zeros(max(D_cat, 1),     dtype=np.int32)
         cat_keys  = np.zeros(max(n_entries, 1), dtype=np.int32)
         cat_vals  = np.zeros(max(n_entries, 1), dtype=np.float32)
-        lib.salot_tree_export_meta(
+        lib.gf_tree_export_meta(
             h, _fptr(na_means), _iptr(cat_sizes), _iptr(cat_keys),
             _fptr(cat_vals),
         )
@@ -246,7 +287,7 @@ class SALOTTree:
         self._tree_handle = None
         if state["handle"] is None:
             return
-        lib = _get_salot_lib()
+        lib = _get_genforge_lib()
         s   = state
         handle = lib.bfstree_from_arrays(
             _iptr(s["hyp_idx"]), _fptr(s["threshold"]), _fptr(s["leaf_vals"]),
@@ -258,7 +299,7 @@ class SALOTTree:
         cat_sizes = np.ascontiguousarray(s["cat_sizes"], dtype=np.int32)
         cat_keys  = np.ascontiguousarray(s["cat_keys"],  dtype=np.int32)
         cat_vals  = np.ascontiguousarray(s["cat_vals"],  dtype=np.float32)
-        lib.salot_tree_import_meta(
+        lib.gf_tree_import_meta(
             handle, s["D_num"], _fptr(na_means), s["na_len"],
             _iptr(cat_sizes), s["D_cat"], _iptr(cat_keys), _fptr(cat_vals),
         )
@@ -267,13 +308,13 @@ class SALOTTree:
     def __del__(self):
         if self._tree_handle is not None:
             try:
-                _get_salot_lib().salot_tree_free(self._tree_handle)
+                _get_genforge_lib().gf_tree_free(self._tree_handle)
             except Exception:
                 pass
             self._tree_handle = None
 
 
-class SalotContext:
+class GenforgeContext:
     """Reusable binning context for a boosting run.
 
     Bins X once (numeric: NaN-mean-imputed 256-bin codes; categorical:
@@ -286,8 +327,8 @@ class SalotContext:
         self.N, self.D = X.shape
         self.D_num = self.D if D_num is None else int(D_num)
         sub = np.arange(self.N, dtype=np.int32)
-        lib = _get_salot_lib()
-        self._handle = lib.salot_ctx_create(
+        lib = _get_genforge_lib()
+        self._handle = lib.gf_ctx_create(
             _fptr(X), self.N, self.D, self.D_num, _iptr(sub), self.N
         )
 
@@ -298,7 +339,10 @@ class SalotContext:
         sub: np.ndarray,
         max_depth: int,
         reg_lambda: float,
-    ) -> tuple[SALOTTree, np.ndarray]:
+        inherited_rp_ratio: float = 1.0,
+        mutation_rate: float = 0.1,
+        mutation_strength: float = 0.5,
+    ) -> tuple[GenforgeTree, np.ndarray]:
         """One boosting round → (fitted tree, predictions for all N rows)."""
         if self._handle is None:
             raise RuntimeError("Context is closed.")
@@ -307,19 +351,23 @@ class SalotContext:
         sub = np.ascontiguousarray(sub, dtype=np.int32)
         K = G.shape[1]
         out_pred = np.zeros((self.N, K), dtype=np.float32)
-        lib = _get_salot_lib()
-        handle = lib.salot_build_v8(
+        lib = _get_genforge_lib()
+        handle = lib.gf_build(
             self._handle, None, _fptr(G), _fptr(H), K,
             _iptr(sub), len(sub), max_depth,
-            ctypes.c_float(reg_lambda), _fptr(out_pred),
+            ctypes.c_float(reg_lambda),
+            ctypes.c_float(inherited_rp_ratio),
+            ctypes.c_float(mutation_rate),
+            ctypes.c_float(mutation_strength),
+            _fptr(out_pred),
         )
-        tree = SALOTTree._from_handle(handle, K, max_depth, reg_lambda)
+        tree = GenforgeTree._from_handle(handle, K, max_depth, reg_lambda)
         return tree, out_pred
 
     def close(self):
         if self._handle is not None:
             try:
-                _get_salot_lib().salot_ctx_free(self._handle)
+                _get_genforge_lib().gf_ctx_free(self._handle)
             except Exception:
                 pass
             self._handle = None

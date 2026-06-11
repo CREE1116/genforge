@@ -10,8 +10,8 @@ class CustomBuildPy(build_py):
     def run(self):
         super().run()
 
-        src_ext_dir   = os.path.abspath(os.path.join(os.path.dirname(__file__), "src", "hypforge", "_ext"))
-        build_ext_dir = os.path.abspath(os.path.join(self.build_lib, "hypforge", "_ext"))
+        src_ext_dir   = os.path.abspath(os.path.join(os.path.dirname(__file__), "src", "genforge", "_ext"))
+        build_ext_dir = os.path.abspath(os.path.join(self.build_lib, "genforge", "_ext"))
 
         system = platform.system()
         if system == "Darwin":
@@ -29,24 +29,16 @@ class CustomBuildPy(build_py):
             lib_name = "libbfstree.so"
             cmd = ["g++", "-O3", "-march=native", "-shared", "-fPIC", "-std=c++17", "-fopenmp"]
 
-        src_bfstree   = os.path.join(src_ext_dir, "bfstree.cpp")
-        src_hypforge  = os.path.join(src_ext_dir, "hypforge.cpp")
-        src_lib       = os.path.join(src_ext_dir, lib_name)
+        src_bfstree  = os.path.join(src_ext_dir, "bfstree.cpp")
+        src_genforge = os.path.join(src_ext_dir, "genforge.cpp")
+        src_lib      = os.path.join(src_ext_dir, lib_name)
         build_lib_path = os.path.join(build_ext_dir, lib_name)
 
-        src_salot = os.path.join(src_ext_dir, "salot.cpp")
-        src_gos   = os.path.join(src_ext_dir, "gos.cpp")
-        src_evopool = os.path.join(src_ext_dir, "evopool.cpp")
+        src_files = [src_bfstree]
+        if os.path.exists(src_genforge):
+            src_files.append(src_genforge)
 
-        src_files = [src_bfstree, src_hypforge]
-        if os.path.exists(src_salot):
-            src_files.append(src_salot)
-        if os.path.exists(src_gos):
-            src_files.append(src_gos)
-        if os.path.exists(src_evopool):
-            src_files.append(src_evopool)
-
-        if os.path.exists(src_bfstree) and os.path.exists(src_hypforge):
+        if os.path.exists(src_bfstree):
             compile_cmd = cmd + src_files + ["-o", src_lib]
             print(f"Compiling C++ extension: {' '.join(compile_cmd)}")
             subprocess.run(compile_cmd, check=True)
@@ -55,7 +47,7 @@ class CustomBuildPy(build_py):
             print(f"Copying compiled library to build folder: {build_lib_path}")
             shutil.copy2(src_lib, build_lib_path)
 
-            for src_name in ["bfstree.cpp", "hypforge.cpp", "salot.cpp", "gos.cpp", "evopool.cpp", "bfstree_types.h"]:
+            for src_name in ["bfstree.cpp", "genforge.cpp", "bfstree_types.h"]:
                 src_file_in_build = os.path.join(build_ext_dir, src_name)
                 if os.path.exists(src_file_in_build):
                     print(f"Removing source file {src_file_in_build} from build folder")

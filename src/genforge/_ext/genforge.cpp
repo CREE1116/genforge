@@ -1,4 +1,4 @@
-// salot.cpp — SALOT v9: context-cached, subtraction-based oblique booster
+// genforge.cpp — GenForge v9: context-cached, subtraction-based oblique booster
 // with native missing-value and categorical handling.
 //
 // One route, two hyperparameters (max_depth, reg_lambda), fully
@@ -22,21 +22,32 @@
 //     cached direction touching a cat dim would silently change meaning.
 //
 // Carried over from v8:
-//   * Binning context computed ONCE in salot_ctx_create, reused per round
+//   * Binning context computed ONCE in gf_ctx_create, reused per round
 //     (numeric codes static; only cat columns are re-coded per round).
 //   * Histogram subtraction (smaller child fresh, larger = parent − smaller).
 //   * Lazy A* best-first growth with admissible node potential.
 //   * Oblique directions only where ns ≥ OBLIQUE_MIN.
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <numeric>
 #include <queue>
+#include <random>
+#include <unordered_map>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "bfstree_types.h"
-#include "salot_core.h"
+#include "genforge_core.h"
 
 static constexpr int OBLIQUE_MIN = 64;  // min node size to fit directions
 
 // ─── Binning context (per dataset, reused across all boosting rounds) ───────
-struct SalotCtx {
+struct GenforgeCtx {
   int N = 0, D = 0, D_num = 0, D_cat = 0;
   std::vector<uint8_t> code;            // N·D uint8 bin codes
   std::vector<float> ax_min, ax_range;  // per-feature bin frame
@@ -49,12 +60,7 @@ struct SalotCtx {
   std::vector<int> cat_card;       // per cat col: n_distinct + 1 (NaN slot)
   std::vector<int32_t> cat_dense;  // N·D_cat dense ids (NaN → card-1)
 
-  // Persistent direction cache (the pool-persistence trait shared by the
-  // two high-balanced-accuracy models, HypForge and EvoPool): oblique
-  // directions that won a split stay available as FREE candidates (no CD
-  // solve) at every node of every subsequent round. NUMERIC-ONLY: cat
-  // rank coordinates change meaning each round. Ring buffer,
-  // cosine-deduplicated, deterministic.
+  // Persistent direction cache
   static constexpr int DIR_CACHE_MAX = 32;
   std::vector<std::vector<float>> dir_cache;  // dense D each
   int dir_cache_next = 0;
@@ -91,24 +97,25 @@ static std::vector<int> stride_cap(const std::vector<int>& v, int cap) {
 }
 
 // Route a TRANSFORMED matrix x̃ (no NaN, cats already rank-encoded).
-static void _salot_route(const BFSTree* tree, const float* X, int N,
+static void _gf_route(const BFSTree* tree, const float* X, int N,
                          float* out_pred) {
   int D = tree->D, K = tree->K;
   int T = tree->total_nodes;
-  std::vector<std::vector<std::pair<int, float>>> node_nz(T);
+  std::vector<SparseVec> node_nz(T);
   for (int t = 0; t < T; t++) {
     if (tree->is_leaf[t]) continue;
-    collect_nonzero(tree->split_weights.data() + (size_t)t * D, D, node_nz[t]);
+    collect_nonzero_stack(tree->split_weights.data() + (size_t)t * D, D,
+                          node_nz[t]);
   }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
   for (int i = 0; i < N; i++) {
-    const float* SALOT_RESTRICT xi = X + (size_t)i * D;
+    const float* GF_RESTRICT xi = X + (size_t)i * D;
     int t = 0;
     for (int dep = 0; dep < tree->max_depth; dep++) {
       if (tree->is_leaf[t]) break;
-      float proj = sparse_dot(node_nz[t], xi);
+      float proj = sparse_dot_stack(node_nz[t], xi);
       t = (proj < tree->split_threshold[t]) ? (2 * t + 1) : (2 * t + 2);
     }
     const float* lv = tree->leaf_values.data() + (size_t)t * K;
@@ -119,13 +126,10 @@ static void _salot_route(const BFSTree* tree, const float* X, int N,
 
 extern "C" {
 
-// Pre-bin all features once. Numeric: NaN → μ_f imputation, then linear
-// 256-bin grid. Categorical (columns [D_num, D)): build the raw-value
-// dictionary; rank codes are written per round by salot_build_v8.
-// X is fully copied into the context (it need not stay alive).
-SALOT_API void* salot_ctx_create(const float* X, int N, int D, int D_num,
+// Pre-bin all features once.
+GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
                                  const int* sub, int Ns) {
-  auto* ctx = new SalotCtx();
+  auto* ctx = new GenforgeCtx();
   ctx->N = N;
   ctx->D = D;
   ctx->D_num = D_num;
@@ -142,7 +146,7 @@ SALOT_API void* salot_ctx_create(const float* X, int N, int D, int D_num,
   std::vector<double> sum(D_num, 0.0);
   std::vector<int> cnt(D_num, 0);
   for (int si = 0; si < Ns; si++) {
-    const float* SALOT_RESTRICT xi = X + (size_t)sub[si] * D;
+    const float* GF_RESTRICT xi = X + (size_t)sub[si] * D;
     for (int f = 0; f < D_num; f++) {
       float v = xi[f];
       if (std::isnan(v)) continue;
@@ -171,9 +175,9 @@ SALOT_API void* salot_ctx_create(const float* X, int N, int D, int D_num,
 #pragma omp parallel for schedule(static)
 #endif
   for (int i = 0; i < N; i++) {
-    const float* SALOT_RESTRICT xi = X + (size_t)i * D;
-    float* SALOT_RESTRICT ti = ctx->Ximp.data() + (size_t)i * D;
-    uint8_t* SALOT_RESTRICT ci = ctx->code.data() + (size_t)i * D;
+    const float* GF_RESTRICT xi = X + (size_t)i * D;
+    float* GF_RESTRICT ti = ctx->Ximp.data() + (size_t)i * D;
+    uint8_t* GF_RESTRICT ci = ctx->code.data() + (size_t)i * D;
     for (int f = 0; f < D_num; f++) {
       float v = xi[f];
       if (std::isnan(v)) v = ctx->col_mean[f];
@@ -186,7 +190,7 @@ SALOT_API void* salot_ctx_create(const float* X, int N, int D, int D_num,
     }
   }
 
-  // ── categorical: value dictionary (sorted → deterministic dense ids) ──────
+  // ── categorical: value dictionary ────────────────────────────────────────
   if (ctx->D_cat > 0) {
     ctx->cat_id.resize(ctx->D_cat);
     ctx->cat_card.assign(ctx->D_cat, 0);
@@ -205,7 +209,7 @@ SALOT_API void* salot_ctx_create(const float* X, int N, int D, int D_num,
       auto& m = ctx->cat_id[fc];
       m.reserve(vals.size() * 2);
       for (int r = 0; r < (int)vals.size(); r++) m[vals[r]] = r;
-      int nan_id = (int)vals.size();  // NaN is its own (always last) category
+      int nan_id = (int)vals.size();  // NaN is its own category
       ctx->cat_card[fc] = nan_id + 1;
       for (int i = 0; i < N; i++) {
         float v = X[(size_t)i * D + f];
@@ -217,22 +221,27 @@ SALOT_API void* salot_ctx_create(const float* X, int N, int D, int D_num,
   return static_cast<void*>(ctx);
 }
 
-SALOT_API void salot_ctx_free(void* h) { delete static_cast<SalotCtx*>(h); }
+GF_API void gf_ctx_free(void* h) { delete static_cast<GenforgeCtx*>(h); }
 
-// ─── salot_build_v8 — one boosting round on a binning context ────────────────
-// (name kept for ABI continuity; implements the v9 semantics above)
-SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
+// ─── gf_build — one boosting round on a binning context ────────────────
+GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                                const float* H, int K, const int* sub, int Ns,
                                int max_depth, float reg_lambda,
-                               float* out_pred) {
-  (void)X;  // v9 reads only the context's transformed copy
-  auto* ctx = static_cast<SalotCtx*>(ctx_handle);
+                               float inherited_rp_ratio, float mutation_rate,
+                               float mutation_strength, float* out_pred) {
+  (void)X;
+  auto* ctx = static_cast<GenforgeCtx*>(ctx_handle);
   const int D = ctx->D, D_num = ctx->D_num, D_cat = ctx->D_cat, N = ctx->N;
-  const float* SALOT_RESTRICT Xt = ctx->Ximp.data();
+  const float* GF_RESTRICT Xt = ctx->Ximp.data();
   const int STRIDE = 2 * K + 1;
   const size_t HSZ = (size_t)D * AX_BINS * STRIDE;
 
-  // Best-first capacity: leaf budget 2^max_depth, internal depth up to 2x.
+  int nth = 1;
+#ifdef _OPENMP
+  nth = omp_get_max_threads();
+#endif
+  std::vector<float> thread_hists((size_t)nth * HSZ, 0.0f);
+
   const int internal_depth = std::min(2 * max_depth, 22);
   const int max_leaves = 1 << max_depth;
   int max_nodes = (1 << (internal_depth + 1)) - 1;
@@ -249,13 +258,9 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
   tree->split_gain.assign(max_nodes, 0.0f);
   tree->split_weights.assign((size_t)max_nodes * D, 0.0f);
   tree->na_means.assign(D, 0.0f);
-  std::copy(ctx->col_mean.begin(), ctx->col_mean.end(),
-            tree->na_means.begin());
+  std::copy(ctx->col_mean.begin(), ctx->col_mean.end(), tree->na_means.begin());
 
-  // ── per-round categorical re-encoding: signed Newton-score ranks ──────────
-  // score(v) = Σ_{i∈v} g_{i,k*} / (Σ_{i∈v} h_{i,k*} + λ), k* = dominant class.
-  // Monotone rank substitution makes each cat column an ordinary ordinal
-  // feature for this round: same binning, same axis scan, same oblique w·x̃.
+  // ── per-round categorical re-encoding ────────────────────────────────────
   if (D_cat > 0) {
     tree->cat_ranks.assign(D_cat, {});
     int kdom = 0;
@@ -274,7 +279,7 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
     for (int fc = 0; fc < D_cat; fc++) {
       int f = D_num + fc;
       int card = ctx->cat_card[fc];
-      if (card <= 1) {  // no observed values at all
+      if (card <= 1) {
         ctx->ax_range[f] = 0.0f;
         continue;
       }
@@ -300,9 +305,9 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       ctx->ax_min[f] = 0.0f;
       ctx->ax_range[f] = (float)(card - 1);
       float scale = (float)AX_BINS / ((float)(card - 1) + EPS);
-      float* SALOT_RESTRICT Xw = ctx->Ximp.data();
-      uint8_t* SALOT_RESTRICT cw = ctx->code.data();
-      const int32_t* SALOT_RESTRICT cd = ctx->cat_dense.data();
+      float* GF_RESTRICT Xw = ctx->Ximp.data();
+      uint8_t* GF_RESTRICT cw = ctx->code.data();
+      const int32_t* GF_RESTRICT cd = ctx->cat_dense.data();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -316,38 +321,33 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       auto& rk = tree->cat_ranks[fc];
       rk.reserve(ctx->cat_id[fc].size() * 2);
       for (const auto& kv : ctx->cat_id[fc]) rk[kv.first] = rank_of[kv.second];
-      // NaN-category rank doubles as the unseen-category fallback.
       tree->na_means[f] = rank_of[card - 1];
     }
   }
-  const uint8_t* SALOT_RESTRICT code = ctx->code.data();
+  const uint8_t* GF_RESTRICT code = ctx->code.data();
 
-  // Parallel histogram accumulation: thread-local buffers, then a serial
-  // merge in tid order. Static scheduling fixes which samples each tid
-  // sums, and the tid-ordered merge fixes the float addition order, so the
-  // result is DETERMINISTIC across runs (for a given thread count).
-  auto accumulate_hist = [&](const int* rows, int nr, float* SALOT_RESTRICT hb,
+  // Histogram accumulation lambda
+  auto accumulate_hist = [&](const int* rows, int nr, float* GF_RESTRICT hb,
                              float* node_P_out) {
     double P_acc = 0.0;
 #ifdef _OPENMP
     if (nr >= 4096) {
-      int nth = omp_get_max_threads();
-      std::vector<std::vector<float>> tbuf(nth);
-      std::vector<double> tP(nth, 0.0);
-#pragma omp parallel num_threads(nth)
+      int nthreads = omp_get_max_threads();
+      std::vector<double> tP(nthreads, 0.0);
+#pragma omp parallel num_threads(nthreads)
       {
         int tid = omp_get_thread_num();
-        tbuf[tid].assign(HSZ, 0.0f);
-        float* SALOT_RESTRICT lb = tbuf[tid].data();
+        float* GF_RESTRICT lb = thread_hists.data() + (size_t)tid * HSZ;
+        std::memset(lb, 0, HSZ * sizeof(float));
         double lp = 0.0;
 #pragma omp for schedule(static) nowait
         for (int si = 0; si < nr; si++) {
           int j = rows[si];
-          const uint8_t* SALOT_RESTRICT cj = code + (size_t)j * D;
-          const float* SALOT_RESTRICT gj = G + (size_t)j * K;
-          const float* SALOT_RESTRICT hj = H + (size_t)j * K;
+          const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
+          const float* GF_RESTRICT gj = G + (size_t)j * K;
+          const float* GF_RESTRICT hj = H + (size_t)j * K;
           for (int f = 0; f < D; f++) {
-            float* SALOT_RESTRICT slot =
+            float* GF_RESTRICT slot =
                 lb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
             for (int c = 0; c < K; c++) {
               slot[c] += gj[c];
@@ -355,33 +355,33 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
             }
             slot[2 * K] += 1.0f;
           }
-          if (node_P_out)
+          if (node_P_out) {
             for (int c = 0; c < K; c++)
               lp += 0.5 * (double)gj[c] * gj[c] /
                     ((double)hj[c] + reg_lambda + EPS);
+          }
         }
         tP[tid] = lp;
       }
-      // Single-region merge: each slot sums its per-thread partials in tid
-      // order — deterministic and one parallel region total.
 #pragma omp parallel for schedule(static)
       for (int64_t i = 0; i < (int64_t)HSZ; i++) {
         float s = hb[i];
-        for (int t = 0; t < nth; t++) s += tbuf[t][i];
+        for (int t = 0; t < nthreads; t++)
+          s += thread_hists[(size_t)t * HSZ + i];
         hb[i] = s;
       }
-      for (int t = 0; t < nth; t++) P_acc += tP[t];
+      for (int t = 0; t < nthreads; t++) P_acc += tP[t];
       if (node_P_out) *node_P_out = (float)P_acc;
       return;
     }
 #endif
     for (int si = 0; si < nr; si++) {
       int j = rows[si];
-      const uint8_t* SALOT_RESTRICT cj = code + (size_t)j * D;
-      const float* SALOT_RESTRICT gj = G + (size_t)j * K;
-      const float* SALOT_RESTRICT hj = H + (size_t)j * K;
+      const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
+      const float* GF_RESTRICT gj = G + (size_t)j * K;
+      const float* GF_RESTRICT hj = H + (size_t)j * K;
       for (int f = 0; f < D; f++) {
-        float* SALOT_RESTRICT slot =
+        float* GF_RESTRICT slot =
             hb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
         for (int c = 0; c < K; c++) {
           slot[c] += gj[c];
@@ -389,10 +389,11 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
         }
         slot[2 * K] += 1.0f;
       }
-      if (node_P_out)
+      if (node_P_out) {
         for (int c = 0; c < K; c++)
           P_acc +=
               0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
+      }
     }
     if (node_P_out) *node_P_out = (float)P_acc;
   };
@@ -401,31 +402,26 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
   std::vector<std::vector<float>> node_hist(max_nodes);
   std::vector<float> node_G((size_t)max_nodes * K, 0.0f);
   std::vector<float> node_H((size_t)max_nodes * K, 0.0f);
-  std::vector<float> node_P(max_nodes,
-                            0.0f);  // Σ_i Σ_c g²/(h+λ): gain UPPER BOUND
+  std::vector<float> node_P(max_nodes, 0.0f);
   std::vector<char> node_has_tot(max_nodes, 0);
 
-  // Pending split candidates (best-first frontier).
   std::vector<float> cand_gain(max_nodes, 0.0f);
   std::vector<float> cand_thr(max_nodes, 0.0f);
   std::vector<int> cand_axis(max_nodes, -1);
   std::vector<int> cand_bcode(max_nodes, 0);
   std::vector<std::vector<float>> cand_w(max_nodes);
-  std::vector<std::vector<float>> cand_proj(
-      max_nodes);  // oblique routing cache
+  std::vector<std::vector<float>> cand_proj(max_nodes);
 
   std::vector<char> oblique_done(max_nodes, 0);
 
-  // ── Phase 1 (cheap, at node creation): exact axis tournament from the
-  // histogram. Its gain is a LOWER BOUND of the node's true best gain and
-  // serves as the frontier priority.
+  // ── Phase 1: Axis scan ───────────────────────────────────────────────────
   auto eval_axis = [&](int t) -> float {
     int ns = (int)node_samp[t].size();
-    const float* SALOT_RESTRICT hb = node_hist[t].data();
+    const float* GF_RESTRICT hb = node_hist[t].data();
 
     std::vector<float> Gt(K, 0.0f), Ht(K, 0.0f);
     for (int b = 0; b < AX_BINS; b++) {
-      const float* SALOT_RESTRICT slot = hb + (size_t)b * STRIDE;
+      const float* GF_RESTRICT slot = hb + (size_t)b * STRIDE;
       for (int c = 0; c < K; c++) {
         Gt[c] += slot[c];
         Ht[c] += slot[K + c];
@@ -443,10 +439,6 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
     float best_gain = 0.0f, best_thr = 0.0f;
     int best_axis = -1, best_axis_b = 0;
 
-    // Axis tournament: exact, from the (possibly subtracted) histogram.
-    // Parallel over features; merge is deterministic regardless of thread
-    // count (max gain, ties broken by the smallest feature index — the same
-    // winner the serial scan picks).
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -459,12 +451,12 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
 #endif
       for (int f = 0; f < D; f++) {
         if (ctx->ax_range[f] == 0.0f) continue;
-        const float* SALOT_RESTRICT fbuf = hb + (size_t)f * AX_BINS * STRIDE;
+        const float* GF_RESTRICT fbuf = hb + (size_t)f * AX_BINS * STRIDE;
         std::fill(Gc.begin(), Gc.end(), 0.0f);
         std::fill(Hc.begin(), Hc.end(), 0.0f);
         int n_left = 0;
         for (int b = 0; b < AX_BINS - 1; b++) {
-          const float* SALOT_RESTRICT slot = fbuf + (size_t)b * STRIDE;
+          const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
           n_left += (int)slot[2 * K];
           for (int c = 0; c < K; c++) {
             Gc[c] += slot[c];
@@ -522,10 +514,7 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
     return best_gain;
   };
 
-  // ── Phase 2 (expensive, only when the node is actually popped to split):
-  // oblique tournament. Candidates are evaluated EXACTLY on the full node
-  // sample (a subsampled estimate rescaled by mass inflates gain variance
-  // and wins by noise). Upgrades the stored candidate when better.
+  // ── Phase 2: Oblique scan ────────────────────────────────────────────────
   auto eval_oblique = [&](int t) -> float {
     const auto& samp = node_samp[t];
     int ns = (int)samp.size();
@@ -540,90 +529,317 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       total_base -= 0.5f * Gt[c] * Gt[c] / (Ht[c] + reg_lambda + EPS);
     std::vector<float> Gc(K), Hc(K);
 
-    std::vector<int> wls_samp = stride_cap(samp, WLS_CAP);
-
-    // Class targets for the CD solves. The Newton WLS objective is
-    // per-class; with K ≥ 3 the top-2 gradient-mass classes each get their
-    // own screening + CD solve (one-vs-rest), so directions serving the
-    // runner-up class structure are not crowded out by the dominant class.
-    // K = 2 is symmetric (G_0 = −G_1): one solve covers both.
-    std::vector<std::pair<float, int>> cmass(K);
-    for (int c = 0; c < K; c++) cmass[c] = {0.0f, c};
-    for (int i : wls_samp)
-      for (int c = 0; c < K; c++)
-        cmass[c].first += std::abs(G[(size_t)i * K + c]);
-    std::sort(cmass.begin(), cmass.end(),
-              [](const std::pair<float, int>& a,
-                 const std::pair<float, int>& b) {
-                if (a.first != b.first) return a.first > b.first;
-                return a.second < b.second;
-              });
-    const int n_cls = (K >= 3) ? 2 : 1;
-    // Screening and CD span ALL D dims: cat columns participate via their
-    // per-round rank coordinates (the CD panel standardizes each column, so
-    // the arbitrary 0..card-1 rank scale is harmless).
-    std::vector<std::vector<float>> dirs;
-    std::vector<float> fscore;
-    for (int cc = 0; cc < n_cls; cc++) {
-      int kc = cmass[cc].second;
-      sis_scores(wls_samp, SCREEN_N, Xt, D, D, G, H, K, kc, reg_lambda,
-                 fscore);
-      int b_sel = std::min(D_SUB_MAX, D);
-      std::vector<int> feat_sub(D);
-      std::iota(feat_sub.begin(), feat_sub.end(), 0);
-      if (b_sel < D) {
-        std::partial_sort(feat_sub.begin(), feat_sub.begin() + b_sel,
-                          feat_sub.end(),
-                          [&](int a, int c) { return fscore[a] > fscore[c]; });
-        feat_sub.resize(b_sel);
+    std::vector<int> samp_e = stride_cap(samp, EST_NE_MAX);
+    int ne = (int)samp_e.size();
+    bool exact_eval = (ne == ns);
+    std::vector<float> eGt(K, 0.0f), eHt(K, 0.0f);
+    if (exact_eval) {
+      eGt = Gt;
+      eHt = Ht;
+    } else {
+      for (int j : samp_e) {
+        for (int c = 0; c < K; c++) {
+          eGt[c] += G[(size_t)j * K + c];
+          eHt[c] += H[(size_t)j * K + c];
+        }
       }
-      std::vector<std::vector<float>> cdirs;
-      node_cd_candidates(wls_samp, feat_sub, D, Xt, G, H, K, kc, reg_lambda,
-                         cdirs);
-      for (auto& w : cdirs) dirs.push_back(std::move(w));
     }
-    // Persistent cached directions compete as free candidates. Selection is
-    // GAIN-based, not proxy-based: a dominant-class SIS-overlap filter
-    // systematically discards exactly the minority-region directions the
-    // cache exists to preserve. Pre-stage: every cached direction gets a
-    // very cheap gain estimate (512-stride sample, 16 bins, all classes);
-    // the top-2 join stage-1 as free candidates. Deterministic.
+    float e_base = 0.0f;
+    for (int c = 0; c < K; c++)
+      e_base -= 0.5f * eGt[c] * eGt[c] / (eHt[c] + reg_lambda + EPS);
+
+    int kdom = dominant_class(samp_e, G, K);
+    std::vector<float> cg_s(D, 0.0f), add_s(D, 0.0f);
+    for (int i = 0; i < ne; i++) {
+      int idx = samp_e[i];
+      const float* GF_RESTRICT xi = Xt + (size_t)idx * D;
+      float gi = G[(size_t)idx * K + kdom];
+      float hi = H[(size_t)idx * K + kdom];
+      for (int d = 0; d < D; d++) {
+        cg_s[d] += xi[d] * gi;
+        add_s[d] += hi * xi[d] * xi[d];
+      }
+    }
+    std::vector<float> fscore(D, 0.0f);
+    for (int d = 0; d < D; d++) {
+      fscore[d] = std::abs(cg_s[d]) / std::sqrt(add_s[d] + reg_lambda + EPS);
+    }
+
+    std::vector<std::vector<float>> dirs;
+    std::mt19937 rng(42 + t);
+
+    std::vector<float> prob(D);
+    for (int d = 0; d < D; d++) {
+      prob[d] = fscore[d] + 1e-6f;
+    }
+    std::discrete_distribution<int> feat_dist(prob.begin(), prob.end());
+    std::uniform_int_distribution<int> len_dist(2, std::min(6, D));
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    std::uniform_int_distribution<int> sign_dist(0, 1);
+
+    bool has_parent = (t > 0);
+    int par = has_parent ? (t - 1) / 2 : -1;
+    SparseVec parent_nz;
+    parent_nz.size = 0;
+    if (has_parent) {
+      collect_nonzero_stack(tree->split_weights.data() + (size_t)par * D, D,
+                            parent_nz);
+    }
+
+    int n_inherited = (int)std::round(32.0f * inherited_rp_ratio);
+    if (n_inherited < 0) n_inherited = 0;
+    if (n_inherited > 32) n_inherited = 32;
+    int n_global = 32 - n_inherited;
+
+    if (has_parent && parent_nz.size > 0) {
+      int depth_t = 0;
+      while (((1 << (depth_t + 1)) - 1) <= t) depth_t++;
+      float local_mutation_rate =
+          mutation_rate / std::sqrt(1.0f + (float)depth_t);
+      float local_mutation_strength =
+          mutation_strength / (1.0f + (float)depth_t);
+
+      for (int r = 0; r < n_inherited; r++) {
+        float strategy_draw = dist(rng);
+        bool do_strategy_a = false;
+        bool do_strategy_b = false;
+        bool do_strategy_c = false;
+
+        if (!ctx->dir_cache.empty()) {
+          if (strategy_draw < 0.375f) {
+            do_strategy_a = (parent_nz.size > 1);
+            if (!do_strategy_a) do_strategy_b = true;
+          } else if (strategy_draw < 0.75f) {
+            do_strategy_b = true;
+          } else {
+            do_strategy_c = true;
+          }
+        } else {
+          if (strategy_draw < 0.5f) {
+            do_strategy_a = (parent_nz.size > 1);
+            if (!do_strategy_a) do_strategy_b = true;
+          } else {
+            do_strategy_b = true;
+          }
+        }
+
+        std::vector<float> w_rand(D, 0.0f);
+
+        if (do_strategy_c) {
+          std::uniform_int_distribution<int> cache_dist(
+              0, (int)ctx->dir_cache.size() - 1);
+          const auto& cached_w = ctx->dir_cache[cache_dist(rng)];
+          float alpha = dist(rng) * 0.6f + 0.2f;
+          for (int d = 0; d < D; d++) {
+            float w_p = 0.0f;
+            for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
+              if (parent_nz.indices[i_nz] == d) {
+                w_p = parent_nz.values[i_nz];
+                break;
+              }
+            }
+            w_rand[d] = alpha * w_p + (1.0f - alpha) * cached_w[d];
+          }
+        } else {
+          for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
+            w_rand[parent_nz.indices[i_nz]] = parent_nz.values[i_nz];
+          }
+
+          if (do_strategy_a) {
+            std::uniform_int_distribution<int> parent_idx_dist(
+                0, parent_nz.size - 1);
+            int idx1 = parent_idx_dist(rng);
+            float s1 =
+                dist(rng) * 2.0f * local_mutation_rate - local_mutation_rate;
+            w_rand[parent_nz.indices[idx1]] *= (1.0f + s1);
+
+            if (parent_nz.size > 2 && dist(rng) < 0.5f) {
+              int idx2 = parent_idx_dist(rng);
+              while (idx2 == idx1) idx2 = parent_idx_dist(rng);
+              float s2 =
+                  dist(rng) * 2.0f * local_mutation_rate - local_mutation_rate;
+              w_rand[parent_nz.indices[idx2]] *= (1.0f + s2);
+            }
+          } else if (do_strategy_b) {
+            std::vector<int> candidate_feats;
+            std::vector<float> candidate_probs;
+            for (int d = 0; d < D; d++) {
+              bool in_parent = false;
+              for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
+                if (parent_nz.indices[i_nz] == d) {
+                  in_parent = true;
+                  break;
+                }
+              }
+              if (!in_parent) {
+                candidate_feats.push_back(d);
+                candidate_probs.push_back(prob[d]);
+              }
+            }
+
+            if (!candidate_feats.empty()) {
+              std::discrete_distribution<int> new_feat_dist(
+                  candidate_probs.begin(), candidate_probs.end());
+              int idx_feat = new_feat_dist(rng);
+              int f_new = candidate_feats[idx_feat];
+              float sign = (cg_s[f_new] >= 0.0f) ? -1.0f : 1.0f;
+              w_rand[f_new] = sign * local_mutation_strength;
+            } else if (parent_nz.size == 1) {
+              int f_new = (parent_nz.indices[0] + 1) % D;
+              w_rand[f_new] = 0.1f;
+            }
+          }
+        }
+
+        float norm = 0.0f;
+        for (int d = 0; d < D; d++) norm += w_rand[d] * w_rand[d];
+        norm = std::sqrt(norm);
+        if (norm > 1e-12f) {
+          for (int d = 0; d < D; d++) w_rand[d] /= norm;
+          dirs.push_back(std::move(w_rand));
+        } else {
+          std::vector<float> w_fallback(D, 0.0f);
+          w_fallback[parent_nz.indices[0]] = parent_nz.values[0];
+          dirs.push_back(std::move(w_fallback));
+        }
+      }
+
+      float s_param = std::max(2.0f, std::sqrt((float)D));
+      float prob_nonzero = 1.0f / s_param;
+      for (int r = 0; r < n_global; r++) {
+        std::vector<float> w_rand(D, 0.0f);
+        float norm = 0.0f;
+        for (int f = 0; f < D; f++) {
+          if (dist(rng) < prob_nonzero) {
+            float val = (sign_dist(rng) == 0) ? 1.0f : -1.0f;
+            w_rand[f] = val;
+            norm += val * val;
+          }
+        }
+        norm = std::sqrt(norm);
+        if (norm > 1e-12f) {
+          for (int f = 0; f < D; f++) w_rand[f] /= norm;
+          dirs.push_back(std::move(w_rand));
+        } else {
+          std::uniform_int_distribution<int> f_dist(0, D - 1);
+          int f = f_dist(rng);
+          w_rand[f] = 1.0f;
+          dirs.push_back(std::move(w_rand));
+        }
+      }
+    } else {
+      for (int r = 0; r < 24; r++) {
+        int L = len_dist(rng);
+        std::vector<int> selected;
+        selected.reserve(L);
+        for (int attempt = 0; attempt < 50 && (int)selected.size() < L;
+             attempt++) {
+          int f = feat_dist(rng);
+          if (std::find(selected.begin(), selected.end(), f) ==
+              selected.end()) {
+            selected.push_back(f);
+          }
+        }
+        if (selected.size() < 2) {
+          std::vector<int> ord(D);
+          std::iota(ord.begin(), ord.end(), 0);
+          std::sort(ord.begin(), ord.end(),
+                    [&](int a, int b) { return fscore[a] > fscore[b]; });
+          selected = {ord[0], ord[1]};
+        }
+
+        std::vector<float> w_rand(D, 0.0f);
+        float norm = 0.0f;
+        for (int f : selected) {
+          float val = (cg_s[f] >= 0.0f) ? -1.0f : 1.0f;
+          w_rand[f] = val;
+          norm += val * val;
+        }
+        norm = std::sqrt(norm);
+        if (norm > 1e-12f) {
+          for (int f : selected) w_rand[f] /= norm;
+          dirs.push_back(std::move(w_rand));
+        }
+      }
+
+      float s_param = std::max(2.0f, std::sqrt((float)D));
+      float prob_nonzero = 1.0f / s_param;
+      for (int r = 0; r < 8; r++) {
+        std::vector<float> w_rand(D, 0.0f);
+        float norm = 0.0f;
+        for (int f = 0; f < D; f++) {
+          if (dist(rng) < prob_nonzero) {
+            float val = (sign_dist(rng) == 0) ? 1.0f : -1.0f;
+            w_rand[f] = val;
+            norm += val * val;
+          }
+        }
+        norm = std::sqrt(norm);
+        if (norm > 1e-12f) {
+          for (int f = 0; f < D; f++) w_rand[f] /= norm;
+          dirs.push_back(std::move(w_rand));
+        } else {
+          std::uniform_int_distribution<int> f_dist(0, D - 1);
+          int f = f_dist(rng);
+          w_rand[f] = 1.0f;
+          dirs.push_back(std::move(w_rand));
+        }
+      }
+    }
+
     {
       int nc = (int)ctx->dir_cache.size();
       if (nc > 0) {
         std::vector<int> samp_p = stride_cap(samp, 512);
         int np = (int)samp_p.size();
         std::vector<float> pGt(K, 0.0f), pHt(K, 0.0f);
-        for (int j : samp_p)
+        for (int j : samp_p) {
           for (int c = 0; c < K; c++) {
             pGt[c] += G[(size_t)j * K + c];
             pHt[c] += H[(size_t)j * K + c];
           }
+        }
         float p_base = 0.0f;
         for (int c = 0; c < K; c++)
           p_base -= 0.5f * pGt[c] * pGt[c] / (pHt[c] + reg_lambda + EPS);
 
         constexpr int PRE_BINS = 16;
-        std::vector<float> pproj(np);
-        std::vector<float> pG((size_t)PRE_BINS * K), pH((size_t)PRE_BINS * K);
-        std::vector<int> pc(PRE_BINS);
-        std::vector<std::pair<int, float>> nz_p;
+        float pproj[512];
+        static constexpr int K_MAX = 32;
+        float pG[16 * K_MAX];
+        float pH[16 * K_MAX];
+        float* pG_ptr = pG;
+        float* pH_ptr = pH;
+        std::vector<float> heap_pG, heap_pH;
+        if (K > K_MAX) {
+          heap_pG.assign(16 * K, 0.0f);
+          heap_pH.assign(16 * K, 0.0f);
+          pG_ptr = heap_pG.data();
+          pH_ptr = heap_pH.data();
+        }
+        int pc[PRE_BINS];
+        SparseVec nz_p;
         std::vector<std::pair<float, int>> rank;
         rank.reserve(nc);
         for (int ci = 0; ci < nc; ci++) {
-          collect_nonzero(ctx->dir_cache[ci].data(), D, nz_p);
-          if (nz_p.size() <= 1) continue;
+          collect_nonzero_stack(ctx->dir_cache[ci].data(), D, nz_p);
+          if (nz_p.size <= 1) continue;
           float mn = 1e30f, mx = -1e30f;
           for (int si = 0; si < np; si++) {
-            float v = sparse_dot(nz_p, Xt + (size_t)samp_p[si] * D);
+            float v = sparse_dot_stack(nz_p, Xt + (size_t)samp_p[si] * D);
             pproj[si] = v;
             if (v < mn) mn = v;
             if (v > mx) mx = v;
           }
           if (mx - mn < 1e-12f) continue;
-          std::fill(pG.begin(), pG.end(), 0.0f);
-          std::fill(pH.begin(), pH.end(), 0.0f);
-          std::fill(pc.begin(), pc.end(), 0);
+          if (K > K_MAX) {
+            std::fill(heap_pG.begin(), heap_pG.end(), 0.0f);
+            std::fill(heap_pH.begin(), heap_pH.end(), 0.0f);
+          } else {
+            std::memset(pG, 0, 16 * K * sizeof(float));
+            std::memset(pH, 0, 16 * K * sizeof(float));
+          }
+          std::memset(pc, 0, sizeof(pc));
           float scale = (float)PRE_BINS / (mx - mn + EPS);
           for (int si = 0; si < np; si++) {
             int j = samp_p[si];
@@ -633,8 +849,8 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
             pc[b]++;
             size_t bo = (size_t)b * K;
             for (int c = 0; c < K; c++) {
-              pG[bo + c] += G[(size_t)j * K + c];
-              pH[bo + c] += H[(size_t)j * K + c];
+              pG_ptr[bo + c] += G[(size_t)j * K + c];
+              pH_ptr[bo + c] += H[(size_t)j * K + c];
             }
           }
           std::fill(Gc.begin(), Gc.end(), 0.0f);
@@ -645,8 +861,8 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
             n_left += pc[b];
             size_t bo = (size_t)b * K;
             for (int c = 0; c < K; c++) {
-              Gc[c] += pG[bo + c];
-              Hc[c] += pH[bo + c];
+              Gc[c] += pG_ptr[bo + c];
+              Hc[c] += pH_ptr[bo + c];
             }
             if (n_left < 5 || np - n_left < 5) continue;
             float gain = p_base;
@@ -667,65 +883,51 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
               return a.second < b.second;
             });
         for (int r = 0; r < n_take; r++) {
-          const auto& cw = ctx->dir_cache[rank[r].second];
-          std::vector<float> wfull(D, 0.0f);
-          std::copy(cw.begin(), cw.end(), wfull.begin());
-          dirs.push_back(std::move(wfull));
+          dirs.push_back(ctx->dir_cache[rank[r].second]);
         }
       }
     }
-    if (dirs.empty()) return cand_gain[t];
-
-    // Stage 1 — select the best oblique (candidate, threshold) on a capped
-    // subsample: selection AMONG oblique candidates shares one noise level,
-    // so it is internally fair and O(1) in ns.
-    std::vector<int> samp_e = stride_cap(samp, EST_NE_MAX);
-    int ne = (int)samp_e.size();
-    bool exact_eval = (ne == ns);
-    std::vector<float> eGt(K, 0.0f), eHt(K, 0.0f);
-    if (exact_eval) {
-      eGt = Gt;
-      eHt = Ht;
-    } else {
-      for (int j : samp_e)
-        for (int c = 0; c < K; c++) {
-          eGt[c] += G[(size_t)j * K + c];
-          eHt[c] += H[(size_t)j * K + c];
-        }
-    }
-    float e_base = 0.0f;
-    for (int c = 0; c < K; c++)
-      e_base -= 0.5f * eGt[c] * eGt[c] / (eHt[c] + reg_lambda + EPS);
 
     float ob_gain = 0.0f, ob_thr = 0.0f;
     int ob_idx = -1;
-    std::vector<float> ob_proj_e;
     const int n_dirs = (int)dirs.size();
-    // Candidates are independent: evaluate them in parallel and merge by
-    // (gain, lowest index) — the same winner the serial scan picks.
     std::vector<float> dir_gain(n_dirs, 0.0f), dir_thr(n_dirs, 0.0f);
-    std::vector<std::vector<float>> dir_proj(n_dirs);
+
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) if (n_dirs > 1)
 #endif
     for (int di = 0; di < n_dirs; di++) {
-      std::vector<std::pair<int, float>> nz_c;
-      collect_nonzero(dirs[di].data(), D, nz_c);
-      if (nz_c.size() <= 1) continue;  // axis scan covers 1-sparse
+      SparseVec sv;
+      collect_nonzero_stack(dirs[di].data(), D, sv);
+      if (sv.size <= 1) continue;
 
-      std::vector<float> proj_e(ne);
+      float proj_e[2048];
       float min_v = 1e30f, max_v = -1e30f;
       for (int si = 0; si < ne; si++) {
-        float proj = sparse_dot(nz_c, Xt + (size_t)samp_e[si] * D);
+        float proj = sparse_dot_stack(sv, Xt + (size_t)samp_e[si] * D);
         proj_e[si] = proj;
         if (proj < min_v) min_v = proj;
         if (proj > max_v) max_v = proj;
       }
       if (max_v - min_v < 1e-12f) continue;
 
-      std::vector<float> bin_G((size_t)HIST_BINS * K, 0.0f);
-      std::vector<float> bin_H((size_t)HIST_BINS * K, 0.0f);
-      std::vector<int> bin_cnt(HIST_BINS, 0);
+      static constexpr int K_MAX = 32;
+      float bin_G[64 * K_MAX];
+      float bin_H[64 * K_MAX];
+      float* bin_G_ptr = bin_G;
+      float* bin_H_ptr = bin_H;
+      std::vector<float> heap_G, heap_H;
+      if (K > K_MAX) {
+        heap_G.assign((size_t)HIST_BINS * K, 0.0f);
+        heap_H.assign((size_t)HIST_BINS * K, 0.0f);
+        bin_G_ptr = heap_G.data();
+        bin_H_ptr = heap_H.data();
+      } else {
+        std::memset(bin_G, 0, HIST_BINS * K * sizeof(float));
+        std::memset(bin_H, 0, HIST_BINS * K * sizeof(float));
+      }
+      int bin_cnt[HIST_BINS] = {0};
+
       float scale = (float)HIST_BINS / (max_v - min_v + EPS);
       for (int si = 0; si < ne; si++) {
         int j = samp_e[si];
@@ -735,8 +937,8 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
         bin_cnt[b]++;
         size_t bo = (size_t)b * K;
         for (int c = 0; c < K; c++) {
-          bin_G[bo + c] += G[(size_t)j * K + c];
-          bin_H[bo + c] += H[(size_t)j * K + c];
+          bin_G_ptr[bo + c] += G[(size_t)j * K + c];
+          bin_H_ptr[bo + c] += H[(size_t)j * K + c];
         }
       }
 
@@ -747,8 +949,8 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
         n_left += bin_cnt[b];
         size_t bo = (size_t)b * K;
         for (int c = 0; c < K; c++) {
-          lGc[c] += bin_G[bo + c];
-          lHc[c] += bin_H[bo + c];
+          lGc[c] += bin_G_ptr[bo + c];
+          lHc[c] += bin_H_ptr[bo + c];
         }
         int n_right = ne - n_left;
         if (n_left < 10 || n_right < 10) continue;
@@ -772,9 +974,9 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       if (d_gain > 0.0f) {
         dir_gain[di] = d_gain;
         dir_thr[di] = d_thr;
-        dir_proj[di] = std::move(proj_e);
       }
     }
+
     for (int di = 0; di < n_dirs; di++) {
       if (dir_gain[di] > ob_gain) {
         ob_gain = dir_gain[di];
@@ -783,41 +985,36 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       }
     }
     if (ob_idx < 0) return cand_gain[t];
-    ob_proj_e = std::move(dir_proj[ob_idx]);
-    std::vector<std::pair<int, float>> nz_c;
+    SparseVec sv;
 
-    // Stage 2 — EXACT re-evaluation of the single winner on the full node
-    // sample (one projection pass; it doubles as the routing projection, so
-    // its marginal cost over routing is ~zero). The axis-vs-oblique decision
-    // is exact-vs-exact: no subsample-noise wins.
-    collect_nonzero(dirs[ob_idx].data(), D, nz_c);
-    std::vector<float> proj_full;
+    collect_nonzero_stack(dirs[ob_idx].data(), D, sv);
+    std::vector<float> proj_full(ns);
     float exact_gain;
     if (exact_eval) {
-      proj_full = std::move(ob_proj_e);
+      for (int si = 0; si < ns; si++) {
+        proj_full[si] = sparse_dot_stack(sv, Xt + (size_t)samp[si] * D);
+      }
       exact_gain = ob_gain;
     } else {
-      proj_full.resize(ns);
       std::vector<float> GL(K, 0.0f), HL(K, 0.0f);
       int n_left = 0;
 #ifdef _OPENMP
       if (ns >= 8192) {
-        // tid-ordered merge keeps the float sums deterministic.
-        int nth = omp_get_max_threads();
-        std::vector<std::vector<float>> tGL(nth), tHL(nth);
-        std::vector<int> tnl(nth, 0);
-#pragma omp parallel num_threads(nth)
+        int nthreads = omp_get_max_threads();
+        std::vector<std::vector<float>> tGL(nthreads), tHL(nthreads);
+        std::vector<int> tnl(nthreads, 0);
+#pragma omp parallel num_threads(nthreads)
         {
           int tid = omp_get_thread_num();
           tGL[tid].assign(K, 0.0f);
           tHL[tid].assign(K, 0.0f);
-          float* SALOT_RESTRICT lGL = tGL[tid].data();
-          float* SALOT_RESTRICT lHL = tHL[tid].data();
+          float* GF_RESTRICT lGL = tGL[tid].data();
+          float* GF_RESTRICT lHL = tHL[tid].data();
           int lnl = 0;
 #pragma omp for schedule(static) nowait
           for (int si = 0; si < ns; si++) {
             int j = samp[si];
-            float proj = sparse_dot(nz_c, Xt + (size_t)j * D);
+            float proj = sparse_dot_stack(sv, Xt + (size_t)j * D);
             proj_full[si] = proj;
             if (proj < ob_thr) {
               lnl++;
@@ -829,7 +1026,7 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
           }
           tnl[tid] = lnl;
         }
-        for (int t2 = 0; t2 < nth; t2++) {
+        for (int t2 = 0; t2 < nthreads; t2++) {
           n_left += tnl[t2];
           for (int c = 0; c < K; c++) {
             GL[c] += tGL[t2][c];
@@ -841,7 +1038,7 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       {
         for (int si = 0; si < ns; si++) {
           int j = samp[si];
-          float proj = sparse_dot(nz_c, Xt + (size_t)j * D);
+          float proj = sparse_dot_stack(sv, Xt + (size_t)j * D);
           proj_full[si] = proj;
           if (proj < ob_thr) {
             n_left++;
@@ -873,14 +1070,12 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       cand_thr[t] = ob_thr;
       cand_w[t] = dirs[ob_idx];
       cand_axis[t] = -1;
-      cand_proj[t] = std::move(proj_full);  // reuse for routing (samp order)
+      cand_proj[t] = std::move(proj_full);
     }
     return cand_gain[t];
   };
 
-  // ── Best-first growth: split the highest-gain leaf first. ─────────────────
-  // Leaf budget = 2^user_depth (same capacity as a full level-wise tree),
-  // allocated where the gains are; internal depth cap = 2×user_depth.
+  // ── Best-first growth loop ───────────────────────────────────────────────
   node_samp[0].assign(sub, sub + Ns);
   {
     node_hist[0].assign(HSZ, 0.0f);
@@ -895,31 +1090,22 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
     int t_node = frontier.top().second;
     frontier.pop();
 
-    // Lazily materialize this node's histogram: build the SMALLER of
-    // {node, sibling} fresh, derive the larger from the parent buffer,
-    // then free the parent. Histogram work is thus paid only along the
-    // lineage of nodes that actually split.
     if (node_hist[t_node].empty()) {
-      int par = (t_node - 1) / 2;
+      int par_idx = (t_node - 1) / 2;
       int sib = (t_node % 2 == 1) ? t_node + 1 : t_node - 1;
       bool self_small = node_samp[t_node].size() <= node_samp[sib].size();
       int t_small = self_small ? t_node : sib;
       int t_large = self_small ? sib : t_node;
 
       node_hist[t_small].assign(HSZ, 0.0f);
-      float* SALOT_RESTRICT hs = node_hist[t_small].data();
-      accumulate_hist(node_samp[t_small].data(),
-                      (int)node_samp[t_small].size(), hs, nullptr);
-      float* SALOT_RESTRICT hp = node_hist[par].data();
+      float* GF_RESTRICT hs = node_hist[t_small].data();
+      accumulate_hist(node_samp[t_small].data(), (int)node_samp[t_small].size(),
+                      hs, nullptr);
+      float* GF_RESTRICT hp = node_hist[par_idx].data();
       for (size_t i = 0; i < HSZ; i++) hp[i] -= hs[i];
-      node_hist[t_large] = std::move(node_hist[par]);
+      node_hist[t_large] = std::move(node_hist[par_idx]);
     }
 
-    // Lazy A*: node_P is an ADMISSIBLE upper bound on the node's split
-    // gain, so popping by bound, evaluating exactly once, and re-queueing
-    // with the exact gain when it no longer tops the frontier reproduces
-    // EXACT best-first order — with at most one evaluation per node
-    // (never more work than eager evaluation, usually much less).
     if (!oblique_done[t_node]) {
       float ag = eval_axis(t_node);
       float g2 = eval_oblique(t_node);
@@ -940,7 +1126,6 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
     int depth_t = 0;
     while (((1 << (depth_t + 1)) - 1) <= t_node) depth_t++;
 
-    // Apply the stored split; persist winning oblique directions.
     if (cand_axis[t_node] < 0) ctx->cache_direction(cand_w[t_node]);
     tree->is_leaf[t_node] = 0;
     tree->split_threshold[t_node] = cand_thr[t_node];
@@ -949,7 +1134,6 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
               tree->split_weights.data() + (size_t)t_node * D);
     splits_left--;
 
-    // Partition: codes for axis splits, cached projections for oblique.
     int ax = cand_axis[t_node];
     int bcode = cand_bcode[t_node];
     float thr = cand_thr[t_node];
@@ -960,23 +1144,19 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
     int ns = (int)samp.size();
 #ifdef _OPENMP
     if (ns >= 8192) {
-      // Parallel partition. Static scheduling assigns each thread one
-      // contiguous index range in tid order, so concatenating the
-      // per-thread outputs in tid order reproduces the serial sample order
-      // exactly.
-      int nth = omp_get_max_threads();
-      std::vector<std::vector<int>> tL(nth), tR(nth);
-      std::vector<std::vector<float>> tGL(nth), tHL(nth);
-      std::vector<double> tPL(nth, 0.0);
-#pragma omp parallel num_threads(nth)
+      int nthreads = omp_get_max_threads();
+      std::vector<std::vector<int>> tL(nthreads), tR(nthreads);
+      std::vector<std::vector<float>> tGL(nthreads), tHL(nthreads);
+      std::vector<double> tPL(nthreads, 0.0);
+#pragma omp parallel num_threads(nthreads)
       {
         int tid = omp_get_thread_num();
         auto& Lv = tL[tid];
         auto& Rv = tR[tid];
         tGL[tid].assign(K, 0.0f);
         tHL[tid].assign(K, 0.0f);
-        float* SALOT_RESTRICT gl = tGL[tid].data();
-        float* SALOT_RESTRICT hl = tHL[tid].data();
+        float* GF_RESTRICT gl = tGL[tid].data();
+        float* GF_RESTRICT hl = tHL[tid].data();
         double pl = 0.0;
 #pragma omp for schedule(static) nowait
         for (int si = 0; si < ns; si++) {
@@ -986,8 +1166,8 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
                              : (proj[si] < thr);
           if (go_left) {
             Lv.push_back(j);
-            const float* SALOT_RESTRICT gj = G + (size_t)j * K;
-            const float* SALOT_RESTRICT hj = H + (size_t)j * K;
+            const float* GF_RESTRICT gj = G + (size_t)j * K;
+            const float* GF_RESTRICT hj = H + (size_t)j * K;
             for (int c = 0; c < K; c++) {
               gl[c] += gj[c];
               hl[c] += hj[c];
@@ -1001,14 +1181,14 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
         tPL[tid] = pl;
       }
       size_t nl = 0, nr = 0;
-      for (int t = 0; t < nth; t++) {
+      for (int t = 0; t < nthreads; t++) {
         nl += tL[t].size();
         nr += tR[t].size();
       }
       left_sub.reserve(nl);
       right_sub.reserve(nr);
       double PLd = 0.0;
-      for (int t = 0; t < nth; t++) {
+      for (int t = 0; t < nthreads; t++) {
         left_sub.insert(left_sub.end(), tL[t].begin(), tL[t].end());
         right_sub.insert(right_sub.end(), tR[t].begin(), tR[t].end());
         for (int c = 0; c < K; c++) {
@@ -1027,8 +1207,8 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
                                  : (proj[si] < thr);
         if (go_left) {
           left_sub.push_back(j);
-          const float* SALOT_RESTRICT gj = G + (size_t)j * K;
-          const float* SALOT_RESTRICT hj = H + (size_t)j * K;
+          const float* GF_RESTRICT gj = G + (size_t)j * K;
+          const float* GF_RESTRICT hj = H + (size_t)j * K;
           for (int c = 0; c < K; c++) {
             GL[c] += gj[c];
             HL[c] += hj[c];
@@ -1052,11 +1232,6 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
     cand_proj[t_node].clear();
     cand_proj[t_node].shrink_to_fit();
 
-    // Children enter the frontier with a FREE priority — their loss
-    // potential 0.5·Σ G_c²/(H_c+λ) computed from the totals accumulated
-    // during partitioning. No histogram is built here: histograms are
-    // built lazily only when a node is actually popped to split, so the
-    // ~half of children that end as leaves cost nothing.
     node_samp[tl] = std::move(left_sub);
     node_samp[tr_node] = std::move(right_sub);
     bool can_deepen = (depth_t + 1 < internal_depth) && (splits_left > 0);
@@ -1064,11 +1239,6 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       for (int child : {tl, tr_node}) {
         int cns = (int)node_samp[child].size();
         if (cns < 20) continue;
-        // Priority = Σ_i Σ_c g²/(h+λ): the gain of giving every sample its
-        // own leaf — a true UPPER BOUND on any split sequence below the
-        // node (A*-style optimistic best-first). Crucially it does NOT
-        // vanish when gradients cancel (ΣG≈0 across an oblique boundary),
-        // which is exactly where the best splits live.
         if (node_P[child] > 0.0f) frontier.push({node_P[child], child});
       }
     } else {
@@ -1081,26 +1251,27 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
     node_hist[t].shrink_to_fit();
   }
 
-  // ── Leaves from stored totals: path smoothing scaled by lambda ────────────
+  // ── Leaves smoothing ─────────────────────────────────────────────────────
   {
     std::vector<float> sm((size_t)max_nodes * K, 0.0f);
     std::vector<char> hasv(max_nodes, 0);
     for (int t = 0; t < max_nodes; t++) {
       if (!node_has_tot[t] && node_samp[t].empty()) continue;
-      if (!node_has_tot[t]) {  // node skipped before totals were derived
-        for (int j : node_samp[t])
+      if (!node_has_tot[t]) {
+        for (int j : node_samp[t]) {
           for (int c = 0; c < K; c++) {
             node_G[(size_t)t * K + c] += G[(size_t)j * K + c];
             node_H[(size_t)t * K + c] += H[(size_t)j * K + c];
           }
+        }
       }
-      int par = (t - 1) / 2;
-      bool use_parent = (t > 0) && hasv[par];
+      int par_idx = (t - 1) / 2;
+      bool use_parent = (t > 0) && hasv[par_idx];
       for (int c = 0; c < K; c++) {
         float Gs = node_G[(size_t)t * K + c], Hs = node_H[(size_t)t * K + c];
         float raw = -Gs / (Hs + reg_lambda + EPS);
         float v = use_parent
-                      ? (Hs * raw + reg_lambda * sm[(size_t)par * K + c]) /
+                      ? (Hs * raw + reg_lambda * sm[(size_t)par_idx * K + c]) /
                             (Hs + reg_lambda + EPS)
                       : raw;
         sm[(size_t)t * K + c] = v;
@@ -1112,8 +1283,6 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
 
   if (out_pred) {
     std::memset(out_pred, 0, (size_t)N * K * sizeof(float));
-    // Build-side rows already know their leaf (node_samp partition) — only
-    // rows outside the training subsample need routing.
     std::vector<uint8_t> in_sub(N, 0);
     for (int si = 0; si < Ns; si++) in_sub[sub[si]] = 1;
     for (int t = 0; t < max_nodes; t++) {
@@ -1125,22 +1294,22 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
       }
     }
     if (Ns < N) {
-      std::vector<std::vector<std::pair<int, float>>> node_nz(max_nodes);
+      std::vector<SparseVec> node_nz(max_nodes);
       for (int t = 0; t < max_nodes; t++) {
         if (tree->is_leaf[t]) continue;
-        collect_nonzero(tree->split_weights.data() + (size_t)t * D, D,
-                        node_nz[t]);
+        collect_nonzero_stack(tree->split_weights.data() + (size_t)t * D, D,
+                              node_nz[t]);
       }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
       for (int i = 0; i < N; i++) {
         if (in_sub[i]) continue;
-        const float* SALOT_RESTRICT xi = Xt + (size_t)i * D;
+        const float* GF_RESTRICT xi = Xt + (size_t)i * D;
         int t = 0;
         for (int dep = 0; dep < tree->max_depth; dep++) {
           if (tree->is_leaf[t]) break;
-          float proj = sparse_dot(node_nz[t], xi);
+          float proj = sparse_dot_stack(node_nz[t], xi);
           t = (proj < tree->split_threshold[t]) ? (2 * t + 1) : (2 * t + 2);
         }
         const float* lv = tree->leaf_values.data() + (size_t)t * K;
@@ -1152,32 +1321,29 @@ SALOT_API void* salot_build_v8(void* ctx_handle, const float* X, const float* G,
   return static_cast<void*>(tree);
 }
 
-// One-shot compatibility wrapper (signature unchanged; seed is unused — v9
-// is deterministic by construction).
-SALOT_API void* salot_build_v7(const float* X, int N, int D, int D_num,
+// One-shot compatibility wrapper
+GF_API void* gf_build_oneshot(const float* X, int N, int D, int D_num,
                                const float* G, const float* H, int K,
                                const int* sub, int Ns, int max_depth,
                                float reg_lambda, unsigned int seed,
                                float* out_pred) {
   (void)seed;
-  void* ctx = salot_ctx_create(X, N, D, D_num, sub, Ns);
-  void* tree =
-      salot_build_v8(ctx, X, G, H, K, sub, Ns, max_depth, reg_lambda, out_pred);
-  salot_ctx_free(ctx);
+  void* ctx = gf_ctx_create(X, N, D, D_num, sub, Ns);
+  void* tree = gf_build(ctx, X, G, H, K, sub, Ns, max_depth, reg_lambda,
+                              1.0f, 0.1f, 0.5f, out_pred);
+  gf_ctx_free(ctx);
   return tree;
 }
 
-// Predict on RAW X: NaN and categorical values are re-encoded into the
-// tree's transformed space (numeric NaN → stored μ_f; cat value → stored
-// per-tree rank; NaN/unseen cat → stored NaN-category rank), then routed.
-SALOT_API void salot_predict(void* tree_handle, const float* X, int N, int K,
+// Predict on RAW X
+GF_API void gf_predict(void* tree_handle, const float* X, int N, int K,
                              float* out_pred) {
   const BFSTree* tree = static_cast<const BFSTree*>(tree_handle);
   std::memset(out_pred, 0, (size_t)N * K * sizeof(float));
   if (!tree) return;
   const int D = tree->D;
-  if ((int)tree->na_means.size() != D) {  // legacy tree: route raw
-    _salot_route(tree, X, N, out_pred);
+  if ((int)tree->na_means.size() != D) {
+    _gf_route(tree, X, N, out_pred);
     return;
   }
   const int D_num = tree->D_num;
@@ -1186,8 +1352,8 @@ SALOT_API void salot_predict(void* tree_handle, const float* X, int N, int K,
 #pragma omp parallel for schedule(static)
 #endif
   for (int i = 0; i < N; i++) {
-    const float* SALOT_RESTRICT xi = X + (size_t)i * D;
-    float* SALOT_RESTRICT ti = Xt.data() + (size_t)i * D;
+    const float* GF_RESTRICT xi = X + (size_t)i * D;
+    float* GF_RESTRICT ti = Xt.data() + (size_t)i * D;
     for (int f = 0; f < D; f++) {
       float v = xi[f];
       if (f < D_num) {
@@ -1204,17 +1370,135 @@ SALOT_API void salot_predict(void* tree_handle, const float* X, int N, int K,
       }
     }
   }
-  _salot_route(tree, Xt.data(), N, out_pred);
+  _gf_route(tree, Xt.data(), N, out_pred);
 }
 
-SALOT_API void salot_tree_free(void* tree_handle) {
+// Compact routing node: the sparse heap layout (8191 slots for a 64-leaf
+// tree) costs ~3 cache misses per visited node; packing the ~127 live nodes
+// contiguously keeps the whole tree L1-resident during routing.
+struct GFCompactNode {
+  SparseVec nz;
+  float thr = 0.0f;
+  int32_t left = -1, right = -1;  // compact ids; -1 → leaf
+};
+
+// Ensemble predict on RAW X: out_pred must be pre-filled with F_init by the
+// caller; each tree's leaf values are accumulated scaled by lr.
+// The numeric NaN transform is shared across trees (na_means are identical
+// within one boosting run); only categorical columns are re-encoded per tree
+// (gradient-rank maps differ per round).
+GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
+                                const float* X, int N, int K, float lr,
+                                float* out_pred) {
+  std::vector<const BFSTree*> trees;
+  trees.reserve(n_trees > 0 ? n_trees : 0);
+  for (int t = 0; t < n_trees; t++) {
+    const BFSTree* tr = static_cast<const BFSTree*>(handles[t]);
+    if (tr) trees.push_back(tr);
+  }
+  if (trees.empty()) return;
+  const int D = trees[0]->D;
+  const int D_num = trees[0]->D_num;
+  const bool has_meta = (int)trees[0]->na_means.size() == D;
+  const int D_cat = has_meta ? (D - D_num) : 0;
+
+  std::vector<float> Xt((size_t)N * D);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int i = 0; i < N; i++) {
+    const float* GF_RESTRICT xi = X + (size_t)i * D;
+    float* GF_RESTRICT ti = Xt.data() + (size_t)i * D;
+    for (int f = 0; f < D; f++) {
+      float v = xi[f];
+      if (has_meta && f < D_num && std::isnan(v)) v = trees[0]->na_means[f];
+      ti[f] = v;
+    }
+  }
+
+  std::vector<GFCompactNode> nodes;
+  std::vector<float> leaf_vals;
+  std::vector<int> heap_of;  // compact id → heap id (BFS order)
+  for (const BFSTree* tr : trees) {
+    // ── compact the live subtree (BFS from root) ────────────────────────────
+    heap_of.clear();
+    heap_of.push_back(0);
+    for (size_t q = 0; q < heap_of.size(); q++) {
+      int h = heap_of[q];
+      if (!tr->is_leaf[h]) {
+        heap_of.push_back(2 * h + 1);
+        heap_of.push_back(2 * h + 2);
+      }
+    }
+    const int M = (int)heap_of.size();
+    nodes.assign(M, GFCompactNode{});
+    leaf_vals.assign((size_t)M * K, 0.0f);
+    {
+      // BFS order ⇒ children appear after parents; rebuild child links.
+      std::vector<std::pair<int, int>> stack;  // (heap id, compact id)
+      int next = 1;
+      for (int c = 0; c < M; c++) {
+        int h = heap_of[c];
+        if (tr->is_leaf[h]) {
+          const float* lv = tr->leaf_values.data() + (size_t)h * K;
+          std::copy(lv, lv + K, leaf_vals.begin() + (size_t)c * K);
+        } else {
+          collect_nonzero_stack(tr->split_weights.data() + (size_t)h * D, D,
+                                nodes[c].nz);
+          nodes[c].thr = tr->split_threshold[h];
+          nodes[c].left = next;
+          nodes[c].right = next + 1;
+          next += 2;
+        }
+      }
+    }
+
+    if (D_cat > 0) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (int i = 0; i < N; i++) {
+        const float* GF_RESTRICT xi = X + (size_t)i * D;
+        float* GF_RESTRICT ti = Xt.data() + (size_t)i * D;
+        for (int fc = 0; fc < D_cat; fc++) {
+          int f = D_num + fc;
+          float v = xi[f];
+          if (std::isnan(v) || fc >= (int)tr->cat_ranks.size()) {
+            ti[f] = tr->na_means[f];
+          } else {
+            const auto& m = tr->cat_ranks[fc];
+            auto it = m.find((int)std::lrintf(v));
+            ti[f] = (it != m.end()) ? it->second : tr->na_means[f];
+          }
+        }
+      }
+    }
+
+    const GFCompactNode* GF_RESTRICT nd = nodes.data();
+    const float* GF_RESTRICT lvals = leaf_vals.data();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < N; i++) {
+      const float* GF_RESTRICT ti = Xt.data() + (size_t)i * D;
+      int n = 0;
+      while (nd[n].left >= 0) {
+        float proj = sparse_dot_stack(nd[n].nz, ti);
+        n = (proj < nd[n].thr) ? nd[n].left : nd[n].right;
+      }
+      const float* lv = lvals + (size_t)n * K;
+      float* GF_RESTRICT oi = out_pred + (size_t)i * K;
+      for (int k = 0; k < K; k++) oi[k] += lr * lv[k];
+    }
+  }
+}
+
+GF_API void gf_tree_free(void* tree_handle) {
   delete static_cast<BFSTree*>(tree_handle);
 }
 
-// ─── tree meta (de)serialization: μ_f, cat rank maps, D_num ─────────────────
-// sizes[0] = D_num, sizes[1] = D_cat, sizes[2] = total cat-map entries,
-// sizes[3] = len(na_means) (0 for legacy trees).
-SALOT_API void salot_tree_meta_sizes(void* tree_handle, int* sizes) {
+// ─── tree meta (de)serialization ───────────────────────────────────────────
+GF_API void gf_tree_meta_sizes(void* tree_handle, int* sizes) {
   const BFSTree* tree = static_cast<const BFSTree*>(tree_handle);
   sizes[0] = tree->D_num;
   sizes[1] = (int)tree->cat_ranks.size();
@@ -1224,7 +1508,7 @@ SALOT_API void salot_tree_meta_sizes(void* tree_handle, int* sizes) {
   sizes[3] = (int)tree->na_means.size();
 }
 
-SALOT_API void salot_tree_export_meta(void* tree_handle, float* na_means,
+GF_API void gf_tree_export_meta(void* tree_handle, float* na_means,
                                       int* cat_sizes, int* cat_keys,
                                       float* cat_vals) {
   const BFSTree* tree = static_cast<const BFSTree*>(tree_handle);
@@ -1242,7 +1526,7 @@ SALOT_API void salot_tree_export_meta(void* tree_handle, float* na_means,
   }
 }
 
-SALOT_API void salot_tree_import_meta(void* tree_handle, int D_num,
+GF_API void gf_tree_import_meta(void* tree_handle, int D_num,
                                       const float* na_means, int na_len,
                                       const int* cat_sizes, int D_cat,
                                       const int* cat_keys,

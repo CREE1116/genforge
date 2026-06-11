@@ -1,353 +1,134 @@
-# HypForge — Algorithm Reference
+# GenForge: Algorithm and Theory
 
 ## Overview
 
-HypForge (Hypothesis Pool Forge) is a gradient-boosted decision tree framework that uses **oblique splits**: each tree node splits on a learned linear combination of features rather than a single axis. Split directions are drawn from an evolving pool of *hypotheses* managed by a UCB (Upper Confidence Bound) bandit.
+GenForge is a gradient-boosted oblique decision tree ensemble built on three principles:
 
-Core idea: instead of searching over individual features at every split, HypForge maintains a shared pool of projection directions that are continuously refined through crossover breeding and fitness pressure. Better directions survive; redundant or weak directions are pruned; new directions are proposed by blending the best existing directions.
-
----
-
-## Hypothesis Types
-
-A **Hypothesis** `h` defines one oblique split direction via a sparse unit-norm weight vector `w ∈ ℝᴰ`:
-
-| Type | ID | Projection | Notes |
-|------|----|-----------|-------|
-| `linear` | 0 | `X @ w` | Standard oblique split |
-| `leaky_relu` | 1 | `max(X@w, 0.01·X@w)` | Asymmetric; emphasizes positive projections |
-| `product` | 2 | `h₁(X) · h₂(X)` | Composite of two existing hypotheses |
-
-Ablation result: using both `linear` and `leaky_relu` (op_mode="all") outperforms either type alone. `product` hypotheses are supported but rarely survive diversity pruning against the two primary types.
-
-Each hypothesis carries:
-- **UCB statistics**: `n_obs`, `mu_fitness`, `M2_fitness` (Welford online mean/variance)
-- **Usage stats**: `use_count`, `rounds_since_last_use`
-- **Projection cache**: `full_cache[N]` (training only; cleared before save), `thresholds[9]`
-- **Genealogy & Lineage**:
-  - `parent1`, `parent2`: global history IDs of parent hypotheses (crossover or component components, -1 if base/gradient)
-  - `birth_round`: boosting round index at which this hypothesis was born
-  - `family_id`: unique lineage identifier (inherited from fitter parent during crossover/product)
-  - `family_fitness`: average fitness of all descendant hypotheses
-  - `breeding_value`: average fitness of all direct child hypotheses
-
-Sparse weights: at most `k = max(2, floor(√D_num))` non-zero entries, ℓ2-normalised.
+1. **GG-SRP** (Gradient-Guided Sparse Random Projection) — oblique directions derived from gradient/Hessian statistics rather than expensive numerical optimization.
+2. **Hereditary direction inheritance** — child nodes inherit and mutate their parent's split direction, exploiting the fact that parent-filtered subsets are already partially separated.
+3. **Parent-cache crossover with depth-decayed mutation** — global high-performing directions (stored in a ring buffer) are blended with local parent directions; mutation strength decays with depth to shift from exploration to exploitation.
 
 ---
 
-## Pool Architecture
+## Boosting Framework
 
-The **HypForgePool** is initialised with `D` axis-aligned base hypotheses (one per feature), marked `is_base=True` and immortal. During training, the pool grows by crossover breeding and shrinks via diversity dedup, elitism, MAP-Elites type quota, and survival pressure.
+GenForge uses Newton-Raphson gradient boosting. Given ensemble prediction $F^{(m)}$, the $(m+1)$-th tree minimizes:
 
-### Confirmed Defaults (ablation-validated)
+$$\sum_i \left[ g_i f(x_i) + \tfrac{1}{2} h_i f(x_i)^2 \right] + \Omega(f), \quad \Omega(f) = \lambda \|w\|^2$$
 
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| `pool_size` | 400 | Larger candidate buffer → better diversity selection |
-| `map_elites_slots` | 100 | Enforces 50/50 linear/lrelu balance (with pool_size=400) |
-| `elitism_k` | 20 | Top-20 immune to similarity eviction |
-| `alps_mode` | True | Young hypotheses (n_obs < 5) skip eviction |
-| `crossover_top_k` | 3 | Top-3 pairs breed; beyond 3 dilutes quality |
-| `subsample` | 0.8 | Row subsampling per tree; regularisation benefit |
-| `max_depth` | 4 | Sweet spot; depth 5+ overfits |
-| `family_max_size` | 30 | Lineage-based MAP-Elites quota; prevents single-family dominance |
-| `meta_evolution` | True | Self-adaptive online UCB bandit selection among 4 candidate policies |
-| `family_lambda` | 0.1 | Weight of family fitness bonus in final UCB score |
-| `breeding_beta` | 0.3 | Weight of breeding value in parent selection score |
-
-Parameters hardcoded after ablation (no user exposure needed):
-
-| Parameter | Fixed Value | Why |
-|-----------|-------------|-----|
-| `mutation_mode` | none | Gradient/random mutation consistently harmful |
-| `feedback_mode` | scan_only | Split-gain re-observation adds overhead without benefit |
-| `fitness_norm_mode` | none | UCB exploration bonus already handles scale variation |
-| `recency_bonus_rounds` | 0 | Protects stale hypotheses; hurts diversity |
-| `use_rate_bonus` | 0.0 | Confirmed harmful across all lambda values |
-| `novelty_lambda` | 0.0 | Novelty re-scoring post-dedup is harmful |
-| `evolve_mode` | crossover | Standard and novelty modes both underperform |
+where $g_i, h_i$ are first- and second-order gradients of the loss. For $K$-class problems, the model maintains $K$ output heads with softmax + cross-entropy.
 
 ---
 
-## UCB Scoring
+## Stage 1: GG-SRP — Gradient-Guided Sparse Random Projection
 
-After every evolve round, each hypothesis is scored:
+**Why:** Per-node numerical Coordinate Descent (Gauss-Seidel with Gram matrix + WLS panels) is computationally prohibitive for deep forests. GG-SRP replaces it with a gradient-informed probabilistic direction that is $O(D)$ to compute.
 
-```
-score = ucb_score + family_lambda × family_fitness
-```
-where `ucb_score` is computed as:
-```
-ucb_score = μ_fitness + (σ_fitness + 0.5) / √n_obs − η · complexity
-```
+**How:**
 
-- `μ_fitness` — Welford online mean of observed split-gain values
-- `σ_fitness` — Welford online standard deviation (zero until n_obs ≥ 2)
-- `0.5` — novelty constant that decays as 1/√n_obs; gives new hypotheses an initial boost
-- `η = 0.002` — complexity penalty
-- `complexity` — number of non-zero entries in `w`
-- `family_fitness` — average fitness of all descendant hypotheses, which rewards propagating high-quality genetic lines
+1. Compute SIS feature importance scores on the node subsample:
+$$s_f = \frac{|\sum_i x_{if} g_i|}{\sqrt{\sum_i h_i x_{if}^2 + \lambda}}$$
 
-The pool is sorted descending by score before diversity pruning and crossover selection.
+2. Sample a random subspace $\mathcal{F}$ of size $b$ with probability $\propto s_f$ (higher gradient correlation = more likely to be included).
+
+3. For each selected feature $f \in \mathcal{F}$, set weight sign to match the steepest descent direction:
+$$\tilde{w}_f = -\operatorname{sign}\!\left(\sum_i x_{if} g_i\right) \cdot |r_f|, \quad r_f \sim \mathcal{N}(0,1)$$
+
+4. Normalize $\tilde{w}$ to unit norm.
+
+This produces a random oblique direction that is aligned with the gradient on the dominant informative subspace, without solving any linear system.
 
 ---
 
-## Training Loop
+## Stage 2: Hereditary Direction Inheritance
 
-### Initialisation
+**Why:** Samples reaching a child node have already been filtered by the parent split. The parent's weight vector $w_\text{parent}$ is therefore a meaningful warm start for the child's direction — the local geometry is already partially aligned.
 
-```
-pool  ← D axis-aligned base hypotheses (immortal)
-F     ← log-prior scores (balanced class log-probabilities), shape [N, K]
-```
+Two mutation strategies:
 
-### Per-Round (m = 1 … n_estimators)
+**Strategy A — Axis-Maintaining Mutation:**  
+Inherit parent weights and add calibrated noise:
 
-**1. Gradients (softmax cross-entropy)**
+$$w_\text{A} = w_\text{parent} + \text{rate} \cdot \epsilon, \quad \epsilon_f \sim \mathcal{U}(-1, 1)$$
 
-```
-P = softmax(F)
-G = sample_weight ⊙ (P − one_hot(y))    # [N, K]
-H = sample_weight ⊙ P ⊙ (1 − P)        # [N, K]
-```
+This tilts the inherited boundary while preserving its orientation.
 
-**2. Evolve pool** (every `evolve_every` rounds, on a random subsample ≤ 10,000 rows)
+**Strategy B — New-Axis Borrowing:**  
+Borrow one new feature $f^*$ that has high gradient correlation at the current node and extend the parent's sparse direction:
 
-See [Pool Evolution](#pool-evolution) below.
+$$w_\text{B} = w_\text{parent} \;\oplus\; \{\,f^* \mapsto \pm\,\text{strength}\,\}$$
 
-**3. Build oblique tree (C++)**
+This expands the split from the parent subspace into a new dimension without discarding the inherited structure.
 
-```
-Z          = pool.eval(X)          # [P, N] — all hypothesis projections
-thresholds = pool.thresholds       # [9, P] — precomputed quantile thresholds
-
-tree.bfs_build(Z, thresholds, G[sub], H[sub], max_depth, reg_lambda)
-```
-
-Each node selects the (hypothesis, threshold) pair maximising XGBoost-style gain:
-
-```
-gain = 0.5 × (G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ))
-```
-
-**4. Update**
-
-```
-F += learning_rate × tree.predict(Z)
-pool.increment_use_counts(tree.split_indices)
-```
-
-**5. Validation & early stopping**
-
-If `eval_set` provided: compute val loss, track `best_val_loss`. On improvement, snapshot `(best_trees, best_pool_snaps)`. Stop if `no_improv ≥ early_stopping_rounds`, restore best snapshot.
+**Ratio control:** `inherited_rp_ratio` sets the fraction of direction candidates drawn from Strategies A/B vs. fresh GG-SRP candidates (default 1.0 = all inherited).
 
 ---
 
-## Pool Evolution
+## Stage 3: Parent-Cache Crossover and Depth-Decayed Mutation
 
-`pool.evolve()` runs on a random subsample of rows each round.
+**Strategy C — Global-Local Crossover:**  
+The ring buffer `dir_cache` stores up to 32 high-performing directions from previous boosting rounds. Each round, a cache direction $w_\text{cache}$ is blended with the current parent direction:
 
-### Step 1 — Fitness scan & UCB update
+$$w_\text{C} = \alpha \, w_\text{parent} + (1 - \alpha) \, w_\text{cache}, \quad \alpha \sim \mathcal{U}(0, 1)$$
 
-For every hypothesis in the pool, compute split-gain fitness on the subsample (feedback_mode="scan_only"), then apply Welford update. Sync stats to the global history DAG, compute genealogy metrics (family fitness as average descendant fitness, breeding value as average direct child fitness) over all history elements, and set:
-```
-score = ucb_score + family_lambda × family_fitness
-```
+This prevents local convergence to a suboptimal split plane by injecting globally validated directions.
 
-Sort pool descending by score.
+**Depth-Decayed Mutation:**  
+Shallow nodes see a large feature space and benefit from wide exploration; deep nodes operate on small, nearly-pure subsets where large perturbations overfit. Mutation parameters decay with depth:
 
-### Step 2 — Crossover
+$$\text{rate}_d = \frac{\text{rate}_0}{\sqrt{1 + d}}, \qquad \text{strength}_d = \frac{\text{strength}_0}{1 + d}$$
 
-1. Sort active hypotheses by parent selection score: `parent_selection_score = fitness + breeding_beta * breeding_value`.
-2. Extract the top `crossover_top_k` parents.
-3. Form all possible parent pairs and compute crossover selection weights proportional to their historical combination survival rate ( Laplace smoothed):
-```
-weight(Ta, Tb) = (survivors[Ta][Tb] + 1) / (births[Ta][Tb] + 2)
-```
-4. Sample pairs via Roulette Wheel Selection based on these weights. For each sampled pair:
-```
-α         ~ Uniform(0.3, 0.7)
-w_child   = α × wᵢ + (1−α) × wⱼ
-w_child   = sparsify(w_child)
-type      = type of higher-scoring parent
-family_id = family_id of higher-scoring parent
-```
-
-### Step 3 — Candidate fitness scan & admission
-
-Compute split-gain for each candidate on the subsample. Admit those with `gain > 1e-5` and append them to the global history (assigning a new `family_id = global_id` if gradient-aligned). Cache their full projections: `full_cache[N] = apply_op(X @ w, type)`.
-
-### Step 4 — Re-score & sort
-
-Recompute scores (UCB score + family bonus) for all hypotheses, sort descending.
-
-### Step 5 — ALPS priority boost
-
-If `alps_mode=True`: temporarily add `+1e6` to the score of any hypothesis with `n_obs < 5` before sorting for eviction. Score boost is removed after re-sort.
-
-### Step 6 — Diversity dedup & Family Quota
-
-Greedy selection on sub-indexed projections. Keep the highest-scoring hypothesis. For each subsequent candidate, verify family quota and cosine similarity:
-1. **Family Quota**: skip if the number of kept hypotheses with the same `family_id` already reaches `family_max_size` (default 30).
-2. **Cosine Similarity**: compute absolute cosine similarity to already-kept ones. Skip if it exceeds `0.90` (same type) or `0.98` (different type).
-
-Stop when `|kept| = pool_size (400)`.
-
-### Step 7 — Elitism
-
-Top `elitism_k = 20` hypotheses by score are immune to similarity and family quota eviction.
-
-### Step 8 — MAP-Elites type quota
-
-After dedup, apply per-type slot limit: at most `map_elites_slots = 100` hypotheses of each type.
-
-### Step 9 — Survival filter & Transition Update
-
-Remove non-base hypotheses with `n_obs ≥ 3` and `mu_fitness + score ≤ 1e-6`. Update the transition matrix births and survivors based on crossover candidates that were admitted in this round and whether they survived eviction.
-
+where $d$ is the node depth, `rate_0 = mutation_rate`, `strength_0 = mutation_strength`.
 
 ---
 
-## Inference
+## Ablation: Evolution of the Direction-Finding Strategy
 
-```python
-F = tile(log_prior, (N, 1))
+Internal ablation on a held-out classification benchmark (100 000 samples, 50 features, 10 informative):
 
-for tree, pool_snap in zip(trees_, pool_snaps_):
-    Z  = pool_snap.eval(X)         # [P_snap, N]
-    F += learning_rate × tree.predict(Z)
+| Configuration | Balanced Acc | F1-Macro | Log Loss |
+|---------------|-------------|----------|----------|
+| GG-SRP only (no inheritance) | 0.96308 | — | 0.11101 |
+| + Parent inheritance 75% | 0.96415 | — | 0.10798 |
+| + Parent inheritance 100% | 0.96373 | — | 0.10382 |
+| + Crossover + Depth Decay (final) | **0.96336** | **0.95386** | **0.10016** |
 
-return softmax(F)
-```
-
-Each tree is paired with its own pool snapshot because C++ trees store *integer indices* into the pool as it existed at build time. Using the final pool for all trees would map indices to wrong hypotheses.
-
----
-
-## C++ Interface
-
-All pool operations run in `bfstree.cpp` (C++17, OpenMP). Python calls via ctypes (`_pool.py`).
-
-| Export | Purpose |
-|------|---------|
-| `pool_create(D, max_size, evolve_mode)` | Allocate pool with D base hypotheses |
-| `pool_set_options(…)` | Set pool configuration options (op_mode, crossover_top_k, elitism_k, alps_mode, map_elites_slots, family_max_size, enable_meta_evolution, family_lambda, breeding_beta) |
-| `pool_evolve(…)` | Full evolve pipeline |
-| `pool_eval(…)` | Batch Z = apply all hypotheses to X |
-| `pool_get_caches_and_thresholds(…)` | Return precomputed projections and thresholds for tree build |
-| `pool_update_use_counts(…)` | Increment use_count for selected split indices |
-| `pool_export(…)` | Serialize pool state to numpy arrays (including parent/family stats) |
-| `pool_import(…)` | Deserialize pool state from numpy arrays |
-| `pool_get_policy_stats(…)` | Retrieve Meta-Evolution bandit telemetry |
-| `pool_get_transition_matrix(…)` | Retrieve crossover operator combination success rates |
-| `pool_free(handle)` | Release C++ pool memory |
+Key findings:
+- Parent inheritance improves Log Loss consistently (better calibration from finer gradient alignment).
+- Depth-decayed mutation achieves the best Log Loss (0.10016), confirming that shallow exploration + deep exploitation improves generalization.
+- Full GG-SRP removal of CD retains competitive Balanced Accuracy while being significantly faster per node.
 
 ---
 
-## C++ Engine
+## Context-Cached Binning (v9)
 
-All pool evolution and tree build operations run in `_ext/bfstree.cpp` (C++17, OpenMP). The engine is compiled once at install time and loaded via `ctypes`.
+Computed once per dataset, reused across all rounds:
 
-### Key data structures
+**Numeric:** Column mean imputation ($x_{\text{NaN}} \leftarrow \mu_f$), 256-bin global histogram codes.
 
-| Buffer | Layout | Description |
-|--------|--------|-------------|
-| `full_cache[N]` | `float[N]` | Per-hypothesis projection of entire training set |
-| `sub_caches_flat[P × Ns_sim]` | `float[P*Ns_sim]` | Normalised projections for similarity dedup (flat, cache-friendly) |
-| `cum_G[Ns × K]`, `cum_H[Ns × K]` | `float[Ns*K]` (thread-local) | Prefix sums for gain evaluation |
+**Categorical:** Value dictionaries (raw int → dense ID). NaN is its own category.
 
-### Gain evaluation — prefix-sum optimisation
-
-The inner hot loop of `evolve()` evaluates split gain for each hypothesis at 9 quantile positions. The naïve implementation scanned all `Ns` samples independently for each of the 9 thresholds — O(9 × Ns × K) per hypothesis.
-
-**Optimised path** (v0.1.2+):
-1. Argsort samples by hypothesis value: O(Ns log Ns)
-2. Build cumulative G/H prefix sums in sorted order: O(Ns × K)
-3. Read off gain at each of 9 positions: O(9 × K)
-
-Net complexity: O(Ns log Ns + Ns × K + 9K) vs. O(9 × Ns × K).
-Typical speedup on the scan step: **~9×** (independent of K).
-
-All prefix buffers are `thread_local` — allocated once per OpenMP thread and reused across hypotheses; no per-hypothesis heap allocation inside the parallel region.
-
-### Other optimisations
-
-| Area | Before | After |
-|------|--------|-------|
-| Candidate `z_sub` storage | `vector<vector<float>>` (P separate allocs) | Eliminated — sort order replaces stored z |
-| Similarity dedup cache | `vector<vector<float>>` (P separate allocs) | `vector<float>` flat array of P×Ns_sim |
-| `is_kept` membership test | `O(|kept|)` `std::find` per candidate | `O(1)` `vector<bool>` lookup |
-
-### Compile flags
-
-```
-clang++ -O3 -march=native -shared -fPIC -std=c++17 \
-        -Xpreprocessor -fopenmp -I$OMP/include -L$OMP/lib -lomp \
-        bfstree.cpp -o libbfstree.dylib
-```
+Per round, only categorical **gradient-rank re-encoding** is recomputed:
+- Score each category: $s_c = \sum G_{ic} / (\sum H_{ic} + \lambda)$
+- Sort by score → replace with rank
+- NaN and unseen test categories fall back to the NaN rank
 
 ---
 
-## Performance
+## Best-First Tree Growth
 
-### Ablation (pool feature additions, 3 datasets, 3 seeds)
-
-| Configuration | Avg Accuracy |
-|--------------|-------------|
-| Baseline (standard mode, no pool features) | 0.9309 |
-| + crossover (top_k=3) | 0.9354 |
-| + elitism_k=20 | 0.9358 |
-| + alps_mode=True | 0.9361 |
-| + map_elites_slots=100 | 0.9364 |
-| + subsample=0.8 | 0.9376 |
-| + pool_size=400 | **0.9394** |
-
-### Cross-framework benchmark (9 datasets, n_estimators=100)
-
-Run `python scripts/benchmark.py` to reproduce. Datasets live in `data/benchmarks/`.
-
-| Dataset | HypForge | XGBoost | LightGBM | RandomForest |
-|---------|----------|---------|----------|--------------|
-| iris (4-D, 3-cls) | 0.9000 | 0.9667 | 0.9667 | 0.9000 |
-| wine (13-D, 3-cls) | 0.9167 | 0.9722 | **1.0000** | **1.0000** |
-| breast_cancer (30-D, 2-cls) | 0.9474 | 0.9474 | 0.9561 | 0.9561 |
-| moons (2-D, 2-cls) | **0.9113** | 0.9038 | 0.9075 | 0.9025 |
-| circles (2-D, 2-cls) | **0.8925** | 0.8875 | 0.8862 | 0.8675 |
-| hiD 20-D 4-cls | **0.8031** | 0.7712 | 0.7863 | 0.8544 |
-| binary 30-D | **0.9125** | 0.8750 | 0.8800 | 0.9437 |
-| multiclass 50-D 6-cls | 0.6090 | 0.6085 | **0.6350** | 0.7765 |
-| oblique 20-D 4-cls | **0.8656** | 0.7031 | 0.7244 | 0.7738 |
-| **Average** | **0.8620** | 0.8484 | 0.8602 | 0.8861 |
-
-HypForge leads on oblique-structure datasets (oblique 20-D: **+23 pp** over XGBoost, **+14 pp** over LightGBM) where split gain is maximised by learned linear combinations rather than axis-aligned cuts.
+Nodes are expanded in decreasing upper-bound gain order (A* / lazy beam). Growth stops at $2^{\text{max\_depth}}$ leaves. Smaller child gets a fresh histogram; larger child = parent − smaller (histogram subtraction).
 
 ---
 
-## Benchmarking
+## Complexity
 
-Datasets and scripts are pre-configured in the repository:
+| Step | Cost |
+|------|------|
+| Context creation | $O(N \cdot D)$ |
+| Cat re-encoding per round | $O(N \cdot D_{\text{cat}})$ |
+| GG-SRP direction per node | $O(D + b)$ |
+| Histogram build (smaller child) | $O(n_t \cdot D \cdot 256)$ |
+| Prediction (sparse routing) | $O(N \cdot \text{depth} \cdot s)$ |
 
-```bash
-# Generate all benchmark datasets (one-time, ~2 sec)
-python scripts/generate_datasets.py
-
-# Full benchmark (n_estimators=300)
-python scripts/benchmark.py
-
-# Quick smoke-test (n_estimators=50)
-python scripts/benchmark.py --quick
-
-# Single dataset
-python scripts/benchmark.py --dataset oblique_20d_4cls
-```
-
-Datasets are saved as compressed `.npz` files in `data/benchmarks/`.
-
----
-
-## Planned Improvements
-
-See separate design documents:
-
-- [`plan_contribution_based_survival_en.md`](plan_contribution_based_survival_en.md) — Track per-hypothesis validation gain; penalise overfitting directions in UCB scoring.
-- [`plan_latent_pool_en.md`](plan_latent_pool_en.md) — Separate primitive (base) and compound (crossover/product) hypothesis pools for independent evolution.
+$b \leq 16$ (direction subspace), $s \approx 2$–6 (split nnz).

@@ -1,21 +1,47 @@
+# Python
 __pycache__/
 *.py[cod]
-*.so
-*.dylib
-*.dll
 *.egg-info/
 dist/
 build/
+*.egg
+
+# Virtual environments
 .venv/
+venv/
+env/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Test cache
 .pytest_cache/
 .coverage
 coverage.xml
 htmlcov/
-src/hypforge/_ext/*.so
-src/hypforge/_ext/*.dylib
-src/hypforge/_ext/*.dll
-# Cython generated files (source hidden — only .pyx committed)
-src/hypforge/_pool.c
-src/hypforge/_pool*.so
-src/hypforge/_pool*.pyd
-*.egg-info/
+
+# Compiled shared libraries — excluded globally but explicitly kept for genforge
+*.so
+*.dylib
+*.dll
+!src/genforge/_ext/libbfstree.dylib
+!src/genforge/_ext/libbfstree.so
+!src/genforge/_ext/bfstree.dll
+
+# Benchmark large data files (downloaded by user)
+benchmark/data/HIGGS.csv.gz
+benchmark/data/cs-training.csv
+benchmark/data/cs-test.csv
+
+# Keep gitkeep
+!benchmark/data/.gitkeep
+
+# Lock files
+uv.lock
+
+# Old hypforge artifacts
+src/hypforge/
+benchmark/catboost_info/
+.DS_Store

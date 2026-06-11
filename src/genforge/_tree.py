@@ -29,7 +29,7 @@ def _get_lib():
     lib_p = _lib_path()
     if not os.path.exists(lib_p):
         raise FileNotFoundError(
-            f"[hypforge] Compiled C++ binary not found at {lib_p}.\n"
+            f"[genforge] Compiled C++ binary not found at {lib_p}.\n"
             "Please build/install the package first (e.g., using `pip install .` or `uv pip install -e .`)."
         )
 
