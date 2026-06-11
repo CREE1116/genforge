@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from _utils import run_benchmark, RESULTS_DIR, N_REPS, VAL_FRAC
-from _utils import _make_xgboost, _make_lightgbm, _make_catboost, _make_genforge
+from _utils import _make_xgboost, _make_lightgbm, _make_catboost
+from _utils import _make_genforge, _make_genforge_plain
 from _utils import evaluate_one
 from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
@@ -15,6 +16,12 @@ N_SAMPLES = 100_000
 N_FEATURES = 50
 N_INFORMATIVE = 10
 SEED = 42
+
+METRIC_COLS = [
+    "accuracy", "balanced_accuracy", "recall_macro", "specificity_macro",
+    "f1_macro", "f1_weighted", "roc_auc", "pr_auc", "log_loss",
+    "train_time", "infer_time",
+]
 
 
 def make_rotation_matrix(D: int, strength: float, rng: np.random.Generator) -> np.ndarray:
@@ -51,10 +58,11 @@ def run_rotation_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
                 X, y, test_size=0.2, random_state=rep
             )
             models = {
-                "XGBoost": _make_xgboost(n_classes),
-                "LightGBM": _make_lightgbm(n_classes),
-                "CatBoost": _make_catboost(None),
-                "GenForge": _make_genforge(None),
+                "XGBoost":        _make_xgboost(n_classes),
+                "LightGBM":       _make_lightgbm(n_classes),
+                "CatBoost":       _make_catboost(None),
+                "GenForge":       _make_genforge_plain(None),
+                "GenForge-balanced": _make_genforge(None),
             }
             for mname, model in models.items():
                 print(f"  Rep {rep+1}/{n_reps} strength={strength} {mname} ...", end="", flush=True)
@@ -62,11 +70,12 @@ def run_rotation_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
                     m = evaluate_one(mname, model, X_train, y_train, X_test, y_test, n_classes)
                     records.append({
                         "rotation_strength": strength, "model": mname, "rep": rep,
-                        "balanced_accuracy": m["balanced_accuracy"],
-                        "accuracy": m["accuracy"],
-                        "train_time": m["train_time"],
+                        **{k: m[k] for k in METRIC_COLS},
                     })
-                    print(f" bal_acc={m['balanced_accuracy']:.4f}")
+                    print(
+                        f" acc={m['accuracy']:.4f} bal={m['balanced_accuracy']:.4f}"
+                        f" roc={m['roc_auc']:.4f} train={m['train_time']:.1f}s"
+                    )
                 except Exception as exc:
                     print(f" ERROR: {exc}")
 

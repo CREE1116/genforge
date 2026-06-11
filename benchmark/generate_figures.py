@@ -18,9 +18,10 @@ MODEL_COLORS = {
     "XGBoost": "#e07b39",
     "LightGBM": "#3bb34a",
     "CatBoost": "#7b4fce",
-    "GenForge": "#2470c5",
+    "GenForge": "#888888",
+    "GenForge-balanced": "#2470c5",
 }
-MODEL_ORDER = ["XGBoost", "LightGBM", "CatBoost", "GenForge"]
+MODEL_ORDER = ["XGBoost", "LightGBM", "CatBoost", "GenForge", "GenForge-balanced"]
 DATASET_LABELS = {
     "adult": "Adult",
     "credit_default": "Credit\nDefault",

@@ -236,11 +236,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   const int STRIDE = 2 * K + 1;
   const size_t HSZ = (size_t)D * AX_BINS * STRIDE;
 
-  int nth = 1;
-#ifdef _OPENMP
-  nth = omp_get_max_threads();
-#endif
-  std::vector<float> thread_hists((size_t)nth * HSZ, 0.0f);
+
 
   const int internal_depth = std::min(2 * max_depth, 22);
   const int max_leaves = 1 << max_depth;
@@ -326,63 +322,107 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   }
   const uint8_t* GF_RESTRICT code = ctx->code.data();
 
-  // Histogram accumulation lambda
+  // Histogram accumulation lambda (dynamic hybrid parallel)
   auto accumulate_hist = [&](const int* rows, int nr, float* GF_RESTRICT hb,
                              float* node_P_out) {
     double P_acc = 0.0;
 #ifdef _OPENMP
-    if (nr >= 4096) {
+    if (nr >= 2048) {
       int nthreads = omp_get_max_threads();
-      std::vector<double> tP(nthreads, 0.0);
-#pragma omp parallel num_threads(nthreads)
-      {
-        int tid = omp_get_thread_num();
-        float* GF_RESTRICT lb = thread_hists.data() + (size_t)tid * HSZ;
-        std::memset(lb, 0, HSZ * sizeof(float));
-        double lp = 0.0;
-#pragma omp for schedule(static) nowait
-        for (int si = 0; si < nr; si++) {
-          int j = rows[si];
-          const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
-          const float* GF_RESTRICT gj = G + (size_t)j * K;
-          const float* GF_RESTRICT hj = H + (size_t)j * K;
-          for (int f = 0; f < D; f++) {
-            float* GF_RESTRICT slot =
-                lb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
-            for (int c = 0; c < K; c++) {
-              slot[c] += gj[c];
-              slot[K + c] += hj[c];
-            }
-            slot[2 * K] += 1.0f;
+      if (D >= nthreads && D >= 2) {
+        // Block-wise Feature-parallelism
+        int block_size = std::max(1, D / nthreads);
+#pragma omp parallel for schedule(static)
+        for (int fg = 0; fg < D; fg += block_size) {
+          int f_end = std::min(fg + block_size, D);
+          for (int f = fg; f < f_end; f++) {
+            float* GF_RESTRICT slot_f = hb + (size_t)f * AX_BINS * STRIDE;
+            std::memset(slot_f, 0, AX_BINS * STRIDE * sizeof(float));
           }
-          if (node_P_out) {
-            for (int c = 0; c < K; c++)
-              lp += 0.5 * (double)gj[c] * gj[c] /
-                    ((double)hj[c] + reg_lambda + EPS);
+          for (int si = 0; si < nr; si++) {
+            int j = rows[si];
+            const float* GF_RESTRICT gj = G + (size_t)j * K;
+            const float* GF_RESTRICT hj = H + (size_t)j * K;
+            for (int f = fg; f < f_end; f++) {
+              int b = code[(size_t)j * D + f];
+              float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + b) * STRIDE;
+              for (int c = 0; c < K; c++) {
+                slot[c] += gj[c];
+                slot[K + c] += hj[c];
+              }
+              slot[2 * K] += 1.0f;
+            }
           }
         }
-        tP[tid] = lp;
-      }
+      } else {
+        // Sample-parallelism with thread-local histograms (efficient for small D)
+        std::vector<float> local_hists((size_t)nthreads * HSZ, 0.0f);
+        std::vector<double> tP(nthreads, 0.0);
+#pragma omp parallel num_threads(nthreads)
+        {
+          int tid = omp_get_thread_num();
+          float* GF_RESTRICT lb = local_hists.data() + (size_t)tid * HSZ;
+          double lp = 0.0;
+#pragma omp for schedule(static) nowait
+          for (int si = 0; si < nr; si++) {
+            int j = rows[si];
+            const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
+            const float* GF_RESTRICT gj = G + (size_t)j * K;
+            const float* GF_RESTRICT hj = H + (size_t)j * K;
+            for (int f = 0; f < D; f++) {
+              float* GF_RESTRICT slot = lb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
+              for (int c = 0; c < K; c++) {
+                slot[c] += gj[c];
+                slot[K + c] += hj[c];
+              }
+              slot[2 * K] += 1.0f;
+            }
+            if (node_P_out) {
+              for (int c = 0; c < K; c++) {
+                lp += 0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
+              }
+            }
+          }
+          tP[tid] = lp;
+        }
 #pragma omp parallel for schedule(static)
-      for (int64_t i = 0; i < (int64_t)HSZ; i++) {
-        float s = hb[i];
-        for (int t = 0; t < nthreads; t++)
-          s += thread_hists[(size_t)t * HSZ + i];
-        hb[i] = s;
+        for (int64_t i = 0; i < (int64_t)HSZ; i++) {
+          float s = 0.0f;
+          for (int t = 0; t < nthreads; t++) {
+            s += local_hists[(size_t)t * HSZ + i];
+          }
+          hb[i] = s;
+        }
+        if (node_P_out) {
+          for (int t = 0; t < nthreads; t++) P_acc += tP[t];
+          *node_P_out = (float)P_acc;
+        }
+        return;
       }
-      for (int t = 0; t < nthreads; t++) P_acc += tP[t];
-      if (node_P_out) *node_P_out = (float)P_acc;
+      if (node_P_out) {
+#pragma omp parallel for reduction(+:P_acc) schedule(static)
+        for (int si = 0; si < nr; si++) {
+          int j = rows[si];
+          const float* GF_RESTRICT gj = G + (size_t)j * K;
+          const float* GF_RESTRICT hj = H + (size_t)j * K;
+          for (int c = 0; c < K; c++) {
+            P_acc += 0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
+          }
+        }
+        *node_P_out = (float)P_acc;
+      }
       return;
     }
 #endif
+    // Fallback to single-threaded accumulation
+    std::memset(hb, 0, HSZ * sizeof(float));
     for (int si = 0; si < nr; si++) {
       int j = rows[si];
       const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
       const float* GF_RESTRICT gj = G + (size_t)j * K;
       const float* GF_RESTRICT hj = H + (size_t)j * K;
       for (int f = 0; f < D; f++) {
-        float* GF_RESTRICT slot =
-            hb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
+        float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
         for (int c = 0; c < K; c++) {
           slot[c] += gj[c];
           slot[K + c] += hj[c];
@@ -390,9 +430,9 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         slot[2 * K] += 1.0f;
       }
       if (node_P_out) {
-        for (int c = 0; c < K; c++)
-          P_acc +=
-              0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
+        for (int c = 0; c < K; c++) {
+          P_acc += 0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
+        }
       }
     }
     if (node_P_out) *node_P_out = (float)P_acc;
@@ -1153,6 +1193,9 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         int tid = omp_get_thread_num();
         auto& Lv = tL[tid];
         auto& Rv = tR[tid];
+        int chunk_size = (ns + nthreads - 1) / nthreads;
+        Lv.reserve(chunk_size);
+        Rv.reserve(chunk_size);
         tGL[tid].assign(K, 0.0f);
         tHL[tid].assign(K, 0.0f);
         float* GF_RESTRICT gl = tGL[tid].data();
@@ -1201,6 +1244,8 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     } else
 #endif
     {
+      left_sub.reserve(ns / 2 + 64);
+      right_sub.reserve(ns / 2 + 64);
       for (int si = 0; si < ns; si++) {
         int j = samp[si];
         bool go_left = (ax >= 0) ? (code[(size_t)j * D + ax] <= (uint8_t)bcode)
@@ -1542,6 +1587,36 @@ GF_API void gf_tree_import_meta(void* tree_handle, int D_num,
     for (int e = 0; e < cat_sizes[fc]; e++) {
       m[cat_keys[off]] = cat_vals[off];
       off++;
+    }
+  }
+}
+
+GF_API void gf_update_gradients(const float* F, const float* oh, int N, int K, float* G, float* H) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int i = 0; i < N; i++) {
+    size_t offset = (size_t)i * K;
+
+    // Find max F for numerical stability
+    float fmax = F[offset];
+    for (int c = 1; c < K; c++) {
+      if (F[offset + c] > fmax) {
+        fmax = F[offset + c];
+      }
+    }
+
+    // Sum of exponentials
+    double sum_exp = 0.0;
+    for (int c = 0; c < K; c++) {
+      sum_exp += std::exp(F[offset + c] - fmax);
+    }
+
+    // Compute P, G, H
+    for (int c = 0; c < K; c++) {
+      float p = (float)(std::exp(F[offset + c] - fmax) / (sum_exp + EPS));
+      G[offset + c] = p - oh[offset + c];
+      H[offset + c] = p * (1.0f - p);
     }
   }
 }

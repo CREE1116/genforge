@@ -5,13 +5,20 @@ import numpy as np
 import pandas as pd
 from _utils import (
     RESULTS_DIR, N_REPS, evaluate_one,
-    _make_xgboost, _make_lightgbm, _make_catboost, _make_genforge,
+    _make_xgboost, _make_lightgbm, _make_catboost,
+    _make_genforge, _make_genforge_plain,
 )
 from sklearn.datasets import fetch_openml
 from sklearn.model_selection import train_test_split
 
 MISSING_RATIOS = [0.0, 0.1, 0.2, 0.3, 0.4]
 SEED = 42
+
+METRIC_COLS = [
+    "accuracy", "balanced_accuracy", "recall_macro", "specificity_macro",
+    "f1_macro", "f1_weighted", "roc_auc", "pr_auc", "log_loss",
+    "train_time", "infer_time",
+]
 
 
 def inject_missing(X: np.ndarray, ratio: float, rng: np.random.Generator) -> np.ndarray:
@@ -42,10 +49,11 @@ def run_missing_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
                 X, y, test_size=0.2, random_state=rep, stratify=y
             )
             models = {
-                "XGBoost": _make_xgboost(n_classes),
-                "LightGBM": _make_lightgbm(n_classes),
-                "CatBoost": _make_catboost(None),
-                "GenForge": _make_genforge(None),
+                "XGBoost":        _make_xgboost(n_classes),
+                "LightGBM":       _make_lightgbm(n_classes),
+                "CatBoost":       _make_catboost(None),
+                "GenForge":       _make_genforge_plain(None),
+                "GenForge-balanced": _make_genforge(None),
             }
             for mname, model in models.items():
                 print(f"  Rep {rep+1}/{n_reps} missing={ratio:.0%} {mname} ...", end="", flush=True)
@@ -53,10 +61,12 @@ def run_missing_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
                     m = evaluate_one(mname, model, X_train, y_train, X_test, y_test, n_classes)
                     records.append({
                         "missing_ratio": ratio, "model": mname, "rep": rep,
-                        "balanced_accuracy": m["balanced_accuracy"],
-                        "accuracy": m["accuracy"],
+                        **{k: m[k] for k in METRIC_COLS},
                     })
-                    print(f" bal_acc={m['balanced_accuracy']:.4f}")
+                    print(
+                        f" acc={m['accuracy']:.4f} bal={m['balanced_accuracy']:.4f}"
+                        f" rec={m['recall_macro']:.4f} roc={m['roc_auc']:.4f}"
+                    )
                 except Exception as exc:
                     print(f" ERROR: {exc}")
 

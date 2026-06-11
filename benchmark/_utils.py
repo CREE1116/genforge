@@ -9,9 +9,13 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     balanced_accuracy_score,
+    confusion_matrix,
     f1_score,
     log_loss,
+    recall_score,
+    roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder
@@ -55,6 +59,21 @@ def _make_genforge(cat_col_indices: list[int] | None):
         n_estimators=1000,
         early_stopping_rounds=50,
         cat_features=cat_col_indices,
+        class_weight="balanced",
+        prior_alpha=0.5,
+        verbose=False,
+    )
+
+
+def _make_genforge_plain(cat_col_indices: list[int] | None):
+    """GenForge without prior correction — isolates structural (oblique-split) bias."""
+    from genforge import GenforgeClassifier
+    return GenforgeClassifier(
+        n_estimators=1000,
+        early_stopping_rounds=50,
+        cat_features=cat_col_indices,
+        class_weight=None,
+        prior_alpha=0.0,
         verbose=False,
     )
 
@@ -137,14 +156,47 @@ def evaluate_one(
     if y_proba is not None:
         y_proba = np.clip(y_proba, 1e-7, 1 - 1e-7)
 
+    labels = np.arange(n_classes)
+    cm = confusion_matrix(y_test, y_pred, labels=labels)
+    # Macro specificity: TN/(TN+FP) averaged over OvR decomposition
+    specs = []
+    for k in range(n_classes):
+        tp = cm[k, k]; fn = cm[k, :].sum() - tp
+        fp = cm[:, k].sum() - tp; tn = cm.sum() - tp - fn - fp
+        specs.append(tn / (tn + fp) if (tn + fp) > 0 else 0.0)
+    specificity = float(np.mean(specs))
+
+    roc_auc = float("nan")
+    pr_auc  = float("nan")
+    if y_proba is not None:
+        try:
+            multi = "ovr" if n_classes > 2 else "raise"
+            if n_classes == 2:
+                roc_auc = roc_auc_score(y_test, y_proba[:, 1])
+                pr_auc  = average_precision_score(y_test, y_proba[:, 1])
+            else:
+                roc_auc = roc_auc_score(y_test, y_proba, multi_class="ovr",
+                                        average="macro", labels=labels)
+                pr_auc  = float(np.mean([
+                    average_precision_score(
+                        (y_test == k).astype(int), y_proba[:, k]
+                    ) for k in range(n_classes)
+                ]))
+        except Exception:
+            pass
+
     return {
-        "accuracy": accuracy_score(y_test, y_pred),
+        "accuracy":          accuracy_score(y_test, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y_test, y_pred),
-        "f1_macro": f1_score(y_test, y_pred, average="macro", zero_division=0),
-        "f1_weighted": f1_score(y_test, y_pred, average="weighted", zero_division=0),
-        "log_loss": log_loss(y_test, y_proba) if y_proba is not None else float("nan"),
-        "train_time": train_time,
-        "infer_time": infer_time,
+        "recall_macro":      recall_score(y_test, y_pred, average="macro", zero_division=0),
+        "specificity_macro": specificity,
+        "f1_macro":          f1_score(y_test, y_pred, average="macro", zero_division=0),
+        "f1_weighted":       f1_score(y_test, y_pred, average="weighted", zero_division=0),
+        "roc_auc":           roc_auc,
+        "pr_auc":            pr_auc,
+        "log_loss":          log_loss(y_test, y_proba) if y_proba is not None else float("nan"),
+        "train_time":        train_time,
+        "infer_time":        infer_time,
     }
 
 
@@ -154,7 +206,7 @@ def run_benchmark(
     cat_idx: list[int] | None = None,
     n_reps: int = N_REPS,
 ) -> pd.DataFrame:
-    """Full benchmark: load → split × n_reps × 4 models → save CSV."""
+    """Full benchmark: load → split × n_reps × 5 models → save CSV."""
     print(f"\n{'='*60}")
     print(f"Dataset: {dataset_name}")
     print(f"{'='*60}")
@@ -178,10 +230,11 @@ def run_benchmark(
         X_test = X_test.astype(np.float32)
 
         models = {
-            "XGBoost": _make_xgboost(n_classes),
-            "LightGBM": _make_lightgbm(n_classes),
-            "CatBoost": _make_catboost(cat_idx),
-            "GenForge": _make_genforge(cat_idx),
+            "XGBoost":       _make_xgboost(n_classes),
+            "LightGBM":      _make_lightgbm(n_classes),
+            "CatBoost":      _make_catboost(cat_idx),
+            "GenForge":      _make_genforge_plain(cat_idx),
+            "GenForge-balanced": _make_genforge(cat_idx),
         }
 
         for model_name, model in models.items():
@@ -200,9 +253,12 @@ def run_benchmark(
                 }
                 results.append(row)
                 print(
-                    f" bal_acc={metrics['balanced_accuracy']:.4f}"
-                    f" train={metrics['train_time']:.2f}s"
-                    f" infer={metrics['infer_time']:.3f}s"
+                    f" acc={metrics['accuracy']:.4f}"
+                    f" bal={metrics['balanced_accuracy']:.4f}"
+                    f" rec={metrics['recall_macro']:.4f}"
+                    f" roc={metrics['roc_auc']:.4f}"
+                    f" pr={metrics['pr_auc']:.4f}"
+                    f" train={metrics['train_time']:.1f}s"
                 )
             except Exception as exc:
                 print(f" ERROR: {exc}")
@@ -223,7 +279,8 @@ def aggregate_results() -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     df = pd.concat(frames, ignore_index=True)
-    metric_cols = ["accuracy", "balanced_accuracy", "f1_macro", "f1_weighted",
+    metric_cols = ["accuracy", "balanced_accuracy", "recall_macro", "specificity_macro",
+                   "f1_macro", "f1_weighted", "roc_auc", "pr_auc",
                    "log_loss", "train_time", "infer_time"]
     agg = df.groupby(["dataset", "model"])[metric_cols].agg(["mean", "std"])
     agg.columns = ["_".join(c) for c in agg.columns]

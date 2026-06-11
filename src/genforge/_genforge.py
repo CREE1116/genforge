@@ -83,6 +83,16 @@ def _get_genforge_lib():
     ]
     lib.gf_tree_import_meta.restype = None
 
+    lib.gf_update_gradients.argtypes = [
+        _pf,           # F
+        _pf,           # oh
+        ctypes.c_int,  # N
+        ctypes.c_int,  # K
+        _pf,           # G
+        _pf,           # H
+    ]
+    lib.gf_update_gradients.restype = None
+
     _genforge_configured = True
     return lib
 
@@ -93,6 +103,19 @@ def _fptr(a: np.ndarray):
 
 def _iptr(a: np.ndarray):
     return a.ctypes.data_as(_pi)
+
+
+def update_gradients(F: np.ndarray, oh: np.ndarray, G: np.ndarray, H: np.ndarray) -> None:
+    N, K = F.shape
+    lib = _get_genforge_lib()
+    lib.gf_update_gradients(
+        _fptr(F),
+        _fptr(oh),
+        N,
+        K,
+        _fptr(G),
+        _fptr(H),
+    )
 
 
 def predict_ensemble(trees: list, X: np.ndarray, K: int, lr: float,

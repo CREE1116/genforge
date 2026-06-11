@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 from _utils import (
     RESULTS_DIR, N_REPS, evaluate_one, _encode_cats,
-    _make_xgboost, _make_lightgbm, _make_catboost, _make_genforge,
+    _make_xgboost, _make_lightgbm, _make_catboost,
+    _make_genforge, _make_genforge_plain,
 )
 from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
@@ -15,6 +16,12 @@ N_SAMPLES = 50_000
 N_NUM_FEATURES = 10
 N_CAT_FEATURES = 5
 SEED = 42
+
+METRIC_COLS = [
+    "accuracy", "balanced_accuracy", "recall_macro", "specificity_macro",
+    "f1_macro", "f1_weighted", "roc_auc", "pr_auc", "log_loss",
+    "train_time", "infer_time",
+]
 
 
 def make_cat_dataset(cardinality: int, seed: int):
@@ -45,10 +52,11 @@ def run_cat_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
             X_train_enc, X_test_enc = _encode_cats(X_train, X_test, cat_idx)
 
             models = {
-                "XGBoost": _make_xgboost(n_classes),
-                "LightGBM": _make_lightgbm(n_classes),
-                "CatBoost": _make_catboost(cat_idx),
-                "GenForge": _make_genforge(cat_idx),
+                "XGBoost":        _make_xgboost(n_classes),
+                "LightGBM":       _make_lightgbm(n_classes),
+                "CatBoost":       _make_catboost(cat_idx),
+                "GenForge":       _make_genforge_plain(cat_idx),
+                "GenForge-balanced": _make_genforge(cat_idx),
             }
             for mname, model in models.items():
                 print(f"  Rep {rep+1}/{n_reps} card={cardinality} {mname} ...", end="", flush=True)
@@ -60,10 +68,12 @@ def run_cat_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
                     )
                     records.append({
                         "cardinality": cardinality, "model": mname, "rep": rep,
-                        "balanced_accuracy": m["balanced_accuracy"],
-                        "accuracy": m["accuracy"],
+                        **{k: m[k] for k in METRIC_COLS},
                     })
-                    print(f" bal_acc={m['balanced_accuracy']:.4f}")
+                    print(
+                        f" acc={m['accuracy']:.4f} bal={m['balanced_accuracy']:.4f}"
+                        f" rec={m['recall_macro']:.4f} roc={m['roc_auc']:.4f}"
+                    )
                 except Exception as exc:
                     print(f" ERROR: {exc}")
 

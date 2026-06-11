@@ -25,7 +25,7 @@ DATASET_ORDER = [
     "adult", "credit_default", "give_me_some_credit",
     "covertype", "higgs", "rotated_synthetic",
 ]
-MODEL_ORDER = ["XGBoost", "LightGBM", "CatBoost", "GenForge"]
+MODEL_ORDER = ["XGBoost", "LightGBM", "CatBoost", "GenForge", "GenForge-balanced"]
 
 
 def load_all() -> pd.DataFrame:
