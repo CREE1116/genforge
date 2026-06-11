@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <unordered_map>
 
 // Shared BFSTree definition used by both bfstree.cpp and hypforge.cpp.
 
@@ -16,6 +17,10 @@ struct BFSTree {
   std::vector<uint8_t> is_leaf;
   std::vector<float>   split_gain;
   std::vector<float>   split_weights;  // [total_nodes × D], SALOT standalone only
+
+  int D_num = 0;
+  std::vector<float> na_means;  // [D]: numeric μ_f impute; cat cols: NaN-category rank
+  std::vector<std::unordered_map<int, float>> cat_ranks;  // [D_cat]: raw value → rank
 };
 
 // Best-first oblique tree builder (implemented in bfstree.cpp).

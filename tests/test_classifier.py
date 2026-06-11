@@ -417,3 +417,49 @@ def test_pool_mechanics():
         )
         assert h.credit >= 0.0, f"Used hyp should have non-negative credit, got {h.credit}"
 
+
+def test_salot_nan_and_categorical():
+    from hypforge import SALOTClassifier
+    import numpy as np
+
+    np.random.seed(42)
+    # 100 samples, 4 features (2 numerical, 2 categorical)
+    X = np.random.randn(100, 4).astype(np.float32)
+    
+    # Categorical features: columns 2 and 3. Map values to float category IDs.
+    X[:, 2] = np.random.choice([0.0, 1.0, 2.0], size=100)
+    X[:, 3] = np.random.choice([0.0, 1.0], size=100)
+
+    # Inject NaNs to both numerical and categorical columns
+    X[10:20, 0] = np.nan
+    X[30:40, 2] = np.nan
+
+    y = np.random.choice([0, 1], size=100)
+
+    # Fit SALOTClassifier with D_num=2 (cols 0, 1 are numerical, cols 2, 3 are categorical)
+    # The cat_features indices resolve D_num = 2.
+    clf = SALOTClassifier(n_estimators=5, max_depth=3, cat_features=[2, 3])
+    clf.fit(X, y)
+
+    # Verify predictions
+    preds = clf.predict(X)
+    proba = clf.predict_proba(X)
+
+    assert preds.shape == (100,)
+    assert proba.shape == (100, 2)
+    assert not np.isnan(proba).any()
+
+    # Verify prediction with unseen category values and new NaNs
+    X_test = np.random.randn(10, 4).astype(np.float32)
+    X_test[:, 2] = 5.0 # Unseen category value
+    X_test[0, 1] = np.nan
+    X_test[1, 3] = np.nan
+
+    preds_test = clf.predict(X_test)
+    proba_test = clf.predict_proba(X_test)
+
+    assert preds_test.shape == (10,)
+    assert proba_test.shape == (10, 2)
+    assert not np.isnan(proba_test).any()
+
+

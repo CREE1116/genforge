@@ -494,17 +494,21 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
 
     # ── internal ─────────────────────────────────────────────────────────────
 
-    def _resolve_D_num(self, D: int) -> int:
-        """Number of numerical (non-categorical) columns."""
+    def _resolve_cat_idx(self, D: int) -> list[int]:
+        """Sorted column indices declared categorical via ``cat_features``."""
         if not self.cat_features:
-            return D
+            return []
         cat_idx = set()
         for cf in self.cat_features:
-            if isinstance(cf, int):
-                cat_idx.add(cf)
+            if isinstance(cf, (int, np.integer)):
+                cat_idx.add(int(cf))
             elif self.feature_names_in_ is not None and cf in self.feature_names_in_:
                 cat_idx.add(self.feature_names_in_.index(cf))
-        return D - len(cat_idx)
+        return sorted(cat_idx)
+
+    def _resolve_D_num(self, D: int) -> int:
+        """Number of numerical (non-categorical) columns."""
+        return D - len(self._resolve_cat_idx(D))
 
     def _fit_core(self, X, y, X_val, y_val, D_num):
         N, D = X.shape
@@ -620,11 +624,19 @@ class HypForgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
 
 class SALOTClassifier(HypForgeClassifier):
     """
-    SALOT: Pool-less Local Stochastic Oblique Tree boosting.
+    SALOT v9: deterministic pool-free oblique tree boosting.
 
-    Per-node block WLS with instance subsampling, feature subsampling, and
-    zero-cross-term feature bundling.  No hypothesis pool, no global cache.
-    Split weight vectors are stored inside each tree node.
+    Two effective hyperparameters per tree (max_depth, reg_lambda).
+    Native missing-value handling (numeric NaN → mean imputation baked into
+    the binning context) and native categorical handling (per-round
+    gradient-rank target encoding; categories participate in both axis
+    scans and oblique projections).  Columns named in ``cat_features`` are
+    internally moved after the numeric block; category values must be
+    numeric IDs (floats holding integers).  NaN is allowed anywhere.
+
+    Legacy v6 knobs (prune_strength, n_wls_max, d_sub_max, gbaor_alpha,
+    n_candidates, honest_split, quant_levels, colsample_bytree) are accepted
+    but ignored.
     """
 
     def __init__(
@@ -642,6 +654,7 @@ class SALOTClassifier(HypForgeClassifier):
         random_state:          int | None = None,
         verbose:               bool  = False,
         cat_features:          list | None = None,
+        class_weight:          str | None = "balanced",
         prune_strength:        float = 0.1,
         n_wls_max:             int   = 512,
         d_sub_max:             int   = 32,
@@ -665,6 +678,7 @@ class SALOTClassifier(HypForgeClassifier):
         )
         self.colsample_bytree = colsample_bytree
         self.n_jobs           = n_jobs
+        self.class_weight     = class_weight
         self.prune_strength   = prune_strength
         self.n_wls_max        = n_wls_max
         self.d_sub_max        = d_sub_max
@@ -674,26 +688,44 @@ class SALOTClassifier(HypForgeClassifier):
         self.quant_levels     = quant_levels
 
     def _fit_core(self, X, y, X_val, y_val, D_num):
-        from ._salot import SALOTTree
+        from ._salot import SalotContext
 
-        N    = X.shape[0]
+        N, D = X.shape
         K    = int(y.max()) + 1
         seed = self.random_state if self.random_state is not None else 42
 
-        cnt = np.bincount(y, minlength=K).astype(np.float32)
-        cw  = N / (K * cnt.clip(min=1))
-        sw  = cw[y]
+        # Move categorical columns after the numeric block (the C++ core
+        # uses the [D_num, D) convention); remember the permutation for
+        # prediction time.
+        cat_idx = self._resolve_cat_idx(D)
+        if cat_idx and cat_idx != list(range(D_num, D)):
+            perm = [i for i in range(D) if i not in set(cat_idx)] + cat_idx
+            self._col_perm_ = np.asarray(perm, dtype=np.intp)
+        else:
+            self._col_perm_ = None
+        if self._col_perm_ is not None:
+            X = np.ascontiguousarray(X[:, self._col_perm_])
+            if X_val is not None:
+                X_val = np.ascontiguousarray(X_val[:, self._col_perm_])
 
-        lp  = np.log(cnt / N + 1e-8); lp -= lp.mean()
+        cnt = np.bincount(y, minlength=K).astype(np.float32)
+        if getattr(self, "class_weight", "balanced") == "balanced":
+            sw = (N / (K * cnt.clip(min=1)))[y].astype(np.float32)
+        else:
+            sw = np.ones(N, dtype=np.float32)
+        sw_col = sw[:, None]
+
+        lp  = np.log(cnt / N + 1e-8).astype(np.float32); lp -= lp.mean()
         self.F_init_ = lp.tolist()
 
         Fsc   = np.tile(lp, (N, 1))
         F_val = np.tile(lp, (X_val.shape[0], 1)) if X_val is not None else None
 
-        rng = np.random.default_rng(seed)
+        # One-hot targets are round-invariant — build once.
+        oh = np.zeros((N, K), dtype=np.float32)
+        oh[np.arange(N), y] = 1.0
 
-        # 저차원(D_num ≤ 4)에서는 energy pruning 비활성화
-        adaptive_prune = self.prune_strength if D_num > 4 else 0.0
+        rng = np.random.default_rng(seed)
 
         best_val_loss = float("inf")
         best_trees:   list = []
@@ -701,74 +733,82 @@ class SALOTClassifier(HypForgeClassifier):
 
         self.trees_: list = []   # list of SALOTTree
 
-        for m in range(self.n_estimators):
-            Fsh = Fsc - Fsc.max(axis=1, keepdims=True)
-            Pm  = np.exp(Fsh); Pm /= Pm.sum(axis=1, keepdims=True)
+        # Bin once, boost many: the context owns the imputed/binned copy of
+        # X, so per-round work is gradients + categorical re-ranks + tree.
+        ctx = SalotContext(X, D_num=D_num)
+        Pm  = np.empty((N, K), dtype=np.float32)
+        G_w = np.empty((N, K), dtype=np.float32)
+        H_w = np.empty((N, K), dtype=np.float32)
+        full_idx = np.arange(N, dtype=np.int32)
+        try:
+            for m in range(self.n_estimators):
+                np.subtract(Fsc, Fsc.max(axis=1, keepdims=True), out=Pm)
+                np.exp(Pm, out=Pm)
+                Pm /= Pm.sum(axis=1, keepdims=True)
 
-            oh  = np.zeros((N, K), dtype=np.float32)
-            oh[np.arange(N), y] = 1.0
-            G_w = (sw[:, None] * (Pm - oh)).astype(np.float32)
-            H_w = (sw[:, None] * Pm * (1.0 - Pm)).astype(np.float32)
+                np.subtract(Pm, oh, out=G_w)
+                G_w *= sw_col
+                np.subtract(1.0, Pm, out=H_w)
+                H_w *= Pm
+                H_w *= sw_col
 
-            if self.subsample < 1.0:
-                sub_size = min(N, max(1000, int(N * self.subsample)))
-                tree_sub = rng.choice(N, size=sub_size, replace=False).astype(np.int32)
-            else:
-                tree_sub = np.arange(N, dtype=np.int32)
-
-            t = SALOTTree(
-                max_depth      = self.max_depth,
-                reg_lambda     = self.reg_lambda,
-                prune_strength = adaptive_prune,
-                n_wls_max      = self.n_wls_max,
-                d_sub_max      = self.d_sub_max,
-                subsample      = 1.0,
-                gbaor_alpha    = self.gbaor_alpha,
-                n_candidates   = self.n_candidates,
-                honest_split   = self.honest_split,
-                quant_levels   = self.quant_levels,
-                random_state   = seed + m,
-            )
-            out_pred = t.fit_predict(X, G_w, H_w, D_num=D_num, subset=tree_sub)
-            self.trees_.append(t)
-            Fsc += self.learning_rate * out_pred
-
-            val_str = ""
-            if X_val is not None:
-                pred_val = t.predict(X_val)
-                F_val    = F_val + self.learning_rate * pred_val
-                Fv_sh    = F_val - F_val.max(axis=1, keepdims=True)
-                P_val    = np.exp(Fv_sh); P_val /= P_val.sum(axis=1, keepdims=True)
-                val_loss = -np.log(P_val[np.arange(len(y_val)), y_val].clip(1e-8)).mean()
-                val_acc  = (P_val.argmax(axis=1) == y_val).mean()
-                val_str  = f" | ValLoss={val_loss:.4f} | ValAcc={val_acc:.4f}"
-
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    no_improv     = 0
-                    best_trees    = list(self.trees_)
+                if self.subsample < 1.0:
+                    # Bernoulli row sampling: indices come out sorted (cache-
+                    # friendly C++ row access) with no explicit sort.
+                    tree_sub = np.flatnonzero(
+                        rng.random(N) < self.subsample
+                    ).astype(np.int32)
+                    if len(tree_sub) < min(N, 1000):
+                        tree_sub = full_idx
                 else:
-                    no_improv += 1
+                    tree_sub = full_idx
 
-            if self.verbose:
-                ll  = -np.log(Pm[np.arange(N), y].clip(1e-8)).mean()
-                acc = (Pm.argmax(axis=1) == y).mean()
-                print(
-                    f"  [SALOTClassifier] Round {m+1:3d} | Loss={ll:.4f} | "
-                    f"Acc={acc:.4f}{val_str}"
+                t, out_pred = ctx.build(
+                    G_w, H_w, tree_sub, self.max_depth, self.reg_lambda
                 )
+                self.trees_.append(t)
+                Fsc += self.learning_rate * out_pred
 
-            if X_val is not None and self.early_stopping_rounds is not None:
-                if no_improv >= self.early_stopping_rounds:
-                    if self.verbose:
-                        print(f"  [SALOTClassifier] Early stopping at round {m+1}")
-                    self.trees_ = best_trees
-                    break
+                val_str = ""
+                if X_val is not None:
+                    pred_val = t.predict(X_val)
+                    F_val    = F_val + self.learning_rate * pred_val
+                    Fv_sh    = F_val - F_val.max(axis=1, keepdims=True)
+                    P_val    = np.exp(Fv_sh); P_val /= P_val.sum(axis=1, keepdims=True)
+                    val_loss = -np.log(P_val[np.arange(len(y_val)), y_val].clip(1e-8)).mean()
+                    val_acc  = (P_val.argmax(axis=1) == y_val).mean()
+                    val_str  = f" | ValLoss={val_loss:.4f} | ValAcc={val_acc:.4f}"
+
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        no_improv     = 0
+                        best_trees    = list(self.trees_)
+                    else:
+                        no_improv += 1
+
+                if self.verbose:
+                    ll  = -np.log(Pm[np.arange(N), y].clip(1e-8)).mean()
+                    acc = (Pm.argmax(axis=1) == y).mean()
+                    print(
+                        f"  [SALOTClassifier] Round {m+1:3d} | Loss={ll:.4f} | "
+                        f"Acc={acc:.4f}{val_str}"
+                    )
+
+                if X_val is not None and self.early_stopping_rounds is not None:
+                    if no_improv >= self.early_stopping_rounds:
+                        if self.verbose:
+                            print(f"  [SALOTClassifier] Early stopping at round {m+1}")
+                        self.trees_ = best_trees
+                        break
+        finally:
+            ctx.close()
 
     def predict_proba(self, X):
         if hasattr(X, "values"):
             X = X.values
         X = np.ascontiguousarray(X, dtype=np.float32)
+        if getattr(self, "_col_perm_", None) is not None:
+            X = np.ascontiguousarray(X[:, self._col_perm_])
         N = X.shape[0]
 
         F = np.tile(np.array(self.F_init_, dtype=np.float32), (N, 1))
