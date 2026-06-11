@@ -26,56 +26,115 @@ TEST_SIZE = 0.2
 VAL_FRAC = 0.1  # fraction of train used for early stopping
 
 
-def _make_xgboost(n_classes: int):
+def _load_best_params(dataset_name: str, model_name: str) -> dict:
+    try:
+        import json
+        from pathlib import Path
+        best_params_path = Path(__file__).parent / "results" / "best_params.json"
+        if best_params_path.exists():
+            with open(best_params_path, "r") as f:
+                data = json.load(f)
+            return data.get(dataset_name, {}).get(model_name, {})
+    except Exception:
+        pass
+    return {}
+
+
+def _make_xgboost(n_classes: int, random_state: int, dataset_name: str = ""):
     from xgboost import XGBClassifier
-    return XGBClassifier(
-        n_estimators=1000,
-        early_stopping_rounds=50,
-        eval_metric="logloss" if n_classes == 2 else "mlogloss",
-        verbosity=0,
-    )
+    params = {
+        "n_estimators": 1000,
+        "learning_rate": 0.05,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "min_child_weight": 1,
+        "tree_method": 'hist',
+        "early_stopping_rounds": 50,
+        "eval_metric": "logloss" if n_classes == 2 else "mlogloss",
+        "verbosity": 0,
+        "random_state": random_state,
+    }
+    best = _load_best_params(dataset_name, "XGBoost")
+    params.update(best)
+    return XGBClassifier(**params)
 
 
-def _make_lightgbm(n_classes: int):
+def _make_lightgbm(n_classes: int, random_state: int, dataset_name: str = ""):
     from lightgbm import LGBMClassifier
-    return LGBMClassifier(
-        n_estimators=1000,
-        verbose=-1,
-    )
+    params = {
+        "n_estimators": 1000,
+        "learning_rate": 0.05,
+        "num_leaves": 63,
+        "max_depth": -1,
+        "subsample": 0.8,
+        "bagging_freq": 1,
+        "colsample_bytree": 0.8,
+        "min_child_samples": 20,
+        "verbose": -1,
+        "random_state": random_state,
+    }
+    best = _load_best_params(dataset_name, "LightGBM")
+    params.update(best)
+    return LGBMClassifier(**params)
 
 
-def _make_catboost(cat_col_indices: list[int] | None):
+def _make_catboost(cat_col_indices: list[int] | None, random_state: int, dataset_name: str = ""):
     from catboost import CatBoostClassifier
-    return CatBoostClassifier(
-        iterations=1000,
-        cat_features=cat_col_indices,
-        verbose=0,
-    )
+    params = {
+        "iterations": 1000,
+        "learning_rate": 0.05,
+        "depth": 6,
+        "l2_leaf_reg": 3,
+        "early_stopping_rounds": 50,
+        "cat_features": cat_col_indices,
+        "verbose": 0,
+        "random_seed": random_state,
+    }
+    best = _load_best_params(dataset_name, "CatBoost")
+    params.update(best)
+    return CatBoostClassifier(**params)
 
 
-def _make_genforge(cat_col_indices: list[int] | None):
+def _make_genforge(cat_col_indices: list[int] | None, random_state: int, dataset_name: str = ""):
     from genforge import GenforgeClassifier
-    return GenforgeClassifier(
-        n_estimators=1000,
-        early_stopping_rounds=50,
-        cat_features=cat_col_indices,
-        class_weight="balanced",
-        prior_alpha=0.5,
-        verbose=False,
-    )
+    params = {
+        "n_estimators": 1000,
+        "learning_rate": 0.05,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "early_stopping_rounds": 50,
+        "cat_features": cat_col_indices,
+        "class_weight": "balanced",
+        "prior_alpha": 0.5,
+        "verbose": False,
+        "random_state": random_state,
+    }
+    best = _load_best_params(dataset_name, "GenForge")
+    params.update(best)
+    return GenforgeClassifier(**params)
 
 
-def _make_genforge_plain(cat_col_indices: list[int] | None):
+def _make_genforge_plain(cat_col_indices: list[int] | None, random_state: int, dataset_name: str = ""):
     """GenForge without prior correction — isolates structural (oblique-split) bias."""
     from genforge import GenforgeClassifier
-    return GenforgeClassifier(
-        n_estimators=1000,
-        early_stopping_rounds=50,
-        cat_features=cat_col_indices,
-        class_weight=None,
-        prior_alpha=0.0,
-        verbose=False,
-    )
+    params = {
+        "n_estimators": 1000,
+        "learning_rate": 0.05,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "early_stopping_rounds": 50,
+        "cat_features": cat_col_indices,
+        "class_weight": None,
+        "prior_alpha": 0.0,
+        "verbose": False,
+        "random_state": random_state,
+    }
+    best = _load_best_params(dataset_name, "GenForge")  # share same params as GenForge
+    params.update(best)
+    return GenforgeClassifier(**params)
+
+
 
 
 def _encode_cats(X_train: np.ndarray, X_test: np.ndarray,
@@ -231,12 +290,14 @@ def run_benchmark(
         X_test = X_test.astype(np.float32)
 
         models = {
-            "XGBoost":       _make_xgboost(n_classes),
-            "LightGBM":      _make_lightgbm(n_classes),
-            "CatBoost":      _make_catboost(cat_idx),
-            "GenForge":      _make_genforge_plain(cat_idx),
-            "GenForge-balanced": _make_genforge(cat_idx),
+            "XGBoost":       _make_xgboost(n_classes, random_state=rep, dataset_name=dataset_name),
+            "LightGBM":      _make_lightgbm(n_classes, random_state=rep, dataset_name=dataset_name),
+            "CatBoost":      _make_catboost(cat_idx, random_state=rep, dataset_name=dataset_name),
+            "GenForge":      _make_genforge_plain(cat_idx, random_state=rep, dataset_name=dataset_name),
+            "GenForge-balanced": _make_genforge(cat_idx, random_state=rep, dataset_name=dataset_name),
         }
+
+
 
         for model_name, model in models.items():
             print(f"  Rep {rep+1}/{n_reps} — {model_name} ...", end="", flush=True)

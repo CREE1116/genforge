@@ -1,0 +1,34 @@
+{
+    "covertype": {
+        "XGBoost": {
+            "learning_rate": 0.1713356943992143,
+            "max_depth": 7,
+            "subsample": 0.769511648021324,
+            "colsample_bytree": 0.8191555967021253,
+            "min_child_weight": 16.874803968797078,
+            "reg_lambda": 0.24591182767569914,
+            "reg_alpha": 0.04382618348008821
+        },
+        "LightGBM": {
+            "max_depth": 7,
+            "learning_rate": 0.07279339861034936,
+            "num_leaves": 114,
+            "subsample": 0.9912840618088219,
+            "colsample_bytree": 0.6140475201091651,
+            "min_child_samples": 40,
+            "reg_lambda": 5.423019792618538,
+            "reg_alpha": 0.07857422932641414
+        },
+        "CatBoost": {
+            "learning_rate": 0.25521130010959503,
+            "depth": 7,
+            "l2_leaf_reg": 7.265010835129052
+        },
+        "GenForge": {
+            "learning_rate": 0.0999171043377358,
+            "max_depth": 6,
+            "subsample": 0.7261913894275287,
+            "reg_lambda": 0.8089941215937467
+        }
+    }
+}
