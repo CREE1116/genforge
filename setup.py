@@ -36,12 +36,15 @@ class CustomBuildPy(build_py):
 
         src_salot = os.path.join(src_ext_dir, "salot.cpp")
         src_gos   = os.path.join(src_ext_dir, "gos.cpp")
+        src_evopool = os.path.join(src_ext_dir, "evopool.cpp")
 
         src_files = [src_bfstree, src_hypforge]
         if os.path.exists(src_salot):
             src_files.append(src_salot)
         if os.path.exists(src_gos):
             src_files.append(src_gos)
+        if os.path.exists(src_evopool):
+            src_files.append(src_evopool)
 
         if os.path.exists(src_bfstree) and os.path.exists(src_hypforge):
             compile_cmd = cmd + src_files + ["-o", src_lib]
@@ -52,7 +55,7 @@ class CustomBuildPy(build_py):
             print(f"Copying compiled library to build folder: {build_lib_path}")
             shutil.copy2(src_lib, build_lib_path)
 
-            for src_name in ["bfstree.cpp", "hypforge.cpp", "salot.cpp", "gos.cpp", "bfstree_types.h"]:
+            for src_name in ["bfstree.cpp", "hypforge.cpp", "salot.cpp", "gos.cpp", "evopool.cpp", "bfstree_types.h"]:
                 src_file_in_build = os.path.join(build_ext_dir, src_name)
                 if os.path.exists(src_file_in_build):
                     print(f"Removing source file {src_file_in_build} from build folder")

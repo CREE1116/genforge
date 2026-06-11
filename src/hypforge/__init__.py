@@ -20,6 +20,7 @@ from ._testforge import SALOTPool
 from ._testforge import TestForgePool  # backwards compat alias
 from ._tree import BFSTree
 from ._salot import SALOTTree
+from ._evopool import EvoPoolClassifier
 
 
 def load_model(path: str) -> HypForgeClassifier:
@@ -30,7 +31,7 @@ def load_model(path: str) -> HypForgeClassifier:
 __version__ = "0.1.0"
 __all__ = [
     # Primary API
-    "HypForgeClassifier", "SALOTClassifier", "GOSClassifier",
+    "HypForgeClassifier", "SALOTClassifier", "GOSClassifier", "EvoPoolClassifier",
     "Hypothesis", "HypForgePool", "SALOTPool",
     "BFSTree", "SALOTTree",
     "load_model",

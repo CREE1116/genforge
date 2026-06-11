@@ -823,7 +823,8 @@ void pool_update_use_counts(void* handle, const int* split_indices,
 void pool_export(void* handle, int* types, float* weights, int* h1_indices,
                  int* h2_indices, int* use_counts, int* rounds_since_last_use,
                  float* credits, uint8_t* is_base, int* parent1, int* parent2,
-                 int* birth_round, int* family_id) {
+                 int* birth_round, int* family_id, float* family_fitness,
+                 float* breeding_value, float* ancestor_credit) {
   auto* pool = static_cast<HypForgePool*>(handle);
   int H = (int)pool->history.size(), D = pool->D;
   for (int p = 0; p < H; p++) {
@@ -839,6 +840,9 @@ void pool_export(void* handle, int* types, float* weights, int* h1_indices,
     parent2[p] = h.parent2;
     birth_round[p] = h.birth_round;
     family_id[p] = h.family_id;
+    family_fitness[p] = h.family_fitness;
+    breeding_value[p] = h.breeding_value;
+    ancestor_credit[p] = h.ancestor_credit;
     if (h.type < 2)
       std::memcpy(weights + p * D, h.w.data(), D * sizeof(float));
     else
@@ -852,7 +856,9 @@ void* pool_import(int D, int max_size, int U, const int* types,
                   const int* rounds_since_last_use, const float* credits,
                   const uint8_t* is_base, const int* parent1,
                   const int* parent2, const int* birth_round,
-                  const int* family_id, int P, const int* active_indices) {
+                  const int* family_id, const float* family_fitness,
+                  const float* breeding_value, const float* ancestor_credit,
+                  int P, const int* active_indices) {
   auto* pool = new HypForgePool(D, max_size);
   pool->pop.clear();
   pool->history.clear();
@@ -869,6 +875,9 @@ void* pool_import(int D, int max_size, int U, const int* types,
     h.parent2 = parent2[u];
     h.birth_round = birth_round[u];
     h.family_id = family_id[u];
+    h.family_fitness = family_fitness[u];
+    h.breeding_value = breeding_value[u];
+    h.ancestor_credit = ancestor_credit[u];
     h.global_id = u;
     if (h.type < 2) h.w.assign(weights + u * D, weights + (u + 1) * D);
     h.full_cache.clear();

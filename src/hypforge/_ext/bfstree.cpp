@@ -792,4 +792,22 @@ void* bfstree_from_arrays(const int* split_hyp_idx,
   return static_cast<void*>(tree);
 }
 
+int bfstree_get_D(void* handle) {
+  const BFSTree* tree = static_cast<const BFSTree*>(handle);
+  return tree->D;
+}
+
+void bfstree_get_split_weights(void* handle, float* out_weights) {
+  const BFSTree* tree = static_cast<const BFSTree*>(handle);
+  if (tree->split_weights.size() > 0) {
+    std::memcpy(out_weights, tree->split_weights.data(), tree->split_weights.size() * sizeof(float));
+  }
+}
+
+void bfstree_set_split_weights(void* handle, int D, const float* weights) {
+  BFSTree* tree = static_cast<BFSTree*>(handle);
+  tree->D = D;
+  tree->split_weights.assign(weights, weights + (size_t)tree->total_nodes * D);
+}
+
 }  // extern "C"

@@ -94,10 +94,13 @@ def _get_pool_lib():
         ctypes.POINTER(ctypes.c_int),      # rounds_since_last_use
         ctypes.POINTER(ctypes.c_float),    # credits
         ctypes.POINTER(ctypes.c_uint8),    # is_base
-        ctypes.POINTER(ctypes.c_int),      # parent1  (unused stub)
-        ctypes.POINTER(ctypes.c_int),      # parent2  (unused stub)
-        ctypes.POINTER(ctypes.c_int),      # birth_round (unused stub)
-        ctypes.POINTER(ctypes.c_int),      # family_id (unused stub)
+        ctypes.POINTER(ctypes.c_int),      # parent1
+        ctypes.POINTER(ctypes.c_int),      # parent2
+        ctypes.POINTER(ctypes.c_int),      # birth_round
+        ctypes.POINTER(ctypes.c_int),      # family_id
+        ctypes.POINTER(ctypes.c_float),    # family_fitness
+        ctypes.POINTER(ctypes.c_float),    # breeding_value
+        ctypes.POINTER(ctypes.c_float),    # ancestor_credit
     ]
     lib.pool_export.restype = None
 
@@ -111,10 +114,13 @@ def _get_pool_lib():
         ctypes.POINTER(ctypes.c_int),      # rounds_since_last_use
         ctypes.POINTER(ctypes.c_float),    # credits
         ctypes.POINTER(ctypes.c_uint8),    # is_base
-        ctypes.POINTER(ctypes.c_int),      # parent1  (unused stub)
-        ctypes.POINTER(ctypes.c_int),      # parent2  (unused stub)
-        ctypes.POINTER(ctypes.c_int),      # birth_round (unused stub)
-        ctypes.POINTER(ctypes.c_int),      # family_id (unused stub)
+        ctypes.POINTER(ctypes.c_int),      # parent1
+        ctypes.POINTER(ctypes.c_int),      # parent2
+        ctypes.POINTER(ctypes.c_int),      # birth_round
+        ctypes.POINTER(ctypes.c_int),      # family_id
+        ctypes.POINTER(ctypes.c_float),    # family_fitness
+        ctypes.POINTER(ctypes.c_float),    # breeding_value
+        ctypes.POINTER(ctypes.c_float),    # ancestor_credit
         ctypes.c_int,                      # P
         ctypes.POINTER(ctypes.c_int),      # active_indices
     ]
@@ -145,9 +151,33 @@ class Hypothesis:
         self.credit                = 0.0
         self.is_base               = False
 
+        self.parent1         = -1
+        self.parent2         = -1
+        self.birth_round     = 0
+        self.family_id       = -1
+        self.family_fitness  = 0.0
+        self.breeding_value  = 0.0
+        self.ancestor_credit = 0.0
+
         # projection cache (cleared before pickling)
         self.full_cache = None
         self.thresholds = None
+
+    @property
+    def fitness(self) -> float:
+        return self.credit
+
+    @fitness.setter
+    def fitness(self, val: float):
+        self.credit = val
+
+    @property
+    def score(self) -> float:
+        return self.credit
+
+    @score.setter
+    def score(self, val: float):
+        self.credit = val
 
     def complexity(self):
         if self.hyp_type == "product":
@@ -338,7 +368,13 @@ class HypForgePool:
         rounds_since_last_use = np.zeros(H, dtype=np.int32)
         credits               = np.zeros(H, dtype=np.float32)
         is_base               = np.zeros(H, dtype=np.uint8)
-        _stub_i               = np.zeros(H, dtype=np.int32)
+        parent1               = np.zeros(H, dtype=np.int32)
+        parent2               = np.zeros(H, dtype=np.int32)
+        birth_round           = np.zeros(H, dtype=np.int32)
+        family_id             = np.zeros(H, dtype=np.int32)
+        family_fitness        = np.zeros(H, dtype=np.float32)
+        breeding_value        = np.zeros(H, dtype=np.float32)
+        ancestor_credit       = np.zeros(H, dtype=np.float32)
 
         lib.pool_export(
             self._handle,
@@ -350,10 +386,13 @@ class HypForgePool:
             self._pi(rounds_since_last_use),
             self._pf(credits),
             self._pu8(is_base),
-            self._pi(_stub_i),  # parent1  — stub
-            self._pi(_stub_i),  # parent2  — stub
-            self._pi(_stub_i),  # birth_round — stub
-            self._pi(_stub_i),  # family_id — stub
+            self._pi(parent1),
+            self._pi(parent2),
+            self._pi(birth_round),
+            self._pi(family_id),
+            self._pf(family_fitness),
+            self._pf(breeding_value),
+            self._pf(ancestor_credit),
         )
 
         active_indices = np.zeros(P, dtype=np.int32)
@@ -379,6 +418,13 @@ class HypForgePool:
             h.rounds_since_last_use = int(rounds_since_last_use[p])
             h.credit                = float(credits[p])
             h.is_base               = bool(is_base[p])
+            h.parent1               = int(parent1[p])
+            h.parent2               = int(parent2[p])
+            h.birth_round           = int(birth_round[p])
+            h.family_id             = int(family_id[p])
+            h.family_fitness        = float(family_fitness[p])
+            h.breeding_value        = float(breeding_value[p])
+            h.ancestor_credit       = float(ancestor_credit[p])
             py_history.append(h)
 
         return [py_history[idx] for idx in active_indices if 0 <= idx < H]
@@ -412,7 +458,13 @@ class HypForgePool:
         rounds_since_last_use = np.zeros(U, dtype=np.int32)
         credits               = np.zeros(U, dtype=np.float32)
         is_base               = np.zeros(U, dtype=np.uint8)
-        _stub_i               = np.full(U, -1, dtype=np.int32)
+        parent1               = np.full(U, -1, dtype=np.int32)
+        parent2               = np.full(U, -1, dtype=np.int32)
+        birth_round           = np.zeros(U, dtype=np.int32)
+        family_id             = np.full(U, -1, dtype=np.int32)
+        family_fitness        = np.zeros(U, dtype=np.float32)
+        breeding_value        = np.zeros(U, dtype=np.float32)
+        ancestor_credit       = np.zeros(U, dtype=np.float32)
 
         for u, h in enumerate(unique_hyps):
             types[u] = type_map[h.hyp_type]
@@ -428,6 +480,13 @@ class HypForgePool:
             rounds_since_last_use[u] = h.rounds_since_last_use
             credits[u]               = h.credit
             is_base[u]               = 1 if h.is_base else 0
+            parent1[u]               = h.parent1
+            parent2[u]               = h.parent2
+            birth_round[u]           = h.birth_round
+            family_id[u]             = h.family_id
+            family_fitness[u]        = getattr(h, "family_fitness", 0.0)
+            breeding_value[u]        = getattr(h, "breeding_value", 0.0)
+            ancestor_credit[u]       = getattr(h, "ancestor_credit", 0.0)
 
         P              = len(py_pop)
         active_indices = np.array([id_to_idx[id(h)] for h in py_pop], dtype=np.int32)
@@ -446,10 +505,13 @@ class HypForgePool:
             self._pi(rounds_since_last_use),
             self._pf(credits),
             self._pu8(is_base),
-            self._pi(_stub_i),  # parent1
-            self._pi(_stub_i),  # parent2
-            self._pi(_stub_i),  # birth_round
-            self._pi(_stub_i),  # family_id
+            self._pi(parent1),
+            self._pi(parent2),
+            self._pi(birth_round),
+            self._pi(family_id),
+            self._pf(family_fitness),
+            self._pf(breeding_value),
+            self._pf(ancestor_credit),
             P,
             self._pi(active_indices),
         )

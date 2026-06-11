@@ -85,6 +85,15 @@ def _get_lib():
     ]
     lib.bfstree_from_arrays.restype = ctypes.c_void_p
 
+    lib.bfstree_get_D.argtypes = [ctypes.c_void_p]
+    lib.bfstree_get_D.restype = ctypes.c_int
+
+    lib.bfstree_get_split_weights.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)]
+    lib.bfstree_get_split_weights.restype = None
+
+    lib.bfstree_set_split_weights.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
+    lib.bfstree_set_split_weights.restype = None
+
     _lib = lib
     return lib
 
@@ -164,6 +173,16 @@ class BFSTree:
             leaf_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             is_leaf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         )
+        D = 0
+        split_weights = None
+        if hasattr(lib, "bfstree_get_D"):
+            D = lib.bfstree_get_D(self._handle)
+            if D > 0:
+                split_weights = np.empty(n_nodes * D, dtype=np.float32)
+                lib.bfstree_get_split_weights(
+                    self._handle,
+                    split_weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                )
         return {
             "handle":    "serialized",
             "K":          K,
@@ -173,6 +192,8 @@ class BFSTree:
             "threshold":  threshold,
             "leaf_vals":  leaf_vals,
             "is_leaf":    is_leaf,
+            "D":          D,
+            "split_weights": split_weights,
         }
 
     def __setstate__(self, state):
@@ -190,6 +211,14 @@ class BFSTree:
             s["is_leaf"].ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             s["n_nodes"], s["K"], s["max_depth"],
         )
+        D = s.get("D", 0)
+        split_weights = s.get("split_weights", None)
+        if D > 0 and split_weights is not None and hasattr(lib, "bfstree_set_split_weights"):
+            lib.bfstree_set_split_weights(
+                self._handle,
+                D,
+                split_weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            )
 
     def __del__(self):
         if self._handle is not None:
