@@ -152,9 +152,10 @@ def evaluate_one(
         y_proba = None
     infer_time = time.perf_counter() - t0
 
-    # Clip proba for numerical stability
+    # Clip proba for numerical stability and re-normalize to sum to 1
     if y_proba is not None:
         y_proba = np.clip(y_proba, 1e-7, 1 - 1e-7)
+        y_proba /= y_proba.sum(axis=1, keepdims=True)
 
     labels = np.arange(n_classes)
     cm = confusion_matrix(y_test, y_pred, labels=labels)
