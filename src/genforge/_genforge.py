@@ -44,8 +44,10 @@ def _get_genforge_lib():
         ctypes.c_float,   # inherited_rp_ratio
         ctypes.c_float,   # mutation_rate
         ctypes.c_float,   # mutation_strength
+        ctypes.c_int,     # seed
         _pf,              # out_pred [N, K]  (may be NULL)
     ]
+
     lib.gf_build.restype = ctypes.c_void_p
 
     lib.gf_predict.argtypes = [
@@ -365,6 +367,7 @@ class GenforgeContext:
         inherited_rp_ratio: float = 1.0,
         mutation_rate: float = 0.1,
         mutation_strength: float = 0.5,
+        seed: int = 42,
     ) -> tuple[GenforgeTree, np.ndarray]:
         """One boosting round → (fitted tree, predictions for all N rows)."""
         if self._handle is None:
@@ -382,8 +385,10 @@ class GenforgeContext:
             ctypes.c_float(inherited_rp_ratio),
             ctypes.c_float(mutation_rate),
             ctypes.c_float(mutation_strength),
+            ctypes.c_int(seed),
             _fptr(out_pred),
         )
+
         tree = GenforgeTree._from_handle(handle, K, max_depth, reg_lambda)
         return tree, out_pred
 

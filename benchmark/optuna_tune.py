@@ -222,11 +222,9 @@ def tune_genforge(X_train, y_train, X_val, y_val, n_classes, n_trials):
     return study.best_params
 
 
-def main():
-    args = parse_args()
-    
+def tune_dataset(dataset_name: str, trials: int, subset_size: int):
     X_train, y_train, X_val, y_val, X_test, y_test, n_classes = get_data(
-        args.dataset, args.subset_size
+        dataset_name, subset_size
     )
     
     results = {}
@@ -237,31 +235,37 @@ def main():
         except Exception:
             pass
 
-    if args.dataset not in results:
-        results[args.dataset] = {}
+    if dataset_name not in results:
+        results[dataset_name] = {}
 
     # Run tuners
     t0 = time.perf_counter()
-    xgb_best = tune_xgboost(X_train, y_train, X_val, y_val, n_classes, args.trials)
-    results[args.dataset]["XGBoost"] = xgb_best
+    xgb_best = tune_xgboost(X_train, y_train, X_val, y_val, n_classes, trials)
+    results[dataset_name]["XGBoost"] = xgb_best
     
-    lgb_best = tune_lightgbm(X_train, y_train, X_val, y_val, n_classes, args.trials)
-    results[args.dataset]["LightGBM"] = lgb_best
+    lgb_best = tune_lightgbm(X_train, y_train, X_val, y_val, n_classes, trials)
+    results[dataset_name]["LightGBM"] = lgb_best
     
-    cb_best = tune_catboost(X_train, y_train, X_val, y_val, n_classes, args.trials)
-    results[args.dataset]["CatBoost"] = cb_best
+    cb_best = tune_catboost(X_train, y_train, X_val, y_val, n_classes, trials)
+    results[dataset_name]["CatBoost"] = cb_best
     
-    gf_best = tune_genforge(X_train, y_train, X_val, y_val, n_classes, args.trials)
-    results[args.dataset]["GenForge"] = gf_best
+    gf_best = tune_genforge(X_train, y_train, X_val, y_val, n_classes, trials)
+    results[dataset_name]["GenForge"] = gf_best
     
     total_time = time.perf_counter() - t0
-    print(f"\nHyperparameter tuning completed in {total_time:.1f} seconds.")
+    print(f"\n[{dataset_name}] Hyperparameter tuning completed in {total_time:.1f} seconds.")
 
     # Save to file
     with open(BEST_PARAMS_FILE, "w") as f:
         json.dump(results, f, indent=4)
-    print(f"Saved best parameters to {BEST_PARAMS_FILE}")
+    print(f"[{dataset_name}] Saved best parameters to {BEST_PARAMS_FILE}")
+
+
+def main():
+    args = parse_args()
+    tune_dataset(args.dataset, args.trials, args.subset_size)
 
 
 if __name__ == "__main__":
     main()
+

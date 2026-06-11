@@ -52,11 +52,11 @@ def run_cat_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
             X_train_enc, X_test_enc = _encode_cats(X_train, X_test, cat_idx)
 
             models = {
-                "XGBoost":        _make_xgboost(n_classes),
-                "LightGBM":       _make_lightgbm(n_classes),
-                "CatBoost":       _make_catboost(cat_idx),
-                "GenForge":       _make_genforge_plain(cat_idx),
-                "GenForge-balanced": _make_genforge(cat_idx),
+                "XGBoost":        _make_xgboost(n_classes, random_state=rep),
+                "LightGBM":       _make_lightgbm(n_classes, random_state=rep),
+                "CatBoost":       _make_catboost(cat_idx, random_state=rep),
+                "GenForge":       _make_genforge_plain(cat_idx, random_state=rep),
+                "GenForge-balanced": _make_genforge(cat_idx, random_state=rep),
             }
             for mname, model in models.items():
                 print(f"  Rep {rep+1}/{n_reps} card={cardinality} {mname} ...", end="", flush=True)

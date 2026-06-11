@@ -23,10 +23,4 @@ struct BFSTree {
   std::vector<std::unordered_map<int, float>> cat_ranks;  // [D_cat]: raw value → rank
 };
 
-// Best-first oblique tree builder (implemented in bfstree.cpp).
-// hyp_caches[p] points to float[N_full] projection values for hypothesis p.
-BFSTree* bfs_build_best_first(const float* const* hyp_caches, int P,
-                               const std::vector<int>& train_indices,
-                               const float* G_full, const float* H_full,
-                               int K, int max_depth, int min_split,
-                               int min_leaf, float reg_lambda);
+

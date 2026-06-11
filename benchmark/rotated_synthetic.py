@@ -58,11 +58,11 @@ def run_rotation_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
                 X, y, test_size=0.2, random_state=rep
             )
             models = {
-                "XGBoost":        _make_xgboost(n_classes),
-                "LightGBM":       _make_lightgbm(n_classes),
-                "CatBoost":       _make_catboost(None),
-                "GenForge":       _make_genforge_plain(None),
-                "GenForge-balanced": _make_genforge(None),
+                "XGBoost":        _make_xgboost(n_classes, random_state=rep),
+                "LightGBM":       _make_lightgbm(n_classes, random_state=rep),
+                "CatBoost":       _make_catboost(None, random_state=rep),
+                "GenForge":       _make_genforge_plain(None, random_state=rep),
+                "GenForge-balanced": _make_genforge(None, random_state=rep),
             }
             for mname, model in models.items():
                 print(f"  Rep {rep+1}/{n_reps} strength={strength} {mname} ...", end="", flush=True)

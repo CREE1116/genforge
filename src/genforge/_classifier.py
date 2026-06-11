@@ -319,8 +319,10 @@ class GenforgeClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                     G_w, H_w, tree_sub, self.max_depth, self.reg_lambda,
                     inherited_rp_ratio=self.inherited_rp_ratio,
                     mutation_rate=self.mutation_rate,
-                    mutation_strength=self.mutation_strength
+                    mutation_strength=self.mutation_strength,
+                    seed=int(rng.integers(1 << 30)),
                 )
+
                 self.trees_.append(t)
                 Fsc += self.learning_rate * out_pred
 

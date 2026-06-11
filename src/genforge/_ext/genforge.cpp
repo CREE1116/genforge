@@ -228,7 +228,8 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                                const float* H, int K, const int* sub, int Ns,
                                int max_depth, float reg_lambda,
                                float inherited_rp_ratio, float mutation_rate,
-                               float mutation_strength, float* out_pred) {
+                               float mutation_strength, int seed, float* out_pred) {
+
   (void)X;
   auto* ctx = static_cast<GenforgeCtx*>(ctx_handle);
   const int D = ctx->D, D_num = ctx->D_num, D_cat = ctx->D_cat, N = ctx->N;
@@ -440,6 +441,25 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 
   std::vector<std::vector<int>> node_samp(max_nodes);
   std::vector<std::vector<float>> node_hist(max_nodes);
+  std::vector<std::vector<float>> hist_pool;
+
+  auto get_hist = [&]() -> std::vector<float> {
+    if (!hist_pool.empty()) {
+      auto h = std::move(hist_pool.back());
+      hist_pool.pop_back();
+      std::fill(h.begin(), h.end(), 0.0f);
+      return h;
+    }
+    return std::vector<float>(HSZ, 0.0f);
+  };
+
+  auto recycle_hist = [&](std::vector<float>& h) {
+    if (h.size() == HSZ) {
+      hist_pool.push_back(std::move(h));
+    }
+    h.clear();
+  };
+
   std::vector<float> node_G((size_t)max_nodes * K, 0.0f);
   std::vector<float> node_H((size_t)max_nodes * K, 0.0f);
   std::vector<float> node_P(max_nodes, 0.0f);
@@ -606,7 +626,8 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     }
 
     std::vector<std::vector<float>> dirs;
-    std::mt19937 rng(42 + t);
+    std::mt19937 rng(seed + t);
+
 
     std::vector<float> prob(D);
     for (int d = 0; d < D; d++) {
@@ -749,11 +770,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       for (int r = 0; r < n_global; r++) {
         std::vector<float> w_rand(D, 0.0f);
         float norm = 0.0f;
+        int nz_count = 0;
         for (int f = 0; f < D; f++) {
-          if (dist(rng) < prob_nonzero) {
+          if (nz_count < D_SUB_MAX && dist(rng) < prob_nonzero) {
             float val = (sign_dist(rng) == 0) ? 1.0f : -1.0f;
             w_rand[f] = val;
             norm += val * val;
+            nz_count++;
           }
         }
         norm = std::sqrt(norm);
@@ -767,6 +790,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           dirs.push_back(std::move(w_rand));
         }
       }
+
     } else {
       for (int r = 0; r < 24; r++) {
         int L = len_dist(rng);
@@ -807,11 +831,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       for (int r = 0; r < 8; r++) {
         std::vector<float> w_rand(D, 0.0f);
         float norm = 0.0f;
+        int nz_count = 0;
         for (int f = 0; f < D; f++) {
-          if (dist(rng) < prob_nonzero) {
+          if (nz_count < D_SUB_MAX && dist(rng) < prob_nonzero) {
             float val = (sign_dist(rng) == 0) ? 1.0f : -1.0f;
             w_rand[f] = val;
             norm += val * val;
+            nz_count++;
           }
         }
         norm = std::sqrt(norm);
@@ -825,6 +851,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           dirs.push_back(std::move(w_rand));
         }
       }
+
     }
 
     {
@@ -1118,7 +1145,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   // ── Best-first growth loop ───────────────────────────────────────────────
   node_samp[0].assign(sub, sub + Ns);
   {
-    node_hist[0].assign(HSZ, 0.0f);
+    node_hist[0] = get_hist();
     accumulate_hist(sub, Ns, node_hist[0].data(), &node_P[0]);
   }
 
@@ -1137,7 +1164,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       int t_small = self_small ? t_node : sib;
       int t_large = self_small ? sib : t_node;
 
-      node_hist[t_small].assign(HSZ, 0.0f);
+      node_hist[t_small] = get_hist();
       float* GF_RESTRICT hs = node_hist[t_small].data();
       accumulate_hist(node_samp[t_small].data(), (int)node_samp[t_small].size(),
                       hs, nullptr);
@@ -1152,10 +1179,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       oblique_done[t_node] = 1;
       (void)ag;
       if (g2 <= 0.0f) {
-        node_hist[t_node].clear();
-        node_hist[t_node].shrink_to_fit();
+        recycle_hist(node_hist[t_node]);
         continue;
       }
+
       if (!frontier.empty() && g2 < frontier.top().first) {
         frontier.push({g2, t_node});
         continue;
@@ -1287,14 +1314,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         if (node_P[child] > 0.0f) frontier.push({node_P[child], child});
       }
     } else {
-      node_hist[t_node].clear();
-      node_hist[t_node].shrink_to_fit();
+      recycle_hist(node_hist[t_node]);
     }
   }
   for (int t = 0; t < max_nodes; t++) {
-    node_hist[t].clear();
-    node_hist[t].shrink_to_fit();
+    recycle_hist(node_hist[t]);
   }
+
 
   // ── Leaves smoothing ─────────────────────────────────────────────────────
   {
@@ -1375,7 +1401,8 @@ GF_API void* gf_build_oneshot(const float* X, int N, int D, int D_num,
   (void)seed;
   void* ctx = gf_ctx_create(X, N, D, D_num, sub, Ns);
   void* tree = gf_build(ctx, X, G, H, K, sub, Ns, max_depth, reg_lambda,
-                              1.0f, 0.1f, 0.5f, out_pred);
+                              1.0f, 0.1f, 0.5f, (int)seed, out_pred);
+
   gf_ctx_free(ctx);
   return tree;
 }
