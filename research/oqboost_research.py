@@ -213,6 +213,7 @@ class OQBoostResearchTree:
         n_inherit: int = 4,   # inherited candidates in 'mutate' mode (continuity family)
         dir_cache: Optional[list] = None,
         winning_history: Optional[list] = None,
+        diversity_mode: str = 'iid',  # 'iid' | 'pobs' | 'pobs_sis'
     ):
         self.max_depth = max_depth
         self.reg_lambda = reg_lambda
@@ -232,6 +233,7 @@ class OQBoostResearchTree:
         self.n_inherit = n_inherit
         self.dir_cache = dir_cache
         self.winning_history = winning_history
+        self.diversity_mode = diversity_mode
 
         self.root_: Optional[Node] = None
         self.split_records_: list[SplitRecord] = []
@@ -850,23 +852,65 @@ class OQBoostResearchTree:
                 if c is not None:
                     candidates.append(c)
 
-        # 4. Sparse random directions (diversity family) — parent-independent,
-        # mirrors the C++ engine's global random pool: ±1 entries with
-        # P(nonzero) = 1/√D, unit-normalized.
+        # 4. Diversity family — parent-independent random directions.
         if self.n_random > 0:
-            p_nz = 1.0 / max(2.0, math.sqrt(D))
-            for _ in range(self.n_random):
-                mask = torch.rand(D, device=X_node.device) < p_nz
-                if not mask.any():
-                    mask[torch.randint(D, (1,), device=X_node.device)] = True
-                w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
-                signs = torch.where(
-                    torch.rand(int(mask.sum()), device=X_node.device) < 0.5,
-                    -1.0, 1.0,
-                )
-                w_r[mask] = signs.to(X_node.dtype)
-                w_r = w_r / w_r.norm()
-                candidates.append((w_r, 'random'))
+            if self.diversity_mode == 'pobs':
+                # User-spec POBS: Haar-random orthogonal block, columns
+                # sliced as candidates, then a random sparsity mask.
+                # NOTE: masking + renormalization BREAKS the orthogonality
+                # of the block — kept faithful to the spec for comparison.
+                K_nz = max(2, int(round(math.sqrt(D))))
+                need = self.n_random
+                while need > 0:
+                    A = torch.randn(D, D, device=X_node.device)
+                    Q, _ = torch.linalg.qr(A)
+                    take = min(need, D)
+                    for ci in range(take):
+                        w_r = Q[:, ci].clone()
+                        keep = torch.randperm(D, device=X_node.device)[:K_nz]
+                        m = torch.zeros(D, dtype=torch.bool,
+                                        device=X_node.device)
+                        m[keep] = True
+                        w_r[~m] = 0.0
+                        n = float(w_r.norm())
+                        if n > 1e-8:
+                            candidates.append((w_r / n, 'random'))
+                    need -= take
+            elif self.diversity_mode == 'pobs_sis':
+                # Refined POBS: sample a SIS-weighted support S of size K,
+                # then a K×K orthogonal block ON S — sparsity and exact
+                # orthogonality coexist, and the support stays
+                # gradient-informed.
+                K_nz = max(2, min(int(round(math.sqrt(D))), D))
+                probs = scores + 1e-6
+                need = self.n_random
+                while need > 0:
+                    S = torch.multinomial(probs, K_nz, replacement=False)
+                    A = torch.randn(K_nz, K_nz, device=X_node.device)
+                    Q, _ = torch.linalg.qr(A)
+                    take = min(need, K_nz)
+                    for ci in range(take):
+                        w_r = torch.zeros(D, dtype=X_node.dtype,
+                                          device=X_node.device)
+                        w_r[S] = Q[:, ci]
+                        candidates.append((w_r, 'random'))
+                    need -= take
+            else:
+                # iid sparse random — mirrors the C++ engine's global pool:
+                # ±1 entries with P(nonzero) = 1/√D, unit-normalized.
+                p_nz = 1.0 / max(2.0, math.sqrt(D))
+                for _ in range(self.n_random):
+                    mask = torch.rand(D, device=X_node.device) < p_nz
+                    if not mask.any():
+                        mask[torch.randint(D, (1,), device=X_node.device)] = True
+                    w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    signs = torch.where(
+                        torch.rand(int(mask.sum()), device=X_node.device) < 0.5,
+                        -1.0, 1.0,
+                    )
+                    w_r[mask] = signs.to(X_node.dtype)
+                    w_r = w_r / w_r.norm()
+                    candidates.append((w_r, 'random'))
 
         # Cone probe (mechanism study): with matched budgets, which cone
         # around the parent direction holds the best split gain?
@@ -1023,6 +1067,7 @@ class OQBoostResearch:
         noise_strategy: str = 'uniform',
         n_random: int = 0,
         n_inherit: int = 4,
+        diversity_mode: str = 'iid',
     ):
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
@@ -1043,6 +1088,7 @@ class OQBoostResearch:
         self.noise_strategy = noise_strategy
         self.n_random = n_random
         self.n_inherit = n_inherit
+        self.diversity_mode = diversity_mode
 
         if device == 'auto':
             if torch.cuda.is_available():
@@ -1117,6 +1163,7 @@ class OQBoostResearch:
                 n_inherit=self.n_inherit,
                 dir_cache=self.dir_cache_,
                 winning_history=self.winning_history_,
+                diversity_mode=self.diversity_mode,
             )
 
             # Build on subsample; predict on full X for F update
