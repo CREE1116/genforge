@@ -1453,9 +1453,17 @@ struct GFCompactNode {
 
 // Ensemble predict on RAW X: out_pred must be pre-filled with F_init by the
 // caller; each tree's leaf values are accumulated scaled by lr.
-// The numeric NaN transform is shared across trees (na_means are identical
-// within one boosting run); only categorical columns are re-encoded per tree
-// (gradient-rank maps differ per round).
+//
+// Layout: trees are processed in tiles of TILE; within a tile ONE parallel
+// region walks the rows and routes each row through all tile trees while its
+// features sit in L1. vs the old per-tree sweep this divides the N×D memory
+// traffic and the fork/join count by TILE (~2× wall on numeric data).
+//
+// Categorical columns: the per-tree gradient-rank maps share one key set
+// (they are refit on the same training categories every round), so raw
+// values are hash-looked-up ONCE into dense codes and each tree contributes
+// a flat rank table indexed by code — array gathers replace per-tree×per-row
+// hash finds (~4× on cat-heavy data).
 GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
                                 const float* X, int N, int K, float lr,
                                 float* out_pred) {
@@ -1467,11 +1475,13 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
     if (tr) trees.push_back(tr);
   }
   if (trees.empty()) return;
+  const int n_live = (int)trees.size();
   const int D = trees[0]->D;
   const int D_num = trees[0]->D_num;
   const bool has_meta = (int)trees[0]->na_means.size() == D;
   const int D_cat = has_meta ? (D - D_num) : 0;
 
+  // Shared numeric transform (na_means identical across one run's trees).
   std::vector<float> Xt((size_t)N * D);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -1486,32 +1496,72 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
     }
   }
 
-  std::vector<GFCompactNode> nodes;
-  std::vector<float> leaf_vals;
-  std::vector<int> heap_of;  // compact id → heap id (BFS order)
-  heap_of.reserve(256);
-  nodes.reserve(256);
-  leaf_vals.reserve(256 * K);
-
-  for (const OQTree* tr : trees) {
-    // ── compact the live subtree (BFS from root) ────────────────────────────
-    heap_of.clear();
-    heap_of.push_back(0);
-    for (size_t q = 0; q < heap_of.size(); q++) {
-      int h = heap_of[q];
-      if (!tr->is_leaf[h]) {
-        heap_of.push_back(2 * h + 1);
-        heap_of.push_back(2 * h + 2);
+  // ── one-time categorical code assignment (raw id → dense code) ──────────
+  // Per column: codes 0..card-1 follow trees[0]'s key set; card is the
+  // NaN/unseen slot. codes[i·D_cat+fc] is then a direct index into every
+  // tree's rank table.
+  std::vector<int32_t> cat_card(D_cat, 0);
+  std::vector<int32_t> codes;
+  std::vector<std::unordered_map<int, int32_t>> raw2code(D_cat);
+  if (D_cat > 0) {
+    for (int fc = 0; fc < D_cat; fc++) {
+      if (fc >= (int)trees[0]->cat_ranks.size()) continue;
+      const auto& m = trees[0]->cat_ranks[fc];
+      raw2code[fc].reserve(m.size() * 2);
+      int32_t next = 0;
+      for (const auto& kv : m) raw2code[fc][kv.first] = next++;
+      cat_card[fc] = next;
+    }
+    codes.assign((size_t)N * D_cat, 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < N; i++) {
+      const float* GF_RESTRICT xi = X + (size_t)i * D;
+      int32_t* GF_RESTRICT ci = codes.data() + (size_t)i * D_cat;
+      for (int fc = 0; fc < D_cat; fc++) {
+        float v = xi[D_num + fc];
+        int32_t c = cat_card[fc];  // NaN / unseen slot
+        if (!std::isnan(v)) {
+          auto it = raw2code[fc].find((int)std::lrintf(v));
+          if (it != raw2code[fc].end()) c = it->second;
+        }
+        ci[fc] = c;
       }
     }
-    const int M = (int)heap_of.size();
-    nodes.resize(M);
-    std::fill(nodes.begin(), nodes.end(), GFCompactNode{});
-    leaf_vals.resize((size_t)M * K);
-    std::fill(leaf_vals.begin(), leaf_vals.end(), 0.0f);
-    {
-      // BFS order ⇒ children appear after parents; rebuild child links.
-      std::vector<std::pair<int, int>> stack;  // (heap id, compact id)
+  }
+
+  static constexpr int TILE = 16;
+  std::vector<std::vector<GFCompactNode>> tile_nodes(TILE);
+  std::vector<std::vector<float>> tile_leaves(TILE);
+  // Per (tile tree, cat col): flat rank table indexed by dense code; the
+  // last entry (code == card) is the tree's NaN/unseen fallback.
+  std::vector<std::vector<float>> tile_rank(D_cat > 0 ? (size_t)TILE * D_cat
+                                                      : 0);
+  std::vector<int> heap_of;
+  heap_of.reserve(256);
+
+  for (int tile_lo = 0; tile_lo < n_live; tile_lo += TILE) {
+    const int tn = std::min(TILE, n_live - tile_lo);
+
+    for (int tt = 0; tt < tn; tt++) {
+      const OQTree* tr = trees[tile_lo + tt];
+
+      // ── compact the live subtree (BFS from root) ───────────────────────
+      heap_of.clear();
+      heap_of.push_back(0);
+      for (size_t q = 0; q < heap_of.size(); q++) {
+        int h = heap_of[q];
+        if (!tr->is_leaf[h]) {
+          heap_of.push_back(2 * h + 1);
+          heap_of.push_back(2 * h + 2);
+        }
+      }
+      const int M = (int)heap_of.size();
+      auto& nodes = tile_nodes[tt];
+      auto& leaf_vals = tile_leaves[tt];
+      nodes.assign(M, GFCompactNode{});
+      leaf_vals.assign((size_t)M * K, 0.0f);
       int next = 1;
       for (int c = 0; c < M; c++) {
         int h = heap_of[c];
@@ -1527,44 +1577,55 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
           next += 2;
         }
       }
-    }
 
-    if (D_cat > 0) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-      for (int i = 0; i < N; i++) {
-        const float* GF_RESTRICT xi = X + (size_t)i * D;
-        float* GF_RESTRICT ti = Xt.data() + (size_t)i * D;
-        for (int fc = 0; fc < D_cat; fc++) {
-          int f = D_num + fc;
-          float v = xi[f];
-          if (std::isnan(v) || fc >= (int)tr->cat_ranks.size()) {
-            ti[f] = tr->na_means[f];
-          } else {
-            const auto& m = tr->cat_ranks[fc];
-            auto it = m.find((int)std::lrintf(v));
-            ti[f] = (it != m.end()) ? it->second : tr->na_means[f];
+      // ── per-tree rank tables (code → encoded value) ─────────────────────
+      for (int fc = 0; fc < D_cat; fc++) {
+        auto& tbl = tile_rank[(size_t)tt * D_cat + fc];
+        tbl.assign((size_t)cat_card[fc] + 1, tr->na_means[D_num + fc]);
+        if (fc < (int)tr->cat_ranks.size()) {
+          for (const auto& kv : tr->cat_ranks[fc]) {
+            auto it = raw2code[fc].find(kv.first);
+            if (it != raw2code[fc].end()) tbl[it->second] = kv.second;
           }
         }
       }
     }
 
-    const GFCompactNode* GF_RESTRICT nd = nodes.data();
-    const float* GF_RESTRICT lvals = leaf_vals.data();
+    // ── route every row through all tile trees while it is cache-hot ─────
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel
 #endif
-    for (int i = 0; i < N; i++) {
-      const float* GF_RESTRICT ti = Xt.data() + (size_t)i * D;
-      int n = 0;
-      while (nd[n].left >= 0) {
-        float proj = sparse_dot_stack(nd[n].nz, ti);
-        n = (proj < nd[n].thr) ? nd[n].left : nd[n].right;
+    {
+      std::vector<float> row(D_cat > 0 ? D : 0);
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int i = 0; i < N; i++) {
+        const float* GF_RESTRICT ti = Xt.data() + (size_t)i * D;
+        float* GF_RESTRICT oi = out_pred + (size_t)i * K;
+        const float* rp = ti;
+        if (D_cat > 0) {
+          std::memcpy(row.data(), ti, (size_t)D * sizeof(float));
+          rp = row.data();
+        }
+        const int32_t* GF_RESTRICT ci =
+            D_cat > 0 ? codes.data() + (size_t)i * D_cat : nullptr;
+        for (int tt = 0; tt < tn; tt++) {
+          if (D_cat > 0) {
+            const auto* tbl0 = tile_rank.data() + (size_t)tt * D_cat;
+            for (int fc = 0; fc < D_cat; fc++)
+              row[D_num + fc] = tbl0[fc][ci[fc]];
+          }
+          const GFCompactNode* GF_RESTRICT nd = tile_nodes[tt].data();
+          int n = 0;
+          while (nd[n].left >= 0) {
+            float proj = sparse_dot_stack(nd[n].nz, rp);
+            n = (proj < nd[n].thr) ? nd[n].left : nd[n].right;
+          }
+          const float* lv = tile_leaves[tt].data() + (size_t)n * K;
+          for (int k = 0; k < K; k++) oi[k] += lr * lv[k];
+        }
       }
-      const float* lv = lvals + (size_t)n * K;
-      float* GF_RESTRICT oi = out_pred + (size_t)i * K;
-      for (int k = 0; k < K; k++) oi[k] += lr * lv[k];
     }
   }
 }
