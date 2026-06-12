@@ -1,23 +1,23 @@
-# GenForge
+# OQBoost
 
-**Gradient-boosted oblique decision trees with hereditary projection evolution.**
+**Gradient-boosted oblique decision trees with gradient-guided random projections.**
 
-GenForge replaces axis-aligned splits with gradient-guided oblique hyperplanes that are inherited and mutated from parent nodes — exploiting the geometric structure of the data without expensive numerical optimization.
+OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes, combining a diverse sparse-random-projection pool with a dataset-level cache of proven directions — exploiting the geometric structure of the data without expensive numerical optimization.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![CI](https://github.com/cree1116/genforge/actions/workflows/ci.yml/badge.svg)](https://github.com/cree1116/genforge/actions)
-[![PyPI](https://img.shields.io/pypi/v/genforge)](https://pypi.org/project/genforge/)
+[![CI](https://github.com/cree1116/oqboost/actions/workflows/ci.yml/badge.svg)](https://github.com/cree1116/oqboost/actions)
+[![PyPI](https://img.shields.io/pypi/v/oqboost)](https://pypi.org/project/oqboost/)
 
 ---
 
 ## Key Properties
 
-| Feature | GenForge |
+| Feature | OQBoost |
 |---------|---------|
 | Split type | Oblique (linear projection of multiple features) |
 | Direction finding | GG-SRP: gradient-guided sparse random projection |
-| Inheritance | Parent weight inheritance with depth-decayed mutation |
+| Direction reuse | Dataset-level cache of winning oblique directions (cross-tree) |
 | Missing values | Native — NaN handled via mean imputation in C++ |
 | Categorical features | Native — gradient-rank encoding per round |
 | API | scikit-learn compatible |
@@ -28,7 +28,7 @@ GenForge replaces axis-aligned splits with gradient-guided oblique hyperplanes t
 ## Install
 
 ```bash
-pip install genforge
+pip install oqboost
 ```
 
 Pre-compiled wheels are available for macOS (arm64, x86_64) and Linux (x86_64).
@@ -39,9 +39,9 @@ On unsupported platforms, `clang++` or `g++` is required to compile from source.
 ## Quickstart
 
 ```python
-from genforge import GenforgeClassifier
+from oqboost import OQBoostClassifier
 
-clf = GenforgeClassifier(
+clf = OQBoostClassifier(
     n_estimators=500,
     learning_rate=0.05,
     max_depth=6,
@@ -72,18 +72,18 @@ X = df.drop(columns=["target"])
 y = df["target"]
 
 # auto-detects pandas Categorical / object columns
-clf = GenforgeClassifier(n_estimators=500)
+clf = OQBoostClassifier(n_estimators=500)
 clf.fit(X, y)
 
 # or specify explicitly
-clf = GenforgeClassifier(cat_features=["city", "product"])
+clf = OQBoostClassifier(cat_features=["city", "product"])
 clf.fit(X, y)
 ```
 
 ### Early stopping
 
 ```python
-clf = GenforgeClassifier(n_estimators=2000, early_stopping_rounds=50)
+clf = OQBoostClassifier(n_estimators=2000, early_stopping_rounds=50)
 clf.fit(X_train, y_train, eval_set=[(X_val, y_val)])
 print(f"Stopped at {clf.get_n_trees()} trees")
 ```
@@ -92,7 +92,7 @@ print(f"Stopped at {clf.get_n_trees()} trees")
 
 ```python
 clf.save("model.joblib")
-from genforge import load_model
+from oqboost import load_model
 clf2 = load_model("model.joblib")
 ```
 
@@ -109,19 +109,19 @@ All benchmarks: 80/20 train-test split, 3 repetitions, mean reported. Default hy
 | Adult Income | XGBoost | 0.7983 | 0.8151 | 0.2748 | **0.32** | **0.003** |
 | | LightGBM | 0.8012 | 0.8180 | 0.2752 | 1.73 | 0.021 |
 | | CatBoost | 0.7965 | 0.8153 | 0.2734 | 11.11 | 0.053 |
-| | **GenForge** | **0.8444** | 0.8030 | 0.3248 | 6.17 | 0.212 |
+| | **OQBoost** | **0.8444** | 0.8030 | 0.3248 | 6.17 | 0.212 |
 | Credit Default | XGBoost | 0.6539 | 0.6795 | 0.4303 | **0.32** | **0.002** |
 | | LightGBM | 0.6605 | 0.6865 | 0.4271 | 1.68 | 0.008 |
 | | **CatBoost** | **0.6619** | **0.6879** | **0.4257** | 6.33 | 0.005 |
-| | GenForge | 0.5936 | 0.5900 | 0.4893 | 0.83 | 0.004 |
+| | OQBoost | 0.5936 | 0.5900 | 0.4893 | 0.83 | 0.004 |
 | Give Me Credit | XGBoost | 0.6496 | 0.6603 | 0.5246 | **0.28** | **0.001** |
 | | LightGBM | 0.6532 | 0.6631 | 0.5501 | 1.03 | 0.003 |
 | | CatBoost | 0.6841 | 0.6987 | **0.4919** | 0.72 | 0.001 |
-| | **GenForge** | **0.6909** | 0.6865 | 0.5241 | 0.96 | 0.044 |
+| | **OQBoost** | **0.6909** | 0.6865 | 0.5241 | 0.96 | 0.044 |
 | Rotated Synth. | XGBoost | 0.9704 | 0.9704 | 0.0978 | **2.37** | **0.017** |
 | | LightGBM | 0.9731 | 0.9731 | 0.0898 | 12.13 | 0.302 |
 | | CatBoost | 0.9759 | 0.9758 | 0.0876 | 11.71 | 0.020 |
-| | **GenForge** | **0.9782** | **0.9782** | **0.0778** | 25.16 | 0.900 |
+| | **OQBoost** | **0.9782** | **0.9782** | **0.0778** | 25.16 | 0.900 |
 | CoverType | — | — | — | — | — | — |
 | Higgs | — | — | — | — | — | — |
 
@@ -129,10 +129,10 @@ All benchmarks: 80/20 train-test split, 3 repetitions, mean reported. Default hy
 
 ### Highlights
 
-- **Best Balanced Accuracy (Adult Income):** GenForge **0.844** vs XGBoost 0.798 (+5.8 pp)
-- **Best Balanced Accuracy (Give Me Credit):** GenForge **0.691** vs XGBoost 0.650 (+6.4 pp)
-- **Best on Rotated Synthetic:** GenForge **0.978** — highest balanced accuracy AND lowest log loss; validates oblique split advantage over axis-aligned methods
-- **Credit Default:** GenForge underperforms baselines here (highly imbalanced, 3% positive rate) — an open problem; tree depth / early stopping sensitivity under extreme imbalance
+- **Best Balanced Accuracy (Adult Income):** OQBoost **0.844** vs XGBoost 0.798 (+5.8 pp)
+- **Best Balanced Accuracy (Give Me Credit):** OQBoost **0.691** vs XGBoost 0.650 (+6.4 pp)
+- **Best on Rotated Synthetic:** OQBoost **0.978** — highest balanced accuracy AND lowest log loss; validates oblique split advantage over axis-aligned methods
+- **Credit Default:** OQBoost underperforms baselines here (highly imbalanced, 3% positive rate) — an open problem; tree depth / early stopping sensitivity under extreme imbalance
 
 ### Figure 1 — Balanced Accuracy Comparison
 
@@ -158,30 +158,28 @@ All benchmarks: 80/20 train-test split, 3 repetitions, mean reported. Default hy
 
 ## Algorithm
 
-GenForge uses three-stage hereditary projection evolution:
+Every node runs a full 256-bin axis scan, then challenges it with a pool of oblique candidate directions built from two complementary sources:
 
-**Stage 1 — GG-SRP (Gradient-Guided Sparse Random Projection)**  
-Features are sampled with probability proportional to SIS gradient-importance scores. Each selected feature gets a weight sign aligned with the steepest gradient descent direction. No Gram matrix, no linear system — $O(D)$ per node.
+**Source 1 — GG-SRP (Gradient-Guided Sparse Random Projection)**  
+Features are sampled with probability proportional to SIS gradient-importance scores. Each selected feature gets a weight sign aligned with the steepest gradient descent direction. No Gram matrix, no linear system — $O(D)$ per node. Mechanism studies show this diversity pool is the essential ingredient: it widens feature coverage, and its win share grows over boosting rounds as residuals become oblique.
 
-**Stage 2 — Parent Weight Inheritance**  
-Child nodes inherit their parent's split direction and apply two mutation strategies:
-- *Strategy A:* axis-maintaining noise (tilt the boundary by ±10%)
-- *Strategy B:* new-axis borrowing (add a high-correlation feature not in the parent's support)
+**Source 2 — Direction Cache (dataset-level direction reuse)**  
+A ring buffer keeps the most recent globally winning oblique directions (up to 32). Candidates blend a cached direction with the current parent direction at a random ratio. Good oblique directions are a property of the dataset's rotated subspaces, not of any single node — so reuse happens across trees, not from parent to child.
 
-**Stage 3 — Global-Local Crossover + Depth Decay**  
-- *Strategy C:* random blend of the current parent direction with a globally top-performing direction from the ring buffer (last 32 rounds)
-- *Depth decay:* mutation strength decreases as $1/\sqrt{1 + d}$ — wide exploration at shallow depth, fine-tuning at deep nodes
+`inherited_rp_ratio` splits the candidate budget between the two sources (default 0.5). Earlier versions also mutated the parent node's own direction (Strategies "A/B"); controlled ablations showed parent-direction mutation consistently underperforms random replacement, and it was removed — see [`research/FINDINGS.md`](research/FINDINGS.md).
 
-**Ablation (internal, 100K samples, 50 features):**
+**Strategy ablation (synthetic 6k×30 / multiclass 10k×30, 5 seeds, accuracy):**
 
-| Configuration | Bal. Acc | Log Loss |
+| Inherited-slot contents | Synthetic | Multiclass |
 |--------------|---------|---------|
-| GG-SRP only | 0.96308 | 0.11101 |
-| + Parent inheritance (75%) | 0.96415 | 0.10798 |
-| + Parent inheritance (100%) | 0.96373 | 0.10382 |
-| + Crossover + Depth Decay | **0.96336** | **0.10016** |
+| Parent mutation only (removed A/B) | 0.9588–0.9620 | 0.8927–0.8986 |
+| Global random only | 0.9643 | 0.9027 |
+| Cache only | 0.9664 | 0.9002 |
+| **Cache + random (current)** | **0.9729**¹ | **0.9192**¹ |
 
-See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation.
+¹ current default `inherited_rp_ratio=0.5`, measured post-change.
+
+See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`research/FINDINGS.md`](research/FINDINGS.md) for the mechanism studies.
 
 ---
 
@@ -197,9 +195,9 @@ See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation.
 | `early_stopping_rounds` | 50 | Stop if class-weighted val loss stagnates |
 | `cat_features` | None | Categorical column names or indices |
 | `class_weight` | "balanced" | Reweight by inverse class frequency |
-| `inherited_rp_ratio` | 1.0 | Fraction of candidates from cache |
-| `mutation_rate` | 0.1 | Base noise scale for axis mutations |
-| `mutation_strength` | 0.5 | Base weight for new-axis borrowing |
+| `inherited_rp_ratio` | 0.5 | Oblique-candidate split: cache-blend vs fresh random projections |
+| `mutation_rate` | — | Deprecated, ignored (parent-mutation strategies removed) |
+| `mutation_strength` | — | Deprecated, ignored (parent-mutation strategies removed) |
 | `random_state` | None | Seed |
 | `verbose` | False | Print per-round metrics |
 
@@ -238,18 +236,16 @@ Large datasets require manual download:
 ## Repository Structure
 
 ```
-genforge/
-├── src/genforge/
+oqboost/
+├── src/oqboost/
 │   ├── __init__.py
-│   ├── _classifier.py      # GenforgeClassifier
-│   ├── _genforge.py        # C bindings + GenforgeTree, GenforgeContext
-│   ├── _tree.py            # BFSTree Python wrapper
+│   ├── _classifier.py      # OQBoostClassifier
+│   ├── _oqboost.py        # C bindings + OQBoostTree, OQBoostContext
 │   └── _ext/
-│       ├── bfstree.cpp     # BFS tree engine
-│       ├── bfstree_types.h
-│       ├── genforge.cpp    # GG-SRP + boosting round (gf_build)
-│       ├── genforge_core.h # Shared constants and helpers
-│       └── libbfstree.dylib / .so / .dll  (compiled)
+│       ├── oqboost.cpp    # full engine: boosting round, routing, serialization
+│       ├── oqboost_types.h # OQTree structure
+│       ├── oqboost_core.h # Shared constants and helpers
+│       └── liboqboost.dylib / .so / .dll  (compiled)
 ├── benchmark/
 │   ├── *.py                # Per-dataset benchmark scripts
 │   ├── _utils.py           # Shared train/eval utilities

@@ -1,4 +1,4 @@
-"""Optuna hyperparameter tuning script for XGBoost, LightGBM, CatBoost, and GenForge."""
+"""Optuna hyperparameter tuning script for XGBoost, LightGBM, CatBoost, and OQBoost."""
 from __future__ import annotations
 
 import argparse
@@ -191,11 +191,11 @@ def tune_catboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
     return study.best_params
 
 
-def tune_genforge(X_train, y_train, X_val, y_val, n_classes, n_trials):
+def tune_oqboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
     print("\n==================================================")
-    print("Tuning GenForge...")
+    print("Tuning OQBoost...")
     print("==================================================")
-    from genforge import GenforgeClassifier
+    from oqboost import OQBoostClassifier
 
     def objective(trial):
         params = {
@@ -209,7 +209,7 @@ def tune_genforge(X_train, y_train, X_val, y_val, n_classes, n_trials):
             "random_state": 42,
         }
         
-        model = GenforgeClassifier(**params)
+        model = OQBoostClassifier(**params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
         
         preds = model.predict(X_val)
@@ -218,7 +218,7 @@ def tune_genforge(X_train, y_train, X_val, y_val, n_classes, n_trials):
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
-    print(f"Best GenForge Trial: {study.best_trial.value:.4f}")
+    print(f"Best OQBoost Trial: {study.best_trial.value:.4f}")
     return study.best_params
 
 
@@ -249,8 +249,8 @@ def tune_dataset(dataset_name: str, trials: int, subset_size: int):
     cb_best = tune_catboost(X_train, y_train, X_val, y_val, n_classes, trials)
     results[dataset_name]["CatBoost"] = cb_best
     
-    gf_best = tune_genforge(X_train, y_train, X_val, y_val, n_classes, trials)
-    results[dataset_name]["GenForge"] = gf_best
+    gf_best = tune_oqboost(X_train, y_train, X_val, y_val, n_classes, trials)
+    results[dataset_name]["OQBoost"] = gf_best
     
     total_time = time.perf_counter() - t0
     print(f"\n[{dataset_name}] Hyperparameter tuning completed in {total_time:.1f} seconds.")

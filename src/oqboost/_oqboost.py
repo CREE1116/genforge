@@ -1,22 +1,69 @@
 from __future__ import annotations
 
 import ctypes
+import os
+import platform
 import numpy as np
-from ._tree import _get_lib as _get_tree_lib
 
-# ── Standalone Genforge C bindings (pool-free) ─────────────────────────────
+# ── OQBoost C bindings ───────────────────────────────────────────────────
 
-_genforge_configured = False
+_lib = None
+_EXT_DIR = os.path.join(os.path.dirname(__file__), "_ext")
 
 _pf = ctypes.POINTER(ctypes.c_float)
 _pi = ctypes.POINTER(ctypes.c_int)
+_pu8 = ctypes.POINTER(ctypes.c_uint8)
 
 
-def _get_genforge_lib():
-    global _genforge_configured
-    lib = _get_tree_lib()
-    if _genforge_configured:
-        return lib
+def _lib_filename() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        return "liboqboost.dylib"
+    elif system == "Windows":
+        return "oqboost.dll"
+    return "liboqboost.so"
+
+
+def _get_oqboost_lib():
+    global _lib
+    if _lib is not None:
+        return _lib
+
+    lib_p = os.path.join(_EXT_DIR, _lib_filename())
+    if not os.path.exists(lib_p):
+        raise FileNotFoundError(
+            f"[oqboost] Compiled C++ binary not found at {lib_p}.\n"
+            "Please build/install the package first (e.g., using `pip install .` "
+            "or `uv pip install -e .`)."
+        )
+
+    lib = ctypes.CDLL(lib_p)
+
+    # ── tree structure (de)serialization ─────────────────────────────────
+    lib.oqtree_get_K.argtypes = [ctypes.c_void_p]
+    lib.oqtree_get_K.restype = ctypes.c_int
+    lib.oqtree_get_max_depth.argtypes = [ctypes.c_void_p]
+    lib.oqtree_get_max_depth.restype = ctypes.c_int
+    lib.oqtree_get_total_nodes.argtypes = [ctypes.c_void_p]
+    lib.oqtree_get_total_nodes.restype = ctypes.c_int
+    lib.oqtree_get_D.argtypes = [ctypes.c_void_p]
+    lib.oqtree_get_D.restype = ctypes.c_int
+
+    lib.oqtree_export.argtypes = [ctypes.c_void_p, _pi, _pf, _pf, _pu8]
+    lib.oqtree_export.restype = None
+
+    lib.oqtree_from_arrays.argtypes = [
+        _pi, _pf, _pf, _pu8,
+        ctypes.c_int,  # total_nodes
+        ctypes.c_int,  # K
+        ctypes.c_int,  # max_depth
+    ]
+    lib.oqtree_from_arrays.restype = ctypes.c_void_p
+
+    lib.oqtree_get_split_weights.argtypes = [ctypes.c_void_p, _pf]
+    lib.oqtree_get_split_weights.restype = None
+    lib.oqtree_set_split_weights.argtypes = [ctypes.c_void_p, ctypes.c_int, _pf]
+    lib.oqtree_set_split_weights.restype = None
 
     lib.gf_ctx_create.argtypes = [
         _pf,           # X     [N, D]   (copied; need not stay alive)
@@ -95,7 +142,7 @@ def _get_genforge_lib():
     ]
     lib.gf_update_gradients.restype = None
 
-    _genforge_configured = True
+    _lib = lib
     return lib
 
 
@@ -109,7 +156,7 @@ def _iptr(a: np.ndarray):
 
 def update_gradients(F: np.ndarray, oh: np.ndarray, G: np.ndarray, H: np.ndarray) -> None:
     N, K = F.shape
-    lib = _get_genforge_lib()
+    lib = _get_oqboost_lib()
     lib.gf_update_gradients(
         _fptr(F),
         _fptr(oh),
@@ -135,14 +182,14 @@ def predict_ensemble(trees: list, X: np.ndarray, K: int, lr: float,
     if not handles:
         return out
     arr = (ctypes.c_void_p * len(handles))(*handles)
-    lib = _get_genforge_lib()
+    lib = _get_oqboost_lib()
     lib.gf_predict_ensemble(arr, len(handles), _fptr(X), N, K,
                             ctypes.c_float(lr), _fptr(out))
     return out
 
 
-class GenforgeTree:
-    """Single pool-free Genforge tree.
+class OQBoostTree:
+    """Single pool-free OQBoost tree.
 
     Deterministic two-hyperparameter oblique booster round: global 256-bin
     histogram axis tournament + per-node CD oblique directions, with native
@@ -198,7 +245,7 @@ class GenforgeTree:
     ) -> np.ndarray:
         """One-shot build (creates and frees a binning context internally).
 
-        For boosting loops use :class:`GenforgeContext` instead — it bins X once
+        For boosting loops use :class:`OQBoostContext` instead — it bins X once
         and reuses the codes across every round.
         """
         X = np.ascontiguousarray(X, dtype=np.float32)
@@ -215,7 +262,7 @@ class GenforgeTree:
             else:
                 subset = np.arange(N, dtype=np.int32)
 
-        ctx = GenforgeContext(X, D_num=D_num)
+        ctx = OQBoostContext(X, D_num=D_num)
         try:
             tree, out_pred = ctx.build(
                 G, H, subset, self.max_depth, self.reg_lambda,
@@ -237,11 +284,11 @@ class GenforgeTree:
         X   = np.ascontiguousarray(X, dtype=np.float32)
         N   = X.shape[0]
         out = np.zeros((N, self._K), dtype=np.float32)
-        lib = _get_genforge_lib()
+        lib = _get_oqboost_lib()
         lib.gf_predict(self._tree_handle, _fptr(X), N, self._K, _fptr(out))
         return out
 
-    # ── pickling: structure via bfstree arrays + v9 meta ─────────────────────
+    # ── pickling: structure via oqtree arrays + v9 meta ──────────────────────
 
     def __getstate__(self):
         base = {
@@ -254,22 +301,22 @@ class GenforgeTree:
         }
         if self._tree_handle is None:
             return base
-        lib     = _get_genforge_lib()
+        lib     = _get_oqboost_lib()
         h       = self._tree_handle
-        n_nodes = lib.bfstree_get_total_nodes(h)
+        n_nodes = lib.oqtree_get_total_nodes(h)
         K       = self._K
-        D       = lib.bfstree_get_D(h)
+        D       = lib.oqtree_get_D(h)
 
         hyp_idx   = np.empty(n_nodes,     dtype=np.int32)
         threshold = np.empty(n_nodes,     dtype=np.float32)
         leaf_vals = np.empty(n_nodes * K, dtype=np.float32)
         is_leaf   = np.empty(n_nodes,     dtype=np.uint8)
-        lib.bfstree_export(
+        lib.oqtree_export(
             h, _iptr(hyp_idx), _fptr(threshold), _fptr(leaf_vals),
             is_leaf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         )
         split_weights = np.empty(n_nodes * D, dtype=np.float32)
-        lib.bfstree_get_split_weights(h, _fptr(split_weights))
+        lib.oqtree_get_split_weights(h, _fptr(split_weights))
 
         sizes = np.zeros(4, dtype=np.int32)
         lib.gf_tree_meta_sizes(h, _iptr(sizes))
@@ -285,7 +332,7 @@ class GenforgeTree:
 
         base.update({
             "handle":        "serialized",
-            "tree_max_depth": lib.bfstree_get_max_depth(h),
+            "tree_max_depth": lib.oqtree_get_max_depth(h),
             "n_nodes":       n_nodes,
             "D":             D,
             "hyp_idx":       hyp_idx,
@@ -312,14 +359,14 @@ class GenforgeTree:
         self._tree_handle = None
         if state["handle"] is None:
             return
-        lib = _get_genforge_lib()
+        lib = _get_oqboost_lib()
         s   = state
-        handle = lib.bfstree_from_arrays(
+        handle = lib.oqtree_from_arrays(
             _iptr(s["hyp_idx"]), _fptr(s["threshold"]), _fptr(s["leaf_vals"]),
             s["is_leaf"].ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             s["n_nodes"], s["K"], s["tree_max_depth"],
         )
-        lib.bfstree_set_split_weights(handle, s["D"], _fptr(s["split_weights"]))
+        lib.oqtree_set_split_weights(handle, s["D"], _fptr(s["split_weights"]))
         na_means  = np.ascontiguousarray(s["na_means"],  dtype=np.float32)
         cat_sizes = np.ascontiguousarray(s["cat_sizes"], dtype=np.int32)
         cat_keys  = np.ascontiguousarray(s["cat_keys"],  dtype=np.int32)
@@ -333,13 +380,13 @@ class GenforgeTree:
     def __del__(self):
         if self._tree_handle is not None:
             try:
-                _get_genforge_lib().gf_tree_free(self._tree_handle)
+                _get_oqboost_lib().gf_tree_free(self._tree_handle)
             except Exception:
                 pass
             self._tree_handle = None
 
 
-class GenforgeContext:
+class OQBoostContext:
     """Reusable binning context for a boosting run.
 
     Bins X once (numeric: NaN-mean-imputed 256-bin codes; categorical:
@@ -352,7 +399,7 @@ class GenforgeContext:
         self.N, self.D = X.shape
         self.D_num = self.D if D_num is None else int(D_num)
         sub = np.arange(self.N, dtype=np.int32)
-        lib = _get_genforge_lib()
+        lib = _get_oqboost_lib()
         self._handle = lib.gf_ctx_create(
             _fptr(X), self.N, self.D, self.D_num, _iptr(sub), self.N
         )
@@ -368,7 +415,7 @@ class GenforgeContext:
         mutation_rate: float = 0.1,
         mutation_strength: float = 0.5,
         seed: int = 42,
-    ) -> tuple[GenforgeTree, np.ndarray]:
+    ) -> tuple[OQBoostTree, np.ndarray]:
         """One boosting round → (fitted tree, predictions for all N rows)."""
         if self._handle is None:
             raise RuntimeError("Context is closed.")
@@ -377,7 +424,7 @@ class GenforgeContext:
         sub = np.ascontiguousarray(sub, dtype=np.int32)
         K = G.shape[1]
         out_pred = np.zeros((self.N, K), dtype=np.float32)
-        lib = _get_genforge_lib()
+        lib = _get_oqboost_lib()
         handle = lib.gf_build(
             self._handle, None, _fptr(G), _fptr(H), K,
             _iptr(sub), len(sub), max_depth,
@@ -389,13 +436,13 @@ class GenforgeContext:
             _fptr(out_pred),
         )
 
-        tree = GenforgeTree._from_handle(handle, K, max_depth, reg_lambda)
+        tree = OQBoostTree._from_handle(handle, K, max_depth, reg_lambda)
         return tree, out_pred
 
     def close(self):
         if self._handle is not None:
             try:
-                _get_genforge_lib().gf_ctx_free(self._handle)
+                _get_oqboost_lib().gf_ctx_free(self._handle)
             except Exception:
                 pass
             self._handle = None

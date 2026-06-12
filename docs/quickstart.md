@@ -1,9 +1,9 @@
-# GenForge Quickstart
+# OQBoost Quickstart
 
 ## Installation
 
 ```bash
-pip install genforge
+pip install oqboost
 ```
 
 Requires a C++ compiler (`clang++` on macOS, `g++` on Linux). The compiled engine is bundled in the wheel — no compilation required for supported platforms.
@@ -13,9 +13,9 @@ Requires a C++ compiler (`clang++` on macOS, `g++` on Linux). The compiled engin
 ## Basic Usage
 
 ```python
-from genforge import GenforgeClassifier
+from oqboost import OQBoostClassifier
 
-clf = GenforgeClassifier(
+clf = OQBoostClassifier(
     n_estimators=500,
     learning_rate=0.05,
     max_depth=6,
@@ -32,7 +32,7 @@ clf.predict_proba(X_test)
 ## With Validation and Early Stopping
 
 ```python
-clf = GenforgeClassifier(
+clf = OQBoostClassifier(
     n_estimators=1000,
     early_stopping_rounds=50,
 )
@@ -52,11 +52,11 @@ X = df.drop(columns=["target"])
 y = df["target"]
 
 # Option 1: auto-detect pandas Categorical / object columns
-clf = GenforgeClassifier(n_estimators=500)
+clf = OQBoostClassifier(n_estimators=500)
 clf.fit(X, y)
 
 # Option 2: explicitly name categorical columns
-clf = GenforgeClassifier(
+clf = OQBoostClassifier(
     n_estimators=500,
     cat_features=["city", "product_type", "category"],
 )
@@ -67,7 +67,7 @@ clf.fit(X, y)
 
 ## Handling Missing Values
 
-GenForge handles NaN natively — no imputation step needed.
+OQBoost handles NaN natively — no imputation step needed.
 
 ```python
 import numpy as np
@@ -75,7 +75,7 @@ import numpy as np
 X_train[50, 3] = np.nan   # NaN is fine
 X_test[10, 7] = np.nan    # NaN in test is also fine
 
-clf = GenforgeClassifier()
+clf = OQBoostClassifier()
 clf.fit(X_train, y_train)
 clf.predict(X_test)        # NaN → column mean imputation at runtime
 ```
@@ -87,7 +87,7 @@ clf.predict(X_test)        # NaN → column mean imputation at runtime
 ```python
 clf.save("model.joblib")
 
-from genforge import load_model
+from oqboost import load_model
 clf2 = load_model("model.joblib")
 proba = clf2.predict_proba(X_test)
 ```
@@ -102,7 +102,7 @@ from sklearn.preprocessing import StandardScaler
 
 pipe = Pipeline([
     ("scaler", StandardScaler()),
-    ("clf", GenforgeClassifier(n_estimators=300, max_depth=5)),
+    ("clf", OQBoostClassifier(n_estimators=300, max_depth=5)),
 ])
 pipe.fit(X_train, y_train)
 pipe.predict(X_test)
@@ -112,10 +112,10 @@ pipe.predict(X_test)
 
 ## Tips
 
-**Tuning:** GenForge has two primary hyperparameters: `max_depth` (4–8) and `reg_lambda` (0.1–10). Start with defaults.
+**Tuning:** OQBoost has two primary hyperparameters: `max_depth` (4–8) and `reg_lambda` (0.1–10). Start with defaults.
 
 **Speed vs accuracy:** Reduce `n_estimators` + increase `learning_rate` for faster training. Use early stopping to find the optimal round count.
 
 **Imbalanced data:** `class_weight="balanced"` (default) reweights gradients by inverse class frequency. Evaluate with `balanced_accuracy_score` rather than raw accuracy.
 
-**Rotation-robust:** GenForge's oblique splits naturally adapt to rotated feature spaces. If your data has features that are informative as linear combinations, GenForge often outperforms axis-aligned models without feature engineering.
+**Rotation-robust:** OQBoost's oblique splits naturally adapt to rotated feature spaces. If your data has features that are informative as linear combinations, OQBoost often outperforms axis-aligned models without feature engineering.

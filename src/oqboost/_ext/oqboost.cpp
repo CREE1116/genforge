@@ -1,4 +1,4 @@
-// genforge.cpp — GenForge v9: context-cached, subtraction-based oblique booster
+// oqboost.cpp — OQBoost v9: context-cached, subtraction-based oblique booster
 // with native missing-value and categorical handling.
 //
 // One route, two hyperparameters (max_depth, reg_lambda), fully
@@ -41,13 +41,21 @@
 #include <omp.h>
 #endif
 
-#include "bfstree_types.h"
-#include "genforge_core.h"
+#if defined(__APPLE__)
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+#define GF_HAVE_BLAS 1
+#else
+#define GF_HAVE_BLAS 0
+#endif
+
+#include "oqboost_types.h"
+#include "oqboost_core.h"
 
 static constexpr int OBLIQUE_MIN = 64;  // min node size to fit directions
 
 // ─── Binning context (per dataset, reused across all boosting rounds) ───────
-struct GenforgeCtx {
+struct OQBoostCtx {
   int N = 0, D = 0, D_num = 0, D_cat = 0;
   std::vector<uint8_t> code;            // N·D uint8 bin codes
   std::vector<float> ax_min, ax_range;  // per-feature bin frame
@@ -71,12 +79,15 @@ struct GenforgeCtx {
     float nw = 0.0f;
     for (int d = 0; d < D; d++) nw += w[d] * w[d];
     if (nw < 1e-12f) return;
+    float norm = std::sqrt(nw);
     for (const auto& c : dir_cache) {
       float dot = 0.0f;
       for (int d = 0; d < D; d++) dot += c[d] * w[d];
-      if (std::abs(dot) / std::sqrt(nw) > 0.95f) return;  // redundant
+      if (std::abs(dot) / norm > 0.95f) return;  // redundant
     }
     std::vector<float> wn(w.begin(), w.begin() + D);
+    float inv_norm = 1.0f / norm;
+    for (int d = 0; d < D; d++) wn[d] *= inv_norm;
     if ((int)dir_cache.size() < DIR_CACHE_MAX) {
       dir_cache.push_back(std::move(wn));
     } else {
@@ -85,6 +96,15 @@ struct GenforgeCtx {
     }
   }
 };
+
+static inline int get_node_depth(int t) {
+  int depth = 0;
+  while (t > 0) {
+    t = (t - 1) / 2;
+    depth++;
+  }
+  return depth;
+}
 
 // Deterministic stride subsample.
 static std::vector<int> stride_cap(const std::vector<int>& v, int cap) {
@@ -97,7 +117,7 @@ static std::vector<int> stride_cap(const std::vector<int>& v, int cap) {
 }
 
 // Route a TRANSFORMED matrix x̃ (no NaN, cats already rank-encoded).
-static void _gf_route(const BFSTree* tree, const float* X, int N,
+static void _gf_route(const OQTree* tree, const float* X, int N,
                          float* out_pred) {
   int D = tree->D, K = tree->K;
   int T = tree->total_nodes;
@@ -116,7 +136,9 @@ static void _gf_route(const BFSTree* tree, const float* X, int N,
     for (int dep = 0; dep < tree->max_depth; dep++) {
       if (tree->is_leaf[t]) break;
       float proj = sparse_dot_stack(node_nz[t], xi);
-      t = (proj < tree->split_threshold[t]) ? (2 * t + 1) : (2 * t + 2);
+      int next_t = (proj < tree->split_threshold[t]) ? (2 * t + 1) : (2 * t + 2);
+      if (next_t >= T) break;
+      t = next_t;
     }
     const float* lv = tree->leaf_values.data() + (size_t)t * K;
     float* oi = out_pred + (size_t)i * K;
@@ -129,7 +151,7 @@ extern "C" {
 // Pre-bin all features once.
 GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
                                  const int* sub, int Ns) {
-  auto* ctx = new GenforgeCtx();
+  auto* ctx = new OQBoostCtx();
   ctx->N = N;
   ctx->D = D;
   ctx->D_num = D_num;
@@ -213,15 +235,20 @@ GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
       ctx->cat_card[fc] = nan_id + 1;
       for (int i = 0; i < N; i++) {
         float v = X[(size_t)i * D + f];
-        ctx->cat_dense[(size_t)i * ctx->D_cat + fc] =
-            std::isnan(v) ? nan_id : m[(int)std::lrintf(v)];
+        if (std::isnan(v)) {
+          ctx->cat_dense[(size_t)i * ctx->D_cat + fc] = nan_id;
+        } else {
+          auto it = m.find((int)std::lrintf(v));
+          ctx->cat_dense[(size_t)i * ctx->D_cat + fc] =
+              (it != m.end()) ? it->second : nan_id;
+        }
       }
     }
   }
   return static_cast<void*>(ctx);
 }
 
-GF_API void gf_ctx_free(void* h) { delete static_cast<GenforgeCtx*>(h); }
+GF_API void gf_ctx_free(void* h) { delete static_cast<OQBoostCtx*>(h); }
 
 // ─── gf_build — one boosting round on a binning context ────────────────
 GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
@@ -231,7 +258,11 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                                float mutation_strength, int seed, float* out_pred) {
 
   (void)X;
-  auto* ctx = static_cast<GenforgeCtx*>(ctx_handle);
+  // mutation_rate/mutation_strength belonged to the removed parent-mutation
+  // strategies; kept in the signature for ABI/Python-API compatibility.
+  (void)mutation_rate;
+  (void)mutation_strength;
+  auto* ctx = static_cast<OQBoostCtx*>(ctx_handle);
   const int D = ctx->D, D_num = ctx->D_num, D_cat = ctx->D_cat, N = ctx->N;
   const float* GF_RESTRICT Xt = ctx->Ximp.data();
   const int STRIDE = 2 * K + 1;
@@ -242,7 +273,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   const int internal_depth = std::min(2 * max_depth, 22);
   const int max_leaves = 1 << max_depth;
   int max_nodes = (1 << (internal_depth + 1)) - 1;
-  auto* tree = new BFSTree();
+  auto* tree = new OQTree();
   tree->K = K;
   tree->D = D;
   tree->D_num = D_num;
@@ -447,10 +478,9 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     if (!hist_pool.empty()) {
       auto h = std::move(hist_pool.back());
       hist_pool.pop_back();
-      std::fill(h.begin(), h.end(), 0.0f);
       return h;
     }
-    return std::vector<float>(HSZ, 0.0f);
+    return std::vector<float>(HSZ);
   };
 
   auto recycle_hist = [&](std::vector<float>& h) {
@@ -587,7 +617,6 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     float total_base = 0.0f;
     for (int c = 0; c < K; c++)
       total_base -= 0.5f * Gt[c] * Gt[c] / (Ht[c] + reg_lambda + EPS);
-    std::vector<float> Gc(K), Hc(K);
 
     std::vector<int> samp_e = stride_cap(samp, EST_NE_MAX);
     int ne = (int)samp_e.size();
@@ -609,10 +638,20 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       e_base -= 0.5f * eGt[c] * eGt[c] / (eHt[c] + reg_lambda + EPS);
 
     int kdom = dominant_class(samp_e, G, K);
+
+    // Gather the evaluation panel contiguously once: every later pass (SIS
+    // accumulation, all candidate projections) then walks Xe sequentially
+    // instead of striding through Xt rows scattered across the full matrix.
+    std::vector<float> Xe((size_t)ne * D);
+    for (int i = 0; i < ne; i++) {
+      std::memcpy(Xe.data() + (size_t)i * D, Xt + (size_t)samp_e[i] * D,
+                  (size_t)D * sizeof(float));
+    }
+
     std::vector<float> cg_s(D, 0.0f), add_s(D, 0.0f);
     for (int i = 0; i < ne; i++) {
+      const float* GF_RESTRICT xi = Xe.data() + (size_t)i * D;
       int idx = samp_e[i];
-      const float* GF_RESTRICT xi = Xt + (size_t)idx * D;
       float gi = G[(size_t)idx * K + kdom];
       float hi = H[(size_t)idx * K + kdom];
       for (int d = 0; d < D; d++) {
@@ -653,101 +692,38 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     int n_global = 32 - n_inherited;
 
     if (has_parent && parent_nz.size > 0) {
-      int depth_t = 0;
-      while (((1 << (depth_t + 1)) - 1) <= t) depth_t++;
-      float local_mutation_rate =
-          mutation_rate / std::sqrt(1.0f + (float)depth_t);
-      float local_mutation_strength =
-          mutation_strength / (1.0f + (float)depth_t);
-
+      // Informed slot = Strategy C only (cache blend). The strategy ablation
+      // (research/FINDINGS.md Part 2) showed parent-direction mutation
+      // (the old Strategies A/B) is consistently WORSE than replacing it
+      // with global random draws — good oblique directions are a property
+      // of the dataset (its rotated subspaces), not of the parent node, so
+      // the continuity worth keeping is the cross-tree cache. When the
+      // cache is still empty (early trees) the draw falls back to a sparse
+      // random direction, identical to the global pool.
+      float s_param_i = std::max(2.0f, std::sqrt((float)D));
+      float prob_nonzero_i = 1.0f / s_param_i;
       for (int r = 0; r < n_inherited; r++) {
-        float strategy_draw = dist(rng);
-        bool do_strategy_a = false;
-        bool do_strategy_b = false;
-        bool do_strategy_c = false;
-
-        if (!ctx->dir_cache.empty()) {
-          if (strategy_draw < 0.375f) {
-            do_strategy_a = (parent_nz.size > 1);
-            if (!do_strategy_a) do_strategy_b = true;
-          } else if (strategy_draw < 0.75f) {
-            do_strategy_b = true;
-          } else {
-            do_strategy_c = true;
-          }
-        } else {
-          if (strategy_draw < 0.5f) {
-            do_strategy_a = (parent_nz.size > 1);
-            if (!do_strategy_a) do_strategy_b = true;
-          } else {
-            do_strategy_b = true;
-          }
-        }
-
         std::vector<float> w_rand(D, 0.0f);
 
-        if (do_strategy_c) {
+        if (!ctx->dir_cache.empty()) {
           std::uniform_int_distribution<int> cache_dist(
               0, (int)ctx->dir_cache.size() - 1);
           const auto& cached_w = ctx->dir_cache[cache_dist(rng)];
           float alpha = dist(rng) * 0.6f + 0.2f;
+          float one_minus_alpha = 1.0f - alpha;
           for (int d = 0; d < D; d++) {
-            float w_p = 0.0f;
-            for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
-              if (parent_nz.indices[i_nz] == d) {
-                w_p = parent_nz.values[i_nz];
-                break;
-              }
-            }
-            w_rand[d] = alpha * w_p + (1.0f - alpha) * cached_w[d];
+            w_rand[d] = one_minus_alpha * cached_w[d];
+          }
+          for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
+            int d = parent_nz.indices[i_nz];
+            w_rand[d] += alpha * parent_nz.values[i_nz];
           }
         } else {
-          for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
-            w_rand[parent_nz.indices[i_nz]] = parent_nz.values[i_nz];
-          }
-
-          if (do_strategy_a) {
-            std::uniform_int_distribution<int> parent_idx_dist(
-                0, parent_nz.size - 1);
-            int idx1 = parent_idx_dist(rng);
-            float s1 =
-                dist(rng) * 2.0f * local_mutation_rate - local_mutation_rate;
-            w_rand[parent_nz.indices[idx1]] *= (1.0f + s1);
-
-            if (parent_nz.size > 2 && dist(rng) < 0.5f) {
-              int idx2 = parent_idx_dist(rng);
-              while (idx2 == idx1) idx2 = parent_idx_dist(rng);
-              float s2 =
-                  dist(rng) * 2.0f * local_mutation_rate - local_mutation_rate;
-              w_rand[parent_nz.indices[idx2]] *= (1.0f + s2);
-            }
-          } else if (do_strategy_b) {
-            std::vector<int> candidate_feats;
-            std::vector<float> candidate_probs;
-            for (int d = 0; d < D; d++) {
-              bool in_parent = false;
-              for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
-                if (parent_nz.indices[i_nz] == d) {
-                  in_parent = true;
-                  break;
-                }
-              }
-              if (!in_parent) {
-                candidate_feats.push_back(d);
-                candidate_probs.push_back(prob[d]);
-              }
-            }
-
-            if (!candidate_feats.empty()) {
-              std::discrete_distribution<int> new_feat_dist(
-                  candidate_probs.begin(), candidate_probs.end());
-              int idx_feat = new_feat_dist(rng);
-              int f_new = candidate_feats[idx_feat];
-              float sign = (cg_s[f_new] >= 0.0f) ? -1.0f : 1.0f;
-              w_rand[f_new] = sign * local_mutation_strength;
-            } else if (parent_nz.size == 1) {
-              int f_new = (parent_nz.indices[0] + 1) % D;
-              w_rand[f_new] = 0.1f;
+          int nz_count = 0;
+          for (int f = 0; f < D; f++) {
+            if (nz_count < D_SUB_MAX && dist(rng) < prob_nonzero_i) {
+              w_rand[f] = (sign_dist(rng) == 0) ? 1.0f : -1.0f;
+              nz_count++;
             }
           }
         }
@@ -792,6 +768,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       }
 
     } else {
+      std::vector<uint8_t> selected_mask(D, 0);
       for (int r = 0; r < 24; r++) {
         int L = len_dist(rng);
         std::vector<int> selected;
@@ -799,10 +776,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         for (int attempt = 0; attempt < 50 && (int)selected.size() < L;
              attempt++) {
           int f = feat_dist(rng);
-          if (std::find(selected.begin(), selected.end(), f) ==
-              selected.end()) {
+          if (!selected_mask[f]) {
+            selected_mask[f] = 1;
             selected.push_back(f);
           }
+        }
+        for (int f : selected) {
+          selected_mask[f] = 0;
         }
         if (selected.size() < 2) {
           std::vector<int> ord(D);
@@ -854,111 +834,55 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 
     }
 
-    {
-      int nc = (int)ctx->dir_cache.size();
-      if (nc > 0) {
-        std::vector<int> samp_p = stride_cap(samp, 512);
-        int np = (int)samp_p.size();
-        std::vector<float> pGt(K, 0.0f), pHt(K, 0.0f);
-        for (int j : samp_p) {
-          for (int c = 0; c < K; c++) {
-            pGt[c] += G[(size_t)j * K + c];
-            pHt[c] += H[(size_t)j * K + c];
-          }
-        }
-        float p_base = 0.0f;
-        for (int c = 0; c < K; c++)
-          p_base -= 0.5f * pGt[c] * pGt[c] / (pHt[c] + reg_lambda + EPS);
-
-        constexpr int PRE_BINS = 16;
-        float pproj[512];
-        static constexpr int K_MAX = 32;
-        float pG[16 * K_MAX];
-        float pH[16 * K_MAX];
-        float* pG_ptr = pG;
-        float* pH_ptr = pH;
-        std::vector<float> heap_pG, heap_pH;
-        if (K > K_MAX) {
-          heap_pG.assign(16 * K, 0.0f);
-          heap_pH.assign(16 * K, 0.0f);
-          pG_ptr = heap_pG.data();
-          pH_ptr = heap_pH.data();
-        }
-        int pc[PRE_BINS];
-        SparseVec nz_p;
-        std::vector<std::pair<float, int>> rank;
-        rank.reserve(nc);
-        for (int ci = 0; ci < nc; ci++) {
-          collect_nonzero_stack(ctx->dir_cache[ci].data(), D, nz_p);
-          if (nz_p.size <= 1) continue;
-          float mn = 1e30f, mx = -1e30f;
-          for (int si = 0; si < np; si++) {
-            float v = sparse_dot_stack(nz_p, Xt + (size_t)samp_p[si] * D);
-            pproj[si] = v;
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-          }
-          if (mx - mn < 1e-12f) continue;
-          if (K > K_MAX) {
-            std::fill(heap_pG.begin(), heap_pG.end(), 0.0f);
-            std::fill(heap_pH.begin(), heap_pH.end(), 0.0f);
-          } else {
-            std::memset(pG, 0, 16 * K * sizeof(float));
-            std::memset(pH, 0, 16 * K * sizeof(float));
-          }
-          std::memset(pc, 0, sizeof(pc));
-          float scale = (float)PRE_BINS / (mx - mn + EPS);
-          for (int si = 0; si < np; si++) {
-            int j = samp_p[si];
-            int b = (int)((pproj[si] - mn) * scale);
-            if (b < 0) b = 0;
-            if (b >= PRE_BINS) b = PRE_BINS - 1;
-            pc[b]++;
-            size_t bo = (size_t)b * K;
-            for (int c = 0; c < K; c++) {
-              pG_ptr[bo + c] += G[(size_t)j * K + c];
-              pH_ptr[bo + c] += H[(size_t)j * K + c];
-            }
-          }
-          std::fill(Gc.begin(), Gc.end(), 0.0f);
-          std::fill(Hc.begin(), Hc.end(), 0.0f);
-          int n_left = 0;
-          float best = 0.0f;
-          for (int b = 0; b < PRE_BINS - 1; b++) {
-            n_left += pc[b];
-            size_t bo = (size_t)b * K;
-            for (int c = 0; c < K; c++) {
-              Gc[c] += pG_ptr[bo + c];
-              Hc[c] += pH_ptr[bo + c];
-            }
-            if (n_left < 5 || np - n_left < 5) continue;
-            float gain = p_base;
-            for (int c = 0; c < K; c++) {
-              float Gr = pGt[c] - Gc[c], Hr = pHt[c] - Hc[c];
-              gain += 0.5f * (Gc[c] * Gc[c] / (Hc[c] + reg_lambda + EPS) +
-                              Gr * Gr / (Hr + reg_lambda + EPS));
-            }
-            if (gain > best) best = gain;
-          }
-          if (best > 0.0f) rank.push_back({best, ci});
-        }
-        int n_take = std::min((int)rank.size(), 2);
-        std::partial_sort(
-            rank.begin(), rank.begin() + n_take, rank.end(),
-            [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-              if (a.first != b.first) return a.first > b.first;
-              return a.second < b.second;
-            });
-        for (int r = 0; r < n_take; r++) {
-          dirs.push_back(ctx->dir_cache[rank[r].second]);
-        }
-      }
-    }
+    // Cached directions enter the candidate batch directly: with the batched
+    // panel projections below, evaluating all of them exactly costs less than
+    // the old approximate 512-sample pre-screen pass did, and removes its
+    // sampling noise.
+    for (const auto& cw : ctx->dir_cache) dirs.push_back(cw);
 
     float ob_gain = 0.0f, ob_thr = 0.0f;
     int ob_idx = -1;
     const int n_dirs = (int)dirs.size();
     std::vector<float> dir_gain(n_dirs, 0.0f), dir_thr(n_dirs, 0.0f);
+
+    // Routing truncates every direction to its first D_SUB_MAX nonzeros
+    // (collect_nonzero_stack); sanitize candidates the same way up front so
+    // the batched dense projections match what routing will later compute.
+    for (auto& wv : dirs) {
+      int nz = 0;
+      for (int d = 0; d < D; d++) {
+        if (wv[d] != 0.0f) {
+          if (nz >= D_SUB_MAX) wv[d] = 0.0f;
+          else nz++;
+        }
+      }
+    }
+
+    // Batched candidate projections over the contiguous panel:
+    // Pj[di·ne + si] = dirs[di]·Xe[si]. One GEMM on the AMX/BLAS path
+    // replaces n_dirs scattered sparse-dot sweeps.
+    std::vector<float> Pj((size_t)n_dirs * ne);
+#if GF_HAVE_BLAS
+    {
+      std::vector<float> Wd((size_t)n_dirs * D);
+      for (int di = 0; di < n_dirs; di++)
+        std::memcpy(Wd.data() + (size_t)di * D, dirs[di].data(),
+                    (size_t)D * sizeof(float));
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n_dirs, ne, D,
+                  1.0f, Wd.data(), D, Xe.data(), D, 0.0f, Pj.data(), ne);
+    }
+#else
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n_dirs > 1)
+#endif
+    for (int di = 0; di < n_dirs; di++) {
+      SparseVec sv;
+      collect_nonzero_stack(dirs[di].data(), D, sv);
+      float* GF_RESTRICT prow = Pj.data() + (size_t)di * ne;
+      for (int si = 0; si < ne; si++)
+        prow[si] = sparse_dot_stack(sv, Xe.data() + (size_t)si * D);
+    }
+#endif
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) if (n_dirs > 1)
@@ -968,11 +892,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       collect_nonzero_stack(dirs[di].data(), D, sv);
       if (sv.size <= 1) continue;
 
-      float proj_e[2048];
+      const float* GF_RESTRICT proj_e = Pj.data() + (size_t)di * ne;
       float min_v = 1e30f, max_v = -1e30f;
       for (int si = 0; si < ne; si++) {
-        float proj = sparse_dot_stack(sv, Xt + (size_t)samp_e[si] * D);
-        proj_e[si] = proj;
+        float proj = proj_e[si];
         if (proj < min_v) min_v = proj;
         if (proj > max_v) max_v = proj;
       }
@@ -1058,9 +981,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     std::vector<float> proj_full(ns);
     float exact_gain;
     if (exact_eval) {
-      for (int si = 0; si < ns; si++) {
-        proj_full[si] = sparse_dot_stack(sv, Xt + (size_t)samp[si] * D);
-      }
+      // samp_e == samp here, so the batched panel projections are exactly
+      // the per-sample projections routing needs.
+      std::memcpy(proj_full.data(), Pj.data() + (size_t)ob_idx * ne,
+                  (size_t)ne * sizeof(float));
       exact_gain = ob_gain;
     } else {
       std::vector<float> GL(K, 0.0f), HL(K, 0.0f);
@@ -1068,13 +992,14 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 #ifdef _OPENMP
       if (ns >= 8192) {
         int nthreads = omp_get_max_threads();
-        std::vector<std::vector<float>> tGL(nthreads), tHL(nthreads);
+        std::vector<std::vector<float>> tGL(nthreads, std::vector<float>(K, 0.0f));
+        std::vector<std::vector<float>> tHL(nthreads, std::vector<float>(K, 0.0f));
         std::vector<int> tnl(nthreads, 0);
+        int actual_threads = nthreads;
 #pragma omp parallel num_threads(nthreads)
         {
           int tid = omp_get_thread_num();
-          tGL[tid].assign(K, 0.0f);
-          tHL[tid].assign(K, 0.0f);
+          if (tid == 0) actual_threads = omp_get_num_threads();
           float* GF_RESTRICT lGL = tGL[tid].data();
           float* GF_RESTRICT lHL = tHL[tid].data();
           int lnl = 0;
@@ -1093,7 +1018,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           }
           tnl[tid] = lnl;
         }
-        for (int t2 = 0; t2 < nthreads; t2++) {
+        for (int t2 = 0; t2 < actual_threads; t2++) {
           n_left += tnl[t2];
           for (int c = 0; c < K; c++) {
             GL[c] += tGL[t2][c];
@@ -1190,8 +1115,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     }
     const auto& samp = node_samp[t_node];
     int tl = 2 * t_node + 1, tr_node = 2 * t_node + 2;
-    int depth_t = 0;
-    while (((1 << (depth_t + 1)) - 1) <= t_node) depth_t++;
+    int depth_t = get_node_depth(t_node);
 
     if (cand_axis[t_node] < 0) ctx->cache_direction(cand_w[t_node]);
     tree->is_leaf[t_node] = 0;
@@ -1212,19 +1136,21 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 #ifdef _OPENMP
     if (ns >= 8192) {
       int nthreads = omp_get_max_threads();
-      std::vector<std::vector<int>> tL(nthreads), tR(nthreads);
-      std::vector<std::vector<float>> tGL(nthreads), tHL(nthreads);
+      std::vector<std::vector<int>> tL(nthreads);
+      std::vector<std::vector<int>> tR(nthreads);
+      std::vector<std::vector<float>> tGL(nthreads, std::vector<float>(K, 0.0f));
+      std::vector<std::vector<float>> tHL(nthreads, std::vector<float>(K, 0.0f));
       std::vector<double> tPL(nthreads, 0.0);
+      int actual_threads = nthreads;
 #pragma omp parallel num_threads(nthreads)
       {
         int tid = omp_get_thread_num();
+        if (tid == 0) actual_threads = omp_get_num_threads();
         auto& Lv = tL[tid];
         auto& Rv = tR[tid];
         int chunk_size = (ns + nthreads - 1) / nthreads;
         Lv.reserve(chunk_size);
         Rv.reserve(chunk_size);
-        tGL[tid].assign(K, 0.0f);
-        tHL[tid].assign(K, 0.0f);
         float* GF_RESTRICT gl = tGL[tid].data();
         float* GF_RESTRICT hl = tHL[tid].data();
         double pl = 0.0;
@@ -1251,14 +1177,14 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         tPL[tid] = pl;
       }
       size_t nl = 0, nr = 0;
-      for (int t = 0; t < nthreads; t++) {
+      for (int t = 0; t < actual_threads; t++) {
         nl += tL[t].size();
         nr += tR[t].size();
       }
       left_sub.reserve(nl);
       right_sub.reserve(nr);
       double PLd = 0.0;
-      for (int t = 0; t < nthreads; t++) {
+      for (int t = 0; t < actual_threads; t++) {
         left_sub.insert(left_sub.end(), tL[t].begin(), tL[t].end());
         right_sub.insert(right_sub.end(), tR[t].begin(), tR[t].end());
         for (int c = 0; c < K; c++) {
@@ -1398,7 +1324,6 @@ GF_API void* gf_build_oneshot(const float* X, int N, int D, int D_num,
                                const int* sub, int Ns, int max_depth,
                                float reg_lambda, unsigned int seed,
                                float* out_pred) {
-  (void)seed;
   void* ctx = gf_ctx_create(X, N, D, D_num, sub, Ns);
   void* tree = gf_build(ctx, X, G, H, K, sub, Ns, max_depth, reg_lambda,
                               1.0f, 0.1f, 0.5f, (int)seed, out_pred);
@@ -1410,9 +1335,9 @@ GF_API void* gf_build_oneshot(const float* X, int N, int D, int D_num,
 // Predict on RAW X
 GF_API void gf_predict(void* tree_handle, const float* X, int N, int K,
                              float* out_pred) {
-  const BFSTree* tree = static_cast<const BFSTree*>(tree_handle);
+  if (!tree_handle || !out_pred || N <= 0 || !X) return;
+  const OQTree* tree = static_cast<const OQTree*>(tree_handle);
   std::memset(out_pred, 0, (size_t)N * K * sizeof(float));
-  if (!tree) return;
   const int D = tree->D;
   if ((int)tree->na_means.size() != D) {
     _gf_route(tree, X, N, out_pred);
@@ -1462,10 +1387,11 @@ struct GFCompactNode {
 GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
                                 const float* X, int N, int K, float lr,
                                 float* out_pred) {
-  std::vector<const BFSTree*> trees;
+  if (!handles || n_trees <= 0 || !out_pred) return;
+  std::vector<const OQTree*> trees;
   trees.reserve(n_trees > 0 ? n_trees : 0);
   for (int t = 0; t < n_trees; t++) {
-    const BFSTree* tr = static_cast<const BFSTree*>(handles[t]);
+    const OQTree* tr = static_cast<const OQTree*>(handles[t]);
     if (tr) trees.push_back(tr);
   }
   if (trees.empty()) return;
@@ -1491,7 +1417,11 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
   std::vector<GFCompactNode> nodes;
   std::vector<float> leaf_vals;
   std::vector<int> heap_of;  // compact id → heap id (BFS order)
-  for (const BFSTree* tr : trees) {
+  heap_of.reserve(256);
+  nodes.reserve(256);
+  leaf_vals.reserve(256 * K);
+
+  for (const OQTree* tr : trees) {
     // ── compact the live subtree (BFS from root) ────────────────────────────
     heap_of.clear();
     heap_of.push_back(0);
@@ -1503,8 +1433,10 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
       }
     }
     const int M = (int)heap_of.size();
-    nodes.assign(M, GFCompactNode{});
-    leaf_vals.assign((size_t)M * K, 0.0f);
+    nodes.resize(M);
+    std::fill(nodes.begin(), nodes.end(), GFCompactNode{});
+    leaf_vals.resize((size_t)M * K);
+    std::fill(leaf_vals.begin(), leaf_vals.end(), 0.0f);
     {
       // BFS order ⇒ children appear after parents; rebuild child links.
       std::vector<std::pair<int, int>> stack;  // (heap id, compact id)
@@ -1566,12 +1498,12 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
 }
 
 GF_API void gf_tree_free(void* tree_handle) {
-  delete static_cast<BFSTree*>(tree_handle);
+  delete static_cast<OQTree*>(tree_handle);
 }
 
 // ─── tree meta (de)serialization ───────────────────────────────────────────
 GF_API void gf_tree_meta_sizes(void* tree_handle, int* sizes) {
-  const BFSTree* tree = static_cast<const BFSTree*>(tree_handle);
+  const OQTree* tree = static_cast<const OQTree*>(tree_handle);
   sizes[0] = tree->D_num;
   sizes[1] = (int)tree->cat_ranks.size();
   int total = 0;
@@ -1583,7 +1515,7 @@ GF_API void gf_tree_meta_sizes(void* tree_handle, int* sizes) {
 GF_API void gf_tree_export_meta(void* tree_handle, float* na_means,
                                       int* cat_sizes, int* cat_keys,
                                       float* cat_vals) {
-  const BFSTree* tree = static_cast<const BFSTree*>(tree_handle);
+  const OQTree* tree = static_cast<const OQTree*>(tree_handle);
   for (size_t i = 0; i < tree->na_means.size(); i++)
     na_means[i] = tree->na_means[i];
   int off = 0;
@@ -1603,7 +1535,7 @@ GF_API void gf_tree_import_meta(void* tree_handle, int D_num,
                                       const int* cat_sizes, int D_cat,
                                       const int* cat_keys,
                                       const float* cat_vals) {
-  BFSTree* tree = static_cast<BFSTree*>(tree_handle);
+  OQTree* tree = static_cast<OQTree*>(tree_handle);
   tree->D_num = D_num;
   tree->na_means.assign(na_means, na_means + na_len);
   tree->cat_ranks.assign(D_cat, {});
@@ -1616,6 +1548,59 @@ GF_API void gf_tree_import_meta(void* tree_handle, int D_num,
       off++;
     }
   }
+}
+
+// ─── tree structure (de)serialization — ported from the removed bfstree.cpp ─
+GF_API int oqtree_get_K(void* handle) { return static_cast<OQTree*>(handle)->K; }
+GF_API int oqtree_get_max_depth(void* handle) {
+  return static_cast<OQTree*>(handle)->max_depth;
+}
+GF_API int oqtree_get_total_nodes(void* handle) {
+  return static_cast<OQTree*>(handle)->total_nodes;
+}
+GF_API int oqtree_get_D(void* handle) {
+  return static_cast<OQTree*>(handle)->D;
+}
+
+GF_API void oqtree_export(void* handle, int* split_hyp_idx,
+                          float* split_threshold, float* leaf_values,
+                          uint8_t* is_leaf) {
+  const OQTree* tree = static_cast<const OQTree*>(handle);
+  int n = tree->total_nodes, K = tree->K;
+  for (int i = 0; i < n; ++i) split_hyp_idx[i] = tree->split_hyp_idx[i];
+  for (int i = 0; i < n; ++i) split_threshold[i] = tree->split_threshold[i];
+  for (size_t i = 0; i < (size_t)n * K; ++i) leaf_values[i] = tree->leaf_values[i];
+  for (int i = 0; i < n; ++i) is_leaf[i] = tree->is_leaf[i];
+}
+
+GF_API void* oqtree_from_arrays(const int* split_hyp_idx,
+                                const float* split_threshold,
+                                const float* leaf_values,
+                                const uint8_t* is_leaf, int total_nodes, int K,
+                                int max_depth) {
+  OQTree* tree = new OQTree();
+  tree->total_nodes = total_nodes;
+  tree->K = K;
+  tree->max_depth = max_depth;
+  tree->split_hyp_idx.assign(split_hyp_idx, split_hyp_idx + total_nodes);
+  tree->split_threshold.assign(split_threshold, split_threshold + total_nodes);
+  tree->leaf_values.assign(leaf_values, leaf_values + (size_t)total_nodes * K);
+  tree->is_leaf.assign(is_leaf, is_leaf + total_nodes);
+  return static_cast<void*>(tree);
+}
+
+GF_API void oqtree_get_split_weights(void* handle, float* out_weights) {
+  const OQTree* tree = static_cast<const OQTree*>(handle);
+  if (!tree->split_weights.empty()) {
+    std::memcpy(out_weights, tree->split_weights.data(),
+                tree->split_weights.size() * sizeof(float));
+  }
+}
+
+GF_API void oqtree_set_split_weights(void* handle, int D, const float* weights) {
+  OQTree* tree = static_cast<OQTree*>(handle);
+  tree->D = D;
+  tree->split_weights.assign(weights, weights + (size_t)tree->total_nodes * D);
 }
 
 GF_API void gf_update_gradients(const float* F, const float* oh, int N, int K, float* G, float* H) {
@@ -1641,7 +1626,7 @@ GF_API void gf_update_gradients(const float* F, const float* oh, int N, int K, f
 
     // Compute P, G, H
     for (int c = 0; c < K; c++) {
-      float p = (float)(std::exp(F[offset + c] - fmax) / (sum_exp + EPS));
+      float p = (float)(std::exp(F[offset + c] - fmax) / sum_exp);
       G[offset + c] = p - oh[offset + c];
       H[offset + c] = p * (1.0f - p);
     }

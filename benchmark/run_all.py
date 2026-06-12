@@ -1,4 +1,4 @@
-"""Run all GenForge benchmarks sequentially."""
+"""Run all OQBoost benchmarks sequentially."""
 from __future__ import annotations
 
 import sys

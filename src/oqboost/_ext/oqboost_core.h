@@ -1,4 +1,4 @@
-// genforge_core.h — internal shared core for genforge.cpp
+// oqboost_core.h — internal shared core for oqboost.cpp
 // Constants, sparse helpers, and the standardized CD direction solver.
 #pragma once
 #include <algorithm>
@@ -53,8 +53,8 @@ static inline float sparse_dot(const std::vector<std::pair<int, float>>& nz,
 
 struct SparseVec {
   int size = 0;
-  int indices[16];
-  float values[16];
+  int indices[D_SUB_MAX];
+  float values[D_SUB_MAX];
 };
 
 static inline void collect_nonzero_stack(const float* w, int n, SparseVec& sv) {
@@ -64,7 +64,7 @@ static inline void collect_nonzero_stack(const float* w, int n, SparseVec& sv) {
       sv.indices[sv.size] = f;
       sv.values[sv.size] = w[f];
       sv.size++;
-      if (sv.size >= 16) break;
+      if (sv.size >= D_SUB_MAX) break;
     }
   }
 }

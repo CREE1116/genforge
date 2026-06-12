@@ -1,4 +1,4 @@
-"""Shared benchmark utilities for GenForge evaluation suite."""
+"""Shared benchmark utilities for OQBoost evaluation suite."""
 from __future__ import annotations
 
 import time
@@ -96,8 +96,8 @@ def _make_catboost(cat_col_indices: list[int] | None, random_state: int, dataset
     return CatBoostClassifier(**params)
 
 
-def _make_genforge(cat_col_indices: list[int] | None, random_state: int, dataset_name: str = ""):
-    from genforge import GenforgeClassifier
+def _make_oqboost(cat_col_indices: list[int] | None, random_state: int, dataset_name: str = ""):
+    from oqboost import OQBoostClassifier
     params = {
         "n_estimators": 1000,
         "learning_rate": 0.05,
@@ -110,14 +110,14 @@ def _make_genforge(cat_col_indices: list[int] | None, random_state: int, dataset
         "verbose": False,
         "random_state": random_state,
     }
-    best = _load_best_params(dataset_name, "GenForge")
+    best = _load_best_params(dataset_name, "OQBoost")
     params.update(best)
-    return GenforgeClassifier(**params)
+    return OQBoostClassifier(**params)
 
 
-def _make_genforge_plain(cat_col_indices: list[int] | None, random_state: int, dataset_name: str = ""):
-    """GenForge without prior correction — isolates structural (oblique-split) bias."""
-    from genforge import GenforgeClassifier
+def _make_oqboost_plain(cat_col_indices: list[int] | None, random_state: int, dataset_name: str = ""):
+    """OQBoost without prior correction — isolates structural (oblique-split) bias."""
+    from oqboost import OQBoostClassifier
     params = {
         "n_estimators": 1000,
         "learning_rate": 0.05,
@@ -130,9 +130,9 @@ def _make_genforge_plain(cat_col_indices: list[int] | None, random_state: int, d
         "verbose": False,
         "random_state": random_state,
     }
-    best = _load_best_params(dataset_name, "GenForge")  # share same params as GenForge
+    best = _load_best_params(dataset_name, "OQBoost")  # share same params as OQBoost
     params.update(best)
-    return GenforgeClassifier(**params)
+    return OQBoostClassifier(**params)
 
 
 
@@ -293,8 +293,8 @@ def run_benchmark(
             "XGBoost":       _make_xgboost(n_classes, random_state=rep, dataset_name=dataset_name),
             "LightGBM":      _make_lightgbm(n_classes, random_state=rep, dataset_name=dataset_name),
             "CatBoost":      _make_catboost(cat_idx, random_state=rep, dataset_name=dataset_name),
-            "GenForge":      _make_genforge_plain(cat_idx, random_state=rep, dataset_name=dataset_name),
-            "GenForge-balanced": _make_genforge(cat_idx, random_state=rep, dataset_name=dataset_name),
+            "OQBoost":      _make_oqboost_plain(cat_idx, random_state=rep, dataset_name=dataset_name),
+            "OQBoost-balanced": _make_oqboost(cat_idx, random_state=rep, dataset_name=dataset_name),
         }
 
 

@@ -1,12 +1,12 @@
-# GenForge: Algorithm and Theory
+# OQBoost: Algorithm and Theory
 
-GenForge is an optimized gradient-boosted oblique decision tree ensemble designed for high accuracy, robust generalization, and fast C++ execution. This document details the mathematical and architectural design of GenForge, including the recent C++ engine optimizations.
+OQBoost is an optimized gradient-boosted oblique decision tree ensemble designed for high accuracy, robust generalization, and fast C++ execution. This document details the mathematical and architectural design of OQBoost, including the recent C++ engine optimizations.
 
 ---
 
 ## 1. Newton-Raphson Boosting Framework
 
-GenForge follows the Newton-Raphson boosting formulation. Given an ensemble prediction $F^{(m)}(x)$ at iteration $m$, the next tree $f^{(m+1)}(x)$ minimizes the second-order Taylor expansion of the loss function:
+OQBoost follows the Newton-Raphson boosting formulation. Given an ensemble prediction $F^{(m)}(x)$ at iteration $m$, the next tree $f^{(m+1)}(x)$ minimizes the second-order Taylor expansion of the loss function:
 
 $$\mathcal{L}^{(m+1)} \approx \sum_{i=1}^{N} \left[ g_i f^{(m+1)}(x_i) + \frac{1}{2} h_i \left(f^{(m+1)}(x_i)\right)^2 \right] + \Omega(f^{(m+1)})$$
 
@@ -21,7 +21,7 @@ For $K$-class classification, the ensemble maintains $K$ output heads and uses a
 
 ## 2. Split Strategy: Oblique Decision Rules
 
-Unlike axis-aligned trees that split on a single feature $x_j < \theta$, GenForge uses **oblique splits** (linear combinations of features) at each decision node:
+Unlike axis-aligned trees that split on a single feature $x_j < \theta$, OQBoost uses **oblique splits** (linear combinations of features) at each decision node:
 
 $$w^T x = \sum_{j \in \mathcal{S}} w_j x_j < \theta$$
 
@@ -31,10 +31,10 @@ where $w$ is a sparse weight vector (restricting the active feature subspace siz
 
 ## 3. Direction Generation & Optimization Pipeline
 
-GenForge avoids computationally expensive Coordinate Descent (CD) or Gram matrix solver operations at each node by using three randomized, gradient-aligned stages.
+OQBoost avoids computationally expensive Coordinate Descent (CD) or Gram matrix solver operations at each node by using three randomized, gradient-aligned stages.
 
 ### Stage 1: GG-SRP (Gradient-Guided Sparse Random Projection)
-Instead of searching all dimensions, GenForge identifies candidate features using Sure Independence Screening (SIS) scores, computed on the node-local subset of samples $\mathcal{I}_t$:
+Instead of searching all dimensions, OQBoost identifies candidate features using Sure Independence Screening (SIS) scores, computed on the node-local subset of samples $\mathcal{I}_t$:
 
 $$s_f = \frac{\left| \sum_{i \in \mathcal{I}_t} x_{if} g_i \right|}{\sqrt{\sum_{i \in \mathcal{I}_t} h_i x_{if}^2 + \lambda}}$$
 
@@ -44,18 +44,14 @@ $$s_f = \frac{\left| \sum_{i \in \mathcal{I}_t} x_{if} g_i \right|}{\sqrt{\sum_{
     $$w_f = -\operatorname{sign}\left( \sum_{i \in \mathcal{I}_t} x_{if} g_i \right) \cdot |r_f|, \quad r_f \sim \mathcal{N}(0, 1)$$
 4.  **Normalization**: The weight vector is normalized to unit L2 norm: $w \leftarrow \frac{w}{\|w\|_2}$.
 
-### Stage 2: Hereditary Direction Inheritance
-Samples reaching a child node have already been filtered by the parent node's split. The parent's weight vector $w_{\text{parent}}$ serves as an excellent warm-start direction. GenForge evaluates two mutation strategies:
-*   **Strategy A (Axis-Maintaining Mutation)**: Tilts the parent boundary slightly while maintaining its orientation:
-    $$w_{\text{mutated}} = w_{\text{parent}} + \text{rate} \cdot \epsilon, \quad \epsilon_j \sim \mathcal{U}(-1, 1)$$
-*   **Strategy B (New-Axis Borrowing)**: Extends the sparse representation by adding one highly correlated new feature $f^*$ to the parent's feature set:
-    $$w_{\text{mutated}} = w_{\text{parent}} \oplus \{ f^* \mapsto \pm \text{strength} \}$$
+### Stage 2: Dataset-Level Direction Cache (Strategy C)
+High-performing split directions from previous boosting rounds are stored in a global ring buffer `dir_cache` (up to 32 directions, near-duplicates rejected at |cos| > 0.95). At non-root nodes, the informed candidate slot blends a cached direction with the current parent direction:
 
-### Stage 3: Parent-Cache Crossover & Depth-Decayed Mutation
-*   **Strategy C (Global-Local Crossover)**: High-performing split directions from previous boosting rounds are stored in a global ring buffer `dir_cache` (up to 32 directions). GenForge blends these with the current parent direction:
-    $$w_{\text{blend}} = \alpha w_{\text{parent}} + (1 - \alpha) w_{\text{cache}}, \quad \alpha \sim \mathcal{U}(0, 1)$$
-*   **Depth-Decayed Mutation**: Shallow nodes benefit from exploration, while deep nodes operate on smaller, nearly-pure subsets where large mutations overfit. GenForge decays the mutation rate and strength at depth $d$:
-    $$\text{rate}_d = \frac{\text{rate}_0}{\sqrt{1 + d}}, \quad \text{strength}_d = \frac{\text{strength}_0}{1 + d}$$
+$$w_{\text{blend}} = \alpha w_{\text{parent}} + (1 - \alpha) w_{\text{cache}}, \quad \alpha \sim \mathcal{U}(0.2, 0.8)$$
+
+While the cache is still empty (early trees), the slot falls back to fresh GG-SRP-style sparse random draws. The `inherited_rp_ratio` parameter (default 0.5) splits the oblique candidate budget between this informed pool and the global random pool.
+
+**Why no parent-direction mutation?** Earlier versions also mutated the parent node's own direction (Strategy A: weight perturbation; Strategy B: new-axis borrowing). Controlled strategy ablations (see `research/FINDINGS.md`) showed both are consistently 0.4–1pp worse than replacing them with random draws: a split on $w$ consumes the gradient signal along $w$, so the residual signal inside each child concentrates away from the parent direction. Good oblique directions are a *global* property of the dataset (its rotated subspaces) — which is exactly what the cache captures across trees — not a local property of the parent node. Both strategies were removed; `mutation_rate` / `mutation_strength` remain as deprecated no-ops.
 
 *   **RNG Seed Propagation**: To ensure tree diversity and prevent redundant splits across boosting rounds, the Python classifier passes a unique random seed (e.g., `rng.integers(1 << 30)`) to the C++ engine for each tree. The C++ engine then seeds its node-level generators with `seed + t`, ensuring full determinism and maximum diversity.
 
@@ -64,7 +60,7 @@ Samples reaching a child node have already been filtered by the parent node's sp
 ## 4. Memory-Optimized C++ Engine
 
 ### Object-Pool Histogram Recycling (`hist_pool`)
-Building histograms is the primary computational bottleneck in GBDT training. To prevent frequent heap memory allocation (`malloc`) and deallocation (`free`) during best-first node growth, GenForge uses a lightweight object pool for histogram buffers inside `gf_build`:
+Building histograms is the primary computational bottleneck in GBDT training. To prevent frequent heap memory allocation (`malloc`) and deallocation (`free`) during best-first node growth, OQBoost uses a lightweight object pool for histogram buffers inside `gf_build`:
 
 ```cpp
 std::vector<std::vector<float>> hist_pool;
@@ -90,7 +86,7 @@ auto recycle_hist = [&](std::vector<float>& h) {
 This pool recycles 256-bin feature histograms, reducing heap allocation overhead to zero once the pool reaches steady state.
 
 ### Dynamic Hybrid Histogram Parallelization
-GenForge dynamically selects between two OpenMP parallelization strategies depending on the number of features $D$ relative to the CPU thread count $T$:
+OQBoost dynamically selects between two OpenMP parallelization strategies depending on the number of features $D$ relative to the CPU thread count $T$:
 
 1.  **Block-Wise Feature-Parallelism (when $D \ge T$)**:
     *   Features are divided into contiguous blocks of size $\lfloor D/T \rfloor$.
@@ -120,5 +116,6 @@ GenForge dynamically selects between two OpenMP parallelization strategies depen
 Ablation studies on a classification benchmark (100,000 samples, 50 features) demonstrate the impact of each algorithmic design:
 
 *   **GG-SRP vs. Coordinate Descent**: Replacing exact Gauss-Seidel CD coordinate search with GG-SRP maintains balanced accuracy parity while speeding up node evaluation by over **10x**.
-*   **Parent Inheritance & Crossover**: Enabling Strategy C (Crossover) and depth-decayed mutations consistently yields the lowest Log Loss (improving model calibration and reducing overfitting).
-*   **Balanced Argmax**: GenForge predictions use a prior-corrected argmax formula to account for class imbalance, keeping predictions well-calibrated without altering the C++ Newton-Raphson gradients.
+*   **Diversity is the essential ingredient**: budget-matched knockouts show removing the random oblique pool collapses accuracy to the axis-only floor, while the random pool alone matches the full candidate set. Its mechanism is wider feature coverage (feature-usage entropy 0.945 → 0.970), not tree decorrelation, and its win share grows monotonically over boosting rounds (18% → 35%) as residuals become oblique.
+*   **Continuity matters at the dataset scale, not the parent scale**: strategy ablations show the direction cache (Strategy C) is the only inherited-slot component that earns its place; parent-direction mutation (former Strategies A/B) consistently underperformed random replacement and was removed. Full study: `research/FINDINGS.md`.
+*   **Balanced Argmax**: OQBoost predictions use a prior-corrected argmax formula to account for class imbalance, keeping predictions well-calibrated without altering the C++ Newton-Raphson gradients.

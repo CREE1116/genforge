@@ -6,7 +6,7 @@ import pandas as pd
 from _utils import (
     RESULTS_DIR, N_REPS, evaluate_one, _encode_cats,
     _make_xgboost, _make_lightgbm, _make_catboost,
-    _make_genforge, _make_genforge_plain,
+    _make_oqboost, _make_oqboost_plain,
 )
 from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
@@ -55,8 +55,8 @@ def run_cat_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
                 "XGBoost":        _make_xgboost(n_classes, random_state=rep),
                 "LightGBM":       _make_lightgbm(n_classes, random_state=rep),
                 "CatBoost":       _make_catboost(cat_idx, random_state=rep),
-                "GenForge":       _make_genforge_plain(cat_idx, random_state=rep),
-                "GenForge-balanced": _make_genforge(cat_idx, random_state=rep),
+                "OQBoost":       _make_oqboost_plain(cat_idx, random_state=rep),
+                "OQBoost-balanced": _make_oqboost(cat_idx, random_state=rep),
             }
             for mname, model in models.items():
                 print(f"  Rep {rep+1}/{n_reps} card={cardinality} {mname} ...", end="", flush=True)

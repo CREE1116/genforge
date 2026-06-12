@@ -1,9 +1,9 @@
-# GenForge API Reference
+# OQBoost API Reference
 
-## `GenforgeClassifier`
+## `OQBoostClassifier`
 
 ```python
-from genforge import GenforgeClassifier
+from oqboost import OQBoostClassifier
 ```
 
 Gradient-boosted oblique decision tree classifier. Implements the scikit-learn `BaseEstimator`, `ClassifierMixin`, and `TransformerMixin` interfaces.
@@ -11,7 +11,7 @@ Gradient-boosted oblique decision tree classifier. Implements the scikit-learn `
 ### Constructor
 
 ```python
-GenforgeClassifier(
+OQBoostClassifier(
     n_estimators=500,
     learning_rate=0.05,
     max_depth=6,
@@ -22,7 +22,7 @@ GenforgeClassifier(
     verbose=False,
     cat_features=None,
     class_weight="balanced",
-    inherited_rp_ratio=1.0,
+    inherited_rp_ratio=0.5,
     mutation_rate=0.1,
     mutation_strength=0.5,
 )
@@ -42,9 +42,9 @@ GenforgeClassifier(
 | `verbose` | bool | False | Print per-round metrics |
 | `cat_features` | list or None | None | Categorical column names (DataFrame) or indices |
 | `class_weight` | str or None | "balanced" | "balanced" reweights by inverse class frequency |
-| `inherited_rp_ratio` | float | 1.0 | Cache-direction candidate fraction |
-| `mutation_rate` | float | 0.1 | Noise scale for inherited directions |
-| `mutation_strength` | float | 0.5 | Weight of borrowed feature in hybrid directions |
+| `inherited_rp_ratio` | float | 0.5 | Oblique-candidate split: cache-blend pool vs fresh random projections |
+| `mutation_rate` | float | — | Deprecated, ignored (parent-mutation strategies removed) |
+| `mutation_strength` | float | — | Deprecated, ignored (parent-mutation strategies removed) |
 
 ---
 
@@ -94,7 +94,7 @@ Serialize and deserialize a fitted model.
 
 ```python
 clf.save("model.joblib")
-clf2 = GenforgeClassifier.load("model.joblib")
+clf2 = OQBoostClassifier.load("model.joblib")
 ```
 
 ---
@@ -107,7 +107,7 @@ Return number of trees actually fitted (after early stopping).
 
 ### sklearn Compatibility
 
-`GenforgeClassifier` is compatible with `sklearn.pipeline.Pipeline`, `clone`, `GridSearchCV`, and `check_estimator`.
+`OQBoostClassifier` is compatible with `sklearn.pipeline.Pipeline`, `clone`, `GridSearchCV`, and `check_estimator`.
 
 ```python
 from sklearn.pipeline import Pipeline
@@ -115,17 +115,17 @@ from sklearn.preprocessing import StandardScaler
 
 pipe = Pipeline([
     ("scaler", StandardScaler()),
-    ("clf", GenforgeClassifier(n_estimators=300)),
+    ("clf", OQBoostClassifier(n_estimators=300)),
 ])
 pipe.fit(X_train, y_train)
 ```
 
 ---
 
-## `GenforgeTree`
+## `OQBoostTree`
 
 ```python
-from genforge import GenforgeTree
+from oqboost import OQBoostTree
 ```
 
 Single pool-free oblique tree. Useful when you want to manage the boosting loop yourself.
@@ -133,7 +133,7 @@ Single pool-free oblique tree. Useful when you want to manage the boosting loop 
 ### Constructor
 
 ```python
-GenforgeTree(
+OQBoostTree(
     max_depth=4,
     reg_lambda=1.0,
     subsample=1.0,
@@ -153,10 +153,10 @@ Predict leaf values `(N, K)`.
 
 ---
 
-## `GenforgeContext`
+## `OQBoostContext`
 
 ```python
-from genforge._genforge import GenforgeContext
+from oqboost._oqboost import OQBoostContext
 ```
 
 Reusable binning context for a boosting loop. Bins X once; reuses codes across rounds.
@@ -164,14 +164,14 @@ Reusable binning context for a boosting loop. Bins X once; reuses codes across r
 ### Constructor
 
 ```python
-ctx = GenforgeContext(X, D_num=None)
+ctx = OQBoostContext(X, D_num=None)
 ```
 
 ### Methods
 
 #### `build(G, H, sub, max_depth, reg_lambda, ...)`
 
-One boosting round. Returns `(GenforgeTree, np.ndarray)` — the fitted tree and predictions.
+One boosting round. Returns `(OQBoostTree, np.ndarray)` — the fitted tree and predictions.
 
 #### `close()`
 
@@ -182,8 +182,8 @@ Free C++ memory. Called automatically by `__del__`.
 ## `load_model(path)`
 
 ```python
-from genforge import load_model
+from oqboost import load_model
 clf = load_model("model.joblib")
 ```
 
-Shorthand for `GenforgeClassifier.load(path)`.
+Shorthand for `OQBoostClassifier.load(path)`.

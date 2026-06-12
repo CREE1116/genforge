@@ -25,7 +25,7 @@ DATASET_ORDER = [
     "adult", "credit_default", "give_me_some_credit",
     "covertype", "higgs", "rotated_synthetic",
 ]
-MODEL_ORDER = ["XGBoost", "LightGBM", "CatBoost", "GenForge", "GenForge-balanced"]
+MODEL_ORDER = ["XGBoost", "LightGBM", "CatBoost", "OQBoost", "OQBoost-balanced"]
 
 
 def load_all() -> pd.DataFrame:
@@ -50,7 +50,7 @@ def make_main_table(df: pd.DataFrame) -> str:
     agg.columns = ["_".join(c) for c in agg.columns]
     agg = agg.reset_index()
 
-    lines = ["# GenForge Benchmark Results\n"]
+    lines = ["# OQBoost Benchmark Results\n"]
     lines.append("## Main Benchmark Table\n")
     header = "| Dataset | Model | Accuracy | Bal. Acc. | F1 Macro | Log Loss | Train (s) | Infer (s) |"
     sep = "|---------|-------|----------|-----------|----------|----------|-----------|-----------|"
@@ -80,8 +80,8 @@ def make_main_table(df: pd.DataFrame) -> str:
 
 
 def make_summary_stats(df: pd.DataFrame) -> str:
-    gf = df[df["model"] == "GenForge"]
-    lines = ["\n## GenForge Highlights\n"]
+    gf = df[df["model"] == "OQBoost"]
+    lines = ["\n## OQBoost Highlights\n"]
     if gf.empty:
         return "\n".join(lines)
     best_bal = gf.groupby("dataset")["balanced_accuracy"].mean().max()

@@ -22,13 +22,13 @@ env/
 coverage.xml
 htmlcov/
 
-# Compiled shared libraries — excluded globally but explicitly kept for genforge
+# Compiled shared libraries — excluded globally but explicitly kept for oqboost
 *.so
 *.dylib
 *.dll
-!src/genforge/_ext/libbfstree.dylib
-!src/genforge/_ext/libbfstree.so
-!src/genforge/_ext/bfstree.dll
+!src/oqboost/_ext/liboqboost.dylib
+!src/oqboost/_ext/liboqboost.so
+!src/oqboost/_ext/oqboost.dll
 
 # Benchmark large data files (downloaded by user)
 benchmark/data/HIGGS.csv.gz
@@ -45,3 +45,8 @@ uv.lock
 src/hypforge/
 benchmark/catboost_info/
 .DS_Store
+
+# Large benchmark datasets (download locally)
+benchmark/data/
+# CatBoost training artifacts
+catboost_info/

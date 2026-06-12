@@ -6,7 +6,7 @@ import pandas as pd
 from _utils import (
     RESULTS_DIR, N_REPS, evaluate_one,
     _make_xgboost, _make_lightgbm, _make_catboost,
-    _make_genforge, _make_genforge_plain,
+    _make_oqboost, _make_oqboost_plain,
 )
 from sklearn.datasets import fetch_openml
 from sklearn.model_selection import train_test_split
@@ -52,8 +52,8 @@ def run_missing_robustness(n_reps: int = N_REPS) -> pd.DataFrame:
                 "XGBoost":        _make_xgboost(n_classes, random_state=rep),
                 "LightGBM":       _make_lightgbm(n_classes, random_state=rep),
                 "CatBoost":       _make_catboost(None, random_state=rep),
-                "GenForge":       _make_genforge_plain(None, random_state=rep),
-                "GenForge-balanced": _make_genforge(None, random_state=rep),
+                "OQBoost":       _make_oqboost_plain(None, random_state=rep),
+                "OQBoost-balanced": _make_oqboost(None, random_state=rep),
             }
             for mname, model in models.items():
                 print(f"  Rep {rep+1}/{n_reps} missing={ratio:.0%} {mname} ...", end="", flush=True)

@@ -38,11 +38,11 @@ jobs:
       - name: Smoke test
         run: |
           python -c "
-          from genforge import GenforgeClassifier
+          from oqboost import OQBoostClassifier
           import numpy as np
           X = np.random.randn(200, 10).astype('float32')
           y = np.random.randint(0, 2, 200)
-          clf = GenforgeClassifier(n_estimators=5, max_depth=3)
+          clf = OQBoostClassifier(n_estimators=5, max_depth=3)
           clf.fit(X, y)
           print('predict:', clf.predict(X).shape)
           print('CI PASS')
