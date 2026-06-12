@@ -44,6 +44,9 @@ class SplitRecord:
     angle_from_axis: float    # 0° = axis-aligned, 90° = fully oblique
     is_oblique_winner: bool   # True if WLS direction beat all axis-aligned candidates
     winner_type: str = 'axis' # which candidate won: axis | wls | inherit_A | inherit_B
+    cos_oracle: Optional[float] = None
+    gain_ratio: Optional[float] = None
+    best_oblique_gain: Optional[float] = None
 
 
 @dataclass
@@ -130,27 +133,40 @@ def _best_threshold(proj: torch.Tensor, G: torch.Tensor, H: torch.Tensor,
 
     G_tot = G.sum(0)
     H_tot = H.sum(0)
-    root = _node_score(G_tot, H_tot, lam)
+    root = float((G_tot.pow(2) / (H_tot + lam)).sum() / 2)
 
-    G_left = torch.zeros_like(G_tot)
-    H_left = torch.zeros_like(H_tot)
-
-    best_gain = -1e18
-    best_t = float(proj_s[0])
+    G_cum = torch.cumsum(G_s, dim=0)
+    H_cum = torch.cumsum(H_s, dim=0)
 
     step = max(1, N // n_bins)
-    for i in range(step, N - step, step):
-        G_left = G_left + G_s[i - step:i].sum(0)
-        H_left = H_left + H_s[i - step:i].sum(0)
-        G_right = G_tot - G_left
-        H_right = H_tot - H_left
-        if float(H_left.sum()) < 0.1 or float(H_right.sum()) < 0.1:
-            continue
-        gain = (_node_score(G_left, H_left, lam) +
-                _node_score(G_right, H_right, lam) - root)
-        if gain > best_gain:
-            best_gain = gain
-            best_t = float((proj_s[i - 1] + proj_s[i]) / 2)
+    range_t = torch.arange(step, N - step, step, dtype=torch.long, device=proj.device)
+    if len(range_t) == 0:
+        return float(proj_s[0]), -1e18
+
+    idxs = range_t - 1
+    G_left = G_cum[idxs]  # shape (n_bins - 1, K)
+    H_left = H_cum[idxs]  # shape (n_bins - 1, K)
+
+    G_right = G_tot.unsqueeze(0) - G_left
+    H_right = H_tot.unsqueeze(0) - H_left
+
+    score_left = (G_left.pow(2) / (H_left + lam)).sum(dim=-1) / 2
+    score_right = (G_right.pow(2) / (H_right + lam)).sum(dim=-1) / 2
+
+    gains = score_left + score_right - root
+
+    # Mask valid splits
+    valid_mask = (H_left.sum(dim=-1) >= 0.1) & (H_right.sum(dim=-1) >= 0.1)
+    if not valid_mask.any():
+        return float(proj_s[0]), -1e18
+
+    gains = torch.where(valid_mask, gains, torch.tensor(-1e18, dtype=gains.dtype, device=gains.device))
+
+    best_idx = gains.argmax()
+    best_gain = float(gains[best_idx])
+    
+    i = int(range_t[best_idx])
+    best_t = float((proj_s[i - 1] + proj_s[i]) / 2)
 
     return best_t, best_gain
 
@@ -177,6 +193,186 @@ def _obliqueness(w: torch.Tensor) -> float:
         return 0.0
     cos_axis = float(w.abs().max()) / norm
     return float(np.degrees(np.arccos(min(cos_axis, 1.0))))
+
+
+def _coordinate_descent(
+    w_start: torch.Tensor,
+    X_opt: torch.Tensor,
+    G_opt: torch.Tensor,
+    H_opt: torch.Tensor,
+    top_feat: list[int],
+    reg_lambda: float,
+) -> tuple[torch.Tensor, float]:
+    w = w_start.clone()
+    proj = X_opt @ w
+    _, best_gain = _best_threshold(proj, G_opt, H_opt, reg_lambda, n_bins=32)
+    
+    # 1 pass of coordinate descent with step size 0.3
+    step = 0.3
+    for j in top_feat:
+        orig_val = w[j].item()
+        best_j_val = orig_val
+        best_j_gain = best_gain
+        
+        for delta in [-step, step]:
+            w[j] = orig_val + delta
+            n = w.norm()
+            if n < 1e-8:
+                continue
+            w_norm = w / n
+            proj = X_opt @ w_norm
+            _, g = _best_threshold(proj, G_opt, H_opt, reg_lambda, n_bins=32)
+            if g > best_j_gain:
+                best_j_gain = g
+                best_j_val = orig_val + delta
+        
+        if best_j_gain > best_gain:
+            w[j] = best_j_val
+            n = w.norm()
+            w = w / n
+            best_gain = best_j_gain
+        else:
+            w[j] = orig_val
+            
+    return w, best_gain
+
+
+def _coordinate_descent_j(
+    w_start_sub: torch.Tensor,
+    G_vec: torch.Tensor,
+    A: torch.Tensor,
+    n_epochs: int = 3
+) -> torch.Tensor:
+    """
+    Coordinate descent to maximize J(w) = (w^T G)^2 / (w^T A w) in a subspace.
+    A and G_vec are precomputed once at the node level.
+    """
+    d_sub = A.shape[0]
+    w = w_start_sub.clone()
+    n = w.norm()
+    if n > 1e-8:
+        w = w / n
+    else:
+        w = torch.zeros(d_sub, dtype=A.dtype, device=A.device)
+        w[0] = 1.0
+        
+    # State tracking variables
+    w_G = float(torch.dot(w, G_vec).item())
+    Aw = A @ w
+    w_Aw = float(torch.dot(w, Aw).item())
+    
+    for epoch in range(n_epochs):
+        for f in range(d_sub):
+            a = w_G
+            g_val = float(G_vec[f].item())
+            b = w_Aw
+            c = float(Aw[f].item())
+            d = float(A[f, f].item())
+            
+            denom = g_val * c - a * d
+            if abs(denom) > 1e-9:
+                delta = (a * c - g_val * b) / denom
+            else:
+                delta = 0.0
+                
+            # Clamp delta to avoid numerical instability
+            if abs(delta) > 10.0:
+                delta = 10.0 * np.sign(delta)
+                
+            w[f] += delta
+            
+            # Update state in-place
+            w_G += delta * G_vec[f].item()
+            Aw += delta * A[:, f]
+            w_Aw = w_Aw + 2.0 * delta * c + (delta ** 2) * d
+            
+    # Normalize final direction
+    n = w.norm()
+    if n > 1e-8:
+        w = w / n
+    return w
+
+
+
+def _oracle_search(
+    X_node: torch.Tensor,
+    G_node: torch.Tensor,
+    H_node: torch.Tensor,
+    top_feat: list[int],
+    k_dom: int,
+    reg_lambda: float,
+    use_wls: bool = True,
+) -> tuple[torch.Tensor, float]:
+    D = X_node.shape[1]
+    starts = []
+    
+    # A. WLS
+    w_wls = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+    if use_wls:
+        X_sub = X_node[:, top_feat]
+        w_wls_sub = _wls_direction(X_sub, G_node, H_node, k_dom, reg_lambda)
+        w_wls[top_feat] = w_wls_sub
+        n = w_wls.norm()
+        if n > 1e-8:
+            starts.append(w_wls / n)
+            
+    # B. Best axis-aligned
+    best_axis_w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+    best_axis_gain = -1e18
+    for f in top_feat:
+        proj = X_node[:, f]
+        _, gain = _best_threshold(proj, G_node, H_node, reg_lambda)
+        if gain > best_axis_gain:
+            best_axis_gain = gain
+            best_axis_w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+            best_axis_w[f] = 1.0
+    if best_axis_w.norm() > 1e-8:
+        starts.append(best_axis_w)
+        
+    # C. Two random starts on top_feat
+    for _ in range(2):
+        w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+        signs = torch.where(torch.rand(len(top_feat), device=X_node.device) < 0.5, -1.0, 1.0)
+        w_r[top_feat] = signs
+        n = w_r.norm()
+        if n > 1e-8:
+            starts.append(w_r / n)
+            
+    if not starts:
+        w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+        w_r[top_feat[0]] = 1.0
+        starts.append(w_r)
+        
+    N = X_node.shape[0]
+    sub_size = min(64, N)
+    if N > sub_size:
+        sub_idx = torch.randperm(N, device=X_node.device)[:sub_size]
+        X_opt = X_node[sub_idx]
+        G_opt = G_node[sub_idx]
+        H_opt = H_node[sub_idx]
+    else:
+        X_opt = X_node
+        G_opt = G_node
+        H_opt = H_node
+        
+    # Evaluate starting candidates on X_opt to select the best one
+    best_start_w = starts[0]
+    best_start_gain = -1e18
+    for w_s in starts:
+        proj = X_opt @ w_s
+        _, gain = _best_threshold(proj, G_opt, H_opt, reg_lambda, n_bins=32)
+        if gain > best_start_gain:
+            best_start_gain = gain
+            best_start_w = w_s
+            
+    # Run coordinate descent only on the best start
+    w_opt, _ = _coordinate_descent(best_start_w, X_opt, G_opt, H_opt, top_feat, reg_lambda)
+    
+    # Evaluate the optimized direction on the full node data
+    proj_all = X_node @ w_opt
+    _, g_all = _best_threshold(proj_all, G_node, H_node, reg_lambda)
+    
+    return w_opt, g_all
 
 
 # ─── Single research tree ─────────────────────────────────────────────────────
@@ -214,6 +410,7 @@ class OQBoostResearchTree:
         dir_cache: Optional[list] = None,
         winning_history: Optional[list] = None,
         diversity_mode: str = 'iid',  # 'iid' | 'pobs' | 'pobs_sis'
+        record_alignment: bool = False,
     ):
         self.max_depth = max_depth
         self.reg_lambda = reg_lambda
@@ -234,6 +431,7 @@ class OQBoostResearchTree:
         self.dir_cache = dir_cache
         self.winning_history = winning_history
         self.diversity_mode = diversity_mode
+        self.record_alignment = record_alignment
 
         self.root_: Optional[Node] = None
         self.split_records_: list[SplitRecord] = []
@@ -367,16 +565,221 @@ class OQBoostResearchTree:
         d_sub = min(self.d_sub, D)
         top_feat = scores.topk(d_sub).indices.tolist()
 
+        # Check if we are running in one of the new Experiment PX modes
+        is_px_mode = False
+        mode = self.inherit_mode
+        budget = 16
+        
+        if mode == 'oracle':
+            is_px_mode = True
+        elif mode == 'gg_srp':
+            is_px_mode = True
+        else:
+            parts = mode.split('_')
+            if len(parts) >= 3 and parts[0] == 'proxy' and parts[1] == 'search':
+                is_px_mode = True
+                budget = int(parts[2])
+                mode = 'proxy_search'
+            elif len(parts) >= 3 and parts[0] == 'pure' and parts[1] == 'random':
+                is_px_mode = True
+                budget = int(parts[2])
+                mode = 'pure_random'
+            elif len(parts) >= 4 and parts[0] == 'proxy' and parts[1] == 'cd' and parts[2] == 'axis':
+                is_px_mode = True
+                budget = int(parts[3])
+                mode = 'proxy_cd_axis'
+            elif len(parts) >= 4 and parts[0] == 'proxy' and parts[1] == 'cov' and parts[2] == 'axis':
+                is_px_mode = True
+                budget = int(parts[3])
+                mode = 'proxy_cov_axis'
+            elif len(parts) >= 3 and parts[0] == 'proxy' and parts[1] == 'cd':
+                is_px_mode = True
+                budget = int(parts[2])
+                mode = 'proxy_cd'
+            elif len(parts) >= 3 and parts[0] == 'proxy' and parts[1] == 'cov':
+                is_px_mode = True
+                budget = int(parts[2])
+                mode = 'proxy_cov'
+
         candidates: list[tuple[torch.Tensor, str]] = []
 
+        if is_px_mode:
+            if mode == 'oracle':
+                starts = []
+                w_wls = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                X_sub = X_node[:, top_feat]
+                w_wls_sub = _wls_direction(X_sub, G_node, H_node, k_dom, self.reg_lambda)
+                w_wls[top_feat] = w_wls_sub
+                n = w_wls.norm()
+                if n > 1e-8:
+                    starts.append(w_wls / n)
+                best_axis_w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                best_axis_gain = -1e18
+                for f in top_feat:
+                    proj = X_node[:, f]
+                    _, gain = _best_threshold(proj, G_node, H_node, self.reg_lambda)
+                    if gain > best_axis_gain:
+                        best_axis_gain = gain
+                        best_axis_w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        best_axis_w[f] = 1.0
+                if best_axis_w.norm() > 1e-8:
+                    starts.append(best_axis_w)
+                for _ in range(2):
+                    w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    signs = torch.where(torch.rand(len(top_feat), device=X_node.device) < 0.5, -1.0, 1.0)
+                    w_r[top_feat] = signs
+                    n = w_r.norm()
+                    if n > 1e-8:
+                        starts.append(w_r / n)
+                while len(starts) < 4:
+                    w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w_r[top_feat[0]] = 1.0
+                    starts.append(w_r)
+                N_node = X_node.shape[0]
+                if N_node > 500:
+                    sub_idx = torch.randperm(N_node, device=X_node.device)[:500]
+                    X_opt = X_node[sub_idx]
+                    G_opt = G_node[sub_idx]
+                    H_opt = H_node[sub_idx]
+                else:
+                    X_opt = X_node
+                    G_opt = G_node
+                    H_opt = H_node
+                for w_s in starts[:4]:
+                    w_opt, _ = _coordinate_descent(w_s, X_opt, G_opt, H_opt, top_feat, self.reg_lambda)
+                    candidates.append((w_opt, 'oracle'))
+            elif mode == 'gg_srp':
+                for f in top_feat:
+                    w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w[f] = 1.0
+                    candidates.append((w, 'axis'))
+                X_sub = X_node[:, top_feat]
+                w_wls = _wls_direction(X_sub, G_node, H_node, k_dom, self.reg_lambda)
+                w_full = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                w_full[top_feat] = w_wls
+                norm = float(w_full.norm())
+                if norm > 1e-8:
+                    w_full = w_full / norm
+                candidates.append((w_full, 'wls'))
+                for _ in range(16):
+                    w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    signs = torch.where(torch.rand(len(top_feat), device=X_node.device) < 0.5, -1.0, 1.0)
+                    w_r[top_feat] = signs
+                    w_r = w_r / (w_r.norm() + 1e-8)
+                    candidates.append((w_r, 'random'))
+            elif mode == 'proxy_search':
+                for f in top_feat:
+                    w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w[f] = 1.0
+                    candidates.append((w, 'axis'))
+                for _ in range(budget):
+                    w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    signs = torch.where(torch.rand(len(top_feat), device=X_node.device) < 0.5, -1.0, 1.0)
+                    w_r[top_feat] = signs
+                    w_r = w_r / (w_r.norm() + 1e-8)
+                    candidates.append((w_r, 'proxy'))
+            elif mode == 'pure_random':
+                for f in top_feat:
+                    w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w[f] = 1.0
+                    candidates.append((w, 'axis'))
+                for _ in range(budget):
+                    rand_feat = torch.randperm(D, device=X_node.device)[:d_sub]
+                    w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    signs = torch.where(torch.rand(d_sub, device=X_node.device) < 0.5, -1.0, 1.0)
+                    w_r[rand_feat] = signs
+                    w_r = w_r / (w_r.norm() + 1e-8)
+                    candidates.append((w_r, 'random'))
+
+                
+            elif mode in ['proxy_cd', 'proxy_cd_axis']:
+                # Sliced subspace data
+                X_sub = X_node[:, top_feat]
+                g_node = G_node[:, k_dom]
+                h_node = H_node[:, k_dom]
+                
+                # Precompute G_sub = - X_sub.T @ g_node
+                G_vec = - (X_sub.T @ g_node)
+                
+                # Precompute A_sub = X_sub.T @ diag(h) @ X_sub + lambda * I
+                XH = X_sub * h_node.unsqueeze(1)
+                A = XH.T @ X_sub + self.reg_lambda * torch.eye(d_sub, dtype=X_node.dtype, device=X_node.device)
+                
+                # Starting points: draw random sparse directions on top_feat subspace
+                if budget == 1:
+                    if mode == 'proxy_cd_axis':
+                        for f in top_feat:
+                            w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                            w[f] = 1.0
+                            candidates.append((w, 'axis'))
+                    w_r_sub = G_vec.clone()
+                    w_opt_sub = _coordinate_descent_j(
+                        w_r_sub, G_vec, A, n_epochs=3
+                    )
+                    w_opt = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w_opt[top_feat] = w_opt_sub
+                    candidates.append((w_opt, 'proxy_cd'))
+                else:
+                    for f in top_feat:
+                        w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        w[f] = 1.0
+                        candidates.append((w, 'axis'))
+                    for _ in range(budget):
+                        w_r_sub = torch.where(torch.rand(d_sub, device=X_node.device) < 0.5, -1.0, 1.0).to(X_node.dtype)
+                        w_r_sub = w_r_sub / (w_r_sub.norm() + 1e-8)
+                        w_opt_sub = _coordinate_descent_j(
+                            w_r_sub, G_vec, A, n_epochs=3
+                        )
+                        w_opt = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        w_opt[top_feat] = w_opt_sub
+                        candidates.append((w_opt, 'proxy_cd'))
+            elif mode in ['proxy_cov', 'proxy_cov_axis']:
+                # Sliced subspace data
+                X_sub = X_node[:, top_feat]
+                g_node = G_node[:, k_dom]
+                
+                # Precompute G_sub = - X_sub.T @ g_node
+                G_vec = - (X_sub.T @ g_node)
+                
+                if budget == 1:
+                    if mode == 'proxy_cov_axis':
+                        for f in top_feat:
+                            w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                            w[f] = 1.0
+                            candidates.append((w, 'axis'))
+                    w_sub = G_vec.clone()
+                    w_sub = w_sub / (w_sub.norm() + 1e-8)
+                    w_opt = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    w_opt[top_feat] = w_sub
+                    candidates.append((w_opt, 'proxy_cov'))
+                else:
+                    for f in top_feat:
+                        w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        w[f] = 1.0
+                        candidates.append((w, 'axis'))
+                    # Generate candidates by selecting random subsets of top_feat and using G_vec values
+                    for _ in range(budget):
+                        mask = torch.rand(d_sub, device=X_node.device) < 0.5
+                        if not mask.any():
+                            mask[torch.randint(d_sub, (1,), device=X_node.device)] = True
+                            
+                        w_sub = torch.zeros(d_sub, dtype=X_node.dtype, device=X_node.device)
+                        w_sub[mask] = G_vec[mask]
+                        w_sub = w_sub / (w_sub.norm() + 1e-8)
+                        
+                        w_opt = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        w_opt[top_feat] = w_sub
+                        candidates.append((w_opt, 'proxy_cov'))
+
         # 1. Axis-aligned: each top feature individually
-        for f in top_feat:
-            w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
-            w[f] = 1.0
-            candidates.append((w, 'axis'))
+        if not is_px_mode:
+            for f in top_feat:
+                w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                w[f] = 1.0
+                candidates.append((w, 'axis'))
 
         # 2. WLS oblique direction on top features
-        if self.use_wls:
+        if self.use_wls and not is_px_mode:
             X_sub = X_node[:, top_feat]
             w_wls = _wls_direction(X_sub, G_node, H_node, k_dom, self.reg_lambda)
             w_full = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
@@ -387,7 +790,7 @@ class OQBoostResearchTree:
             candidates.append((w_full, 'wls'))
 
         # 3. Inherited parent direction
-        if parent_w is not None and self.inherited_rp_ratio > 0:
+        if parent_w is not None and self.inherited_rp_ratio > 0 and not is_px_mode:
             wp = parent_w / (parent_w.norm() + 1e-12)
             support = parent_w.abs() > 1e-8
 
@@ -853,7 +1256,7 @@ class OQBoostResearchTree:
                     candidates.append(c)
 
         # 4. Diversity family — parent-independent random directions.
-        if self.n_random > 0:
+        if self.n_random > 0 and not is_px_mode:
             if self.diversity_mode == 'pobs':
                 # User-spec POBS: Haar-random orthogonal block, columns
                 # sliced as candidates, then a random sparsity mask.
@@ -959,14 +1362,33 @@ class OQBoostResearchTree:
         G_node_cpu = G_node.cpu()
         H_node_cpu = H_node.cpu()
 
+        best_oblique_gain = None
         for idx_cand, (w, ctype) in enumerate(candidates):
             proj = all_proj_cpu[:, idx_cand]
             thresh, gain = _best_threshold(proj, G_node_cpu, H_node_cpu, self.reg_lambda)
+            if ctype != 'axis':
+                if best_oblique_gain is None or gain > best_oblique_gain:
+                    best_oblique_gain = gain
             if gain > best_gain:
                 best_gain = gain
                 best_w = w
                 best_thresh = thresh
                 best_type = ctype
+
+        # Alignment metrics tracking
+        cos_oracle = None
+        gain_ratio = None
+        if self.record_alignment:
+            if is_px_mode and mode == 'oracle':
+                w_oracle = best_w
+                g_oracle = best_gain
+            else:
+                w_oracle, g_oracle = _oracle_search(
+                    X_node, G_node, H_node, top_feat, k_dom, self.reg_lambda, use_wls=self.use_wls
+                )
+            
+            cos_oracle = float(abs(torch.dot(w_oracle.to(best_w.device), best_w))) / (w_oracle.norm() * best_w.norm() + 1e-8).item()
+            gain_ratio = float(best_gain / (g_oracle + 1e-8))
 
         if best_gain <= 0:
             return best_w, best_thresh, best_gain, None
@@ -984,8 +1406,11 @@ class OQBoostResearchTree:
                 _angle_deg(best_w, parent_w) if parent_w is not None else float('nan')
             ),
             angle_from_axis=_obliqueness(best_w),
-            is_oblique_winner=(best_type == 'wls'),
+            is_oblique_winner=(best_type != 'axis'),
             winner_type=best_type,
+            cos_oracle=cos_oracle,
+            gain_ratio=gain_ratio,
+            best_oblique_gain=best_oblique_gain,
         )
         return best_w, best_thresh, best_gain, record
 
@@ -1068,6 +1493,7 @@ class OQBoostResearch:
         n_random: int = 0,
         n_inherit: int = 4,
         diversity_mode: str = 'iid',
+        record_alignment: bool = False,
     ):
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
@@ -1089,6 +1515,7 @@ class OQBoostResearch:
         self.n_random = n_random
         self.n_inherit = n_inherit
         self.diversity_mode = diversity_mode
+        self.record_alignment = record_alignment
 
         if device == 'auto':
             if torch.cuda.is_available():
@@ -1164,6 +1591,7 @@ class OQBoostResearch:
                 dir_cache=self.dir_cache_,
                 winning_history=self.winning_history_,
                 diversity_mode=self.diversity_mode,
+                record_alignment=self.record_alignment,
             )
 
             # Build on subsample; predict on full X for F update
@@ -1284,7 +1712,7 @@ class OQBoostResearch:
             D = records[0].w.shape[0]
             imp = np.zeros(D)
             for r in records:
-                w_abs = r.w.abs().numpy()
+                w_abs = r.w.abs().cpu().numpy()
                 if mode == 'gain_weighted':
                     imp += w_abs * max(r.gain, 0.0)
                 elif mode == 'magnitude':

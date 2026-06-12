@@ -1,98 +1,98 @@
 {
     "adult": {
         "XGBoost": {
-            "learning_rate": 0.06847739902709346,
-            "max_depth": 7,
-            "subsample": 0.9381052981240365,
-            "colsample_bytree": 0.5291740486445293,
-            "min_child_weight": 5.176334459199232,
-            "reg_lambda": 0.029831206458753954,
-            "reg_alpha": 1.0333433660755313
+            "learning_rate": 0.019059453939477687,
+            "max_depth": 9,
+            "subsample": 0.934368034754007,
+            "colsample_bytree": 0.6196730658198994,
+            "min_child_weight": 9.93460872540233,
+            "reg_lambda": 0.013014087794424915,
+            "reg_alpha": 0.05647110231034713
         },
         "LightGBM": {
-            "max_depth": 5,
-            "learning_rate": 0.06102897743301268,
-            "num_leaves": 255,
-            "subsample": 0.99853285280431,
-            "colsample_bytree": 0.8842143150553543,
-            "min_child_samples": 33,
-            "reg_lambda": 0.03905297524994547,
-            "reg_alpha": 0.006414832543135286
+            "max_depth": 10,
+            "learning_rate": 0.03900930962700031,
+            "num_leaves": 72,
+            "subsample": 0.9360658040001307,
+            "colsample_bytree": 0.7202249093548448,
+            "min_child_samples": 43,
+            "reg_lambda": 0.455587083789881,
+            "reg_alpha": 0.14876655118040405
         },
         "CatBoost": {
-            "learning_rate": 0.1368663843054387,
-            "depth": 6,
-            "l2_leaf_reg": 15.018427185390774
+            "learning_rate": 0.07785915862669697,
+            "depth": 8,
+            "l2_leaf_reg": 4.605522260620054
         },
         "OQBoost": {
-            "learning_rate": 0.07966124805672536,
+            "learning_rate": 0.017154714661018623,
             "max_depth": 5,
-            "subsample": 0.9967447100569178,
-            "reg_lambda": 6.598155630954031
+            "subsample": 0.9739055738874087,
+            "reg_lambda": 1.1159827814996675
         }
     },
     "credit_default": {
         "XGBoost": {
-            "learning_rate": 0.1395090927773516,
+            "learning_rate": 0.053600068652936976,
             "max_depth": 9,
-            "subsample": 0.7101253696260256,
-            "colsample_bytree": 0.9084769930203007,
-            "min_child_weight": 19.288484362358517,
-            "reg_lambda": 2.63574896242199,
-            "reg_alpha": 2.9128857280302953
+            "subsample": 0.5470326352118376,
+            "colsample_bytree": 0.969460578443926,
+            "min_child_weight": 11.561114295183533,
+            "reg_lambda": 8.252224133938963,
+            "reg_alpha": 2.889457775891894
         },
         "LightGBM": {
-            "max_depth": 5,
-            "learning_rate": 0.05497855902954822,
-            "num_leaves": 41,
-            "subsample": 0.7870500950037892,
-            "colsample_bytree": 0.9324360445282021,
-            "min_child_samples": 9,
-            "reg_lambda": 4.458695988980687,
-            "reg_alpha": 4.373232206048755
+            "max_depth": 12,
+            "learning_rate": 0.054255669435735655,
+            "num_leaves": 32,
+            "subsample": 0.5490137035770993,
+            "colsample_bytree": 0.9784296424895239,
+            "min_child_samples": 58,
+            "reg_lambda": 4.411166115437241,
+            "reg_alpha": 0.007794832441818355
         },
         "CatBoost": {
-            "learning_rate": 0.231753557192516,
-            "depth": 7,
-            "l2_leaf_reg": 3.5170848434732815
+            "learning_rate": 0.17249505589551348,
+            "depth": 5,
+            "l2_leaf_reg": 6.5998706630823465
         },
         "OQBoost": {
-            "learning_rate": 0.1973520579426522,
-            "max_depth": 6,
-            "subsample": 0.5535461448631676,
-            "reg_lambda": 12.637173457431624
+            "learning_rate": 0.07878000826655275,
+            "max_depth": 4,
+            "subsample": 0.6598668658645528,
+            "reg_lambda": 19.87126110783892
         }
     },
     "give_me_some_credit": {
         "XGBoost": {
-            "learning_rate": 0.18211403249259053,
-            "max_depth": 9,
-            "subsample": 0.6158581011625684,
-            "colsample_bytree": 0.5869437031891176,
-            "min_child_weight": 19.52966850987075,
-            "reg_lambda": 0.08619420967596052,
-            "reg_alpha": 0.440290001483212
+            "learning_rate": 0.2021572632188189,
+            "max_depth": 5,
+            "subsample": 0.6321184691009888,
+            "colsample_bytree": 0.5867850128669226,
+            "min_child_weight": 19.680737535336092,
+            "reg_lambda": 0.002646178489529458,
+            "reg_alpha": 0.005131602780467851
         },
         "LightGBM": {
-            "max_depth": 4,
-            "learning_rate": 0.22378854138549178,
-            "num_leaves": 168,
-            "subsample": 0.6427734440586391,
-            "colsample_bytree": 0.7962717403552559,
-            "min_child_samples": 93,
-            "reg_lambda": 0.0014956336076581355,
-            "reg_alpha": 0.19087466840437733
+            "max_depth": 8,
+            "learning_rate": 0.2314940448067701,
+            "num_leaves": 146,
+            "subsample": 0.6187345154093193,
+            "colsample_bytree": 0.8681143332942529,
+            "min_child_samples": 92,
+            "reg_lambda": 0.02718913921945835,
+            "reg_alpha": 0.028957284570678452
         },
         "CatBoost": {
-            "learning_rate": 0.28291864989564375,
+            "learning_rate": 0.2713664420063428,
             "depth": 5,
-            "l2_leaf_reg": 6.238873857696808
+            "l2_leaf_reg": 16.209719823453376
         },
         "OQBoost": {
-            "learning_rate": 0.1115324957468542,
-            "max_depth": 5,
-            "subsample": 0.5556206878037047,
-            "reg_lambda": 16.388032724745585
+            "learning_rate": 0.11872777333112683,
+            "max_depth": 4,
+            "subsample": 0.872748338455775,
+            "reg_lambda": 12.570525856343505
         }
     }
 }

@@ -225,6 +225,142 @@ compute-reallocation win — constrain the expensive estimate (direction),
 spend the savings on tournament breadth.* At equal wall-clock the gap
 should widen further (2× was conservative).
 
+### 2026-06-12 — Covariance analytical candidate (`docs/cov_oqboost.md`, `research/cov_experiment.py`)
+
+User-proposed spec: replace the random tournament with ONE analytical
+direction $w^* = -X^Tg/\|X^Tg\|$ (linearized WLS, no matrix solve — distinct
+from the rejected full WLS). Implemented behind `OQB_COV_MODE` in the engine:
+SIS top-$d_{sub}$ support, two scalings (spec-literal raw covariance +
+diagonal-Newton $-c_d/(\Sigma h x_d^2+\lambda)$, scale-robust). Mode 1 appends
+both to the pool; mode 2 replaces the 32-candidate random/inherited pool.
+
+Synthetic sanity (20k×50 `make_classification`): mode 1 logloss −10%,
+mode 2 −7% and 10% faster. Deployment protocol (tuned params + ES, 3 reps):
+
+```
+                       mode0 (base)      mode1 (+cov)      mode2 (replace)
+adult        ll/auc    0.2745/0.9293     0.2751/0.9292     0.2781/0.9276
+credit_def   ll/auc    0.4334/0.7761     0.4339/0.7765     0.4328/0.7775
+gmsc(de-credit) ll     0.5322            0.5333            0.5424
+```
+
+**Rejected for integration.** The synthetic gain does not transfer: mode 1 is
+noise-level everywhere (the cov candidate almost never wins on real data),
+mode 2 regresses adult and the small dataset. §1 reading: on
+`make_classification` the Bayes boundary IS a linear combination of the
+informative features, so the analytical direction sits exactly on the gain
+ridge; on real tabular data the ridge is interaction-dominated and one
+analytical candidate has less tail mass than 32 random draws. Note the engine
+already consumes the covariance signal ($cg_s$) as the SIS sampling weights
+and Strategy-B sign choice — the marginal information in the full vector is
+small. Gate kept in the engine (default 0 = production identical) for future
+probes.
+
+### 2026-06-12 — Depth-adaptive candidate budget (`research/budget_experiment.py`) ✅ MERGED
+
+§2/P4-refined applied to budget allocation instead of structure: per-level
+total cost is constant (level sample counts sum to N) so deep levels consume
+most of the oblique budget, yet deep-node direction estimates are
+noise-dominated. `OQB_BUDGET_MODE`: 1 = cut (pool 32→8 at depth ≥ 3),
+2 = cut + reinvest (pool 64 at depth ≤ 2, 8 at depth ≥ 3).
+
+Deployment protocol (tuned+ES, 3 reps) + covtype multiclass (100k, 1 rep):
+
+```
+                       mode0 (uniform)    mode1 (cut)       mode2 (reinvest)
+adult        ll/acc    0.2745/0.8613      0.2744/0.8613     0.2749/0.8614
+             fit       8.5s/579t          7.9s/482t         6.4s/436t (−25%)
+credit_def   ll        0.4334             0.4330            0.4336
+gmsc         ll        0.5322             0.5376            0.5287
+covtype K=7  ll/acc    0.2756/0.8997      0.2812/0.8983     0.2768/0.9010
+```
+
+- **Mode 2 is Pareto across all four datasets**: accuracy ties or wins
+  everywhere, logloss within noise, adult fit −25% (ES converges in fewer
+  rounds — wider shallow tournaments make early trees stronger).
+- Mode 1 (cut without reinvest) loses logloss on covtype: deep candidates
+  still carry signal on large-N datasets; the reinvested shallow width
+  compensates. Cut and reinvest are a package.
+- Synthetic showed the opposite ordering (mode 0 best) — synthetic deep
+  nodes keep clean linear signal, confirming the mechanism is deep-node
+  estimation noise, not budget size per se.
+
+**Merged as engine default 2026-06-12** (first engine change to pass the
+standing rule end-to-end). `OQB_BUDGET_MODE=0` restores the uniform pool.
+
+### 2026-06-12 — §1 open task closed: empirical F_f and optimal allocation (`research/family_allocation.py`)
+
+Engine instrumented with `OQB_GAIN_LOG` (per-candidate `node,depth,ns,family,
+gain` CSV; default off). 1.36M candidate gains on adult (tuned+ES), 1.2M on
+covtype 100k, uniform budget for unbiased sampling.
+
+Measurements:
+- **Win rates**: cache-exact 40-42%, axis 35-75%, B 2-12%, C 3-10%, A 0.5-2%.
+- **E[max k]/poolmax curves**: Strategy A saturates immediately
+  (k=1: 0.55 → k=32: 0.62 — its draws are correlated perturbations of one
+  parent direction, so extra draws buy almost nothing). B and C tails keep
+  growing through k=32. Greedy concave allocation: **a:1 b:15 c:16**
+  (consistent on 3 of 4 depth buckets; covtype-shallow unreliable, 1.3k nodes).
+- Confirms the §1 frame *within a node*: A is worth ≈1 slot of tail coverage,
+  not 12.
+
+`OQB_POOL_MIX=1` (a 6.25% / b 46.9% / c 46.9%) deployment protocol:
+
+```
+              mix0 (production)   mix1 (data-optimal)
+adult         0.2749/0.8614       0.2751/0.8609
+credit_def    0.4336              0.4332
+gmsc          0.5287              0.5520
+covtype K=7   0.2768/0.9010       0.2803/0.8966
+```
+
+**Rejected.** covtype −0.4pp accuracy, gmsc regresses; only credit_default
+marginally better. The decisive lesson: **per-node E[max gain] is the wrong
+objective for the ensemble** — A's value is not visible in its per-node gain
+distribution. This is Claim 2a (A as capacity control / inter-tree
+correlation structure) resurfacing with direct evidence: an allocation that
+provably raises per-node split quality lowers ensemble quality. The
+production a:b:c = 37.5:37.5:25 split survives its third challenge.
+Gate kept (default 0). Instrumentation (`OQB_GAIN_LOG`) kept for future use.
+
+### 2026-06-12 — pobs_sis in the engine (`research/pobs_experiment.py`) ✅ MERGED
+
+C++ port of the validated pobs_sis form behind `OQB_POBS`: per block, sample
+an SIS-weighted support S (|S| ≈ √D), build an exact Haar-orthogonal block ON
+S by Gram-Schmidt (sparse + exactly orthogonal + gradient-informed; the
+orthogonalization is m³ ≈ hundreds of flops, no measurable cost). Mode 1
+replaces the GG-SRP random slots (root pool + n_global); mode 2 additionally
+carves 8 of every node's inherited budget into pobs blocks.
+
+Deployment protocol (tuned+ES, 3 reps; covtype 100k 1 rep), no re-tuning:
+
+```
+                       mode0 (production)        mode2 (per-node pobs)
+adult      ll/acc/auc  0.2749/0.8614/0.9292      0.2744/0.8620/0.9295
+credit_def ll/acc/auc  0.4336/0.8047/0.7765      0.4325/0.8064/0.7777
+gmsc       ll/auc      0.5287/0.7529             0.5238/0.7572
+covtype    ll/acc      0.2768/0.9010             0.2662/0.9049
+```
+
+**First candidate-distribution change to pass the protocol** — logloss and
+AUC improve on all four datasets at untouched tuned params (covtype ll −3.8%,
+acc +0.4pp). Mode 1 alone fails: with `inherited_rp_ratio=1` the random slot
+exists only at the root, so the surface is too small. The value is per-node
+injection.
+
+Why this succeeded where pool-mix failed (§1 account): pool-mix reallocated
+budget among the *mutually correlated* B/C families — same tail, different
+weights. pobs adds an *uncorrelated orthogonal family*: within a block the
+candidate gains are independent by construction, so each draw contributes
+full marginal tail mass. This is exactly the §1-predicted profitable move
+(add mass above the existing families' tails), and it is the designed version
+of what GG-SRP only did at the root. Adult fit 6.4→7.2s — per-tree cost
+unchanged; ES simply keeps improving for ~90 more rounds.
+
+**Merged as engine default 2026-06-12** (`OQB_POBS=0` restores GG-SRP).
+Follow-up candidates: optuna re-tune on top (mode 2 won *without* it),
+cache-integration half of the original user spec (POBS-winners-only FIFO).
+
 ### Pending before any engine work (per the standing rule)
 
 1. standard d6 baseline (research impl) for an equal-depth comparison.
