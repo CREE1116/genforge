@@ -527,6 +527,11 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     float best_gain = 0.0f, best_thr = 0.0f;
     int best_axis = -1, best_axis_b = 0;
 
+    // NOTE: an `if (D * K >= 192)` serialization guard was A/B-tested here
+    // (2026-06-12) and measured ~7% SLOWER overall — libomp's spin-wait
+    // keeps workers hot, so even these small regions win parallel. The
+    // profiler's dominant __psynch_cvwait is parked/spinning workers, not
+    // lost wall time. Don't re-add work-size guards without an A/B.
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -668,87 +673,29 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     // OQB_GAIN_LOG (research instrumentation, THEORY.md §1 open task):
     // when set to a file path, append one CSV line per evaluated candidate:
     //   node_seq,depth,ns,family,gain
-    // family ∈ {x axis, a/b/c inherited strategies, r sparse random,
-    //           s root SIS-seeded, k cache, v covariance}. Default off —
-    // production behavior untouched.
+    // family ∈ {x axis, a/b/c inherited strategies, p pobs block, k cache}.
+    // Default off — production behavior untouched.
     static FILE* gain_log = [] {
       const char* p = std::getenv("OQB_GAIN_LOG");
       return p ? std::fopen(p, "a") : (FILE*)nullptr;
     }();
     std::vector<char> fam;
 
-    // OQB_COV_MODE (experiment gate, docs/cov_oqboost.md):
-    //   0 = off — production candidate pool only (default)
-    //   1 = append the analytical covariance candidates to the pool
-    //   2 = covariance candidates REPLACE the random/inherited pool
-    //       (axis scan + cov + cache only — the spec's lightweight claim)
-    static const int cov_mode = [] {
-      const char* e = std::getenv("OQB_COV_MODE");
-      return e ? std::atoi(e) : 0;
-    }();
-
-    if (cov_mode > 0) {
-      // Analytical covariance direction (docs/cov_oqboost.md): the
-      // linearized-WLS argmax w ∝ -X^T g restricted to the SIS top-d_sub
-      // support, in two scalings — spec-literal (raw covariance; assumes
-      // comparable feature scales) and diagonal-Newton
-      // (-cg_s / (Σ h x² + λ), scale-robust, still solve-free).
-      int dsub = std::min(D, D_SUB_MAX);
-      std::vector<int> ord(D);
-      std::iota(ord.begin(), ord.end(), 0);
-      std::partial_sort(ord.begin(), ord.begin() + dsub, ord.end(),
-                        [&](int a, int b) { return fscore[a] > fscore[b]; });
-      std::vector<float> w_raw(D, 0.0f), w_diag(D, 0.0f);
-      float n_raw = 0.0f, n_diag = 0.0f;
-      for (int ii = 0; ii < dsub; ii++) {
-        int d = ord[ii];
-        float wr = -cg_s[d];
-        float wd = -cg_s[d] / (add_s[d] + reg_lambda + EPS);
-        w_raw[d] = wr;
-        w_diag[d] = wd;
-        n_raw += wr * wr;
-        n_diag += wd * wd;
-      }
-      if (n_raw > 1e-12f) {
-        float inv = 1.0f / std::sqrt(n_raw);
-        for (int d = 0; d < D; d++) w_raw[d] *= inv;
-        dirs.push_back(std::move(w_raw));
-        fam.push_back('v');
-      }
-      if (n_diag > 1e-12f) {
-        float inv = 1.0f / std::sqrt(n_diag);
-        for (int d = 0; d < D; d++) w_diag[d] *= inv;
-        dirs.push_back(std::move(w_diag));
-        fam.push_back('v');
-      }
-    }
-
     std::vector<float> prob(D);
     for (int d = 0; d < D; d++) {
       prob[d] = fscore[d] + 1e-6f;
     }
     std::discrete_distribution<int> feat_dist(prob.begin(), prob.end());
-    std::uniform_int_distribution<int> len_dist(2, std::min(6, D));
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    std::uniform_int_distribution<int> sign_dist(0, 1);
 
-    // OQB_POBS (experiment gate, THEORY.md POBS study): pobs_sis blocks for
-    // the diversity slot — sample an SIS-weighted support S (|S| ≈ √D),
-    // build an exact Haar-orthogonal |S|×|S| block ON S via Gram-Schmidt.
-    // Sparse (routing-compatible), exactly orthogonal (zero within-block
-    // candidate correlation → no wasted budget), gradient-informed.
-    //   0 = off (legacy GG-SRP random)
-    //   1 = pobs blocks replace the random slots (root pool + n_global)
-    //   2 = mode 1 + carve 8 of every node's inherited budget into pobs
-    // Default is 2: validated 2026-06-12 on the deployment protocol —
-    // logloss/auc improved on all four datasets (covtype ll −3.8%,
-    // acc +0.4pp) with untouched tuned params. Mode 1 alone fails (root-only
-    // surface is too small); the value is per-node orthogonal injection.
-    static const int pobs_mode = [] {
-      const char* e = std::getenv("OQB_POBS");
-      return e ? std::atoi(e) : 2;
-    }();
-
+    // pobs_sis candidates (THEORY.md POBS study, merged 2026-06-12): sample
+    // an SIS-weighted support S (|S| ≈ √D), build an exact Haar-orthogonal
+    // |S|×|S| block ON S via Gram-Schmidt. Sparse (routing-compatible),
+    // exactly orthogonal (zero within-block candidate correlation → every
+    // draw contributes full marginal tail mass), gradient-informed. Fills
+    // the diversity slots (root pool, n_global) plus a fixed 8-candidate
+    // slice of every node's inherited budget — the per-node injection is
+    // what passed the deployment protocol (root-only did not).
     auto fill_pobs = [&](int count) {
       if (count <= 0) return;
       int m = (int)std::lround(std::sqrt((float)D));
@@ -804,46 +751,29 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                             parent_nz);
     }
 
-    // OQB_BUDGET_MODE (experiment gate, THEORY.md §2/P4-refined): a node at
-    // depth d estimates directions from n/2^d samples — at depth ≥ 3 the
-    // gradient statistics are noise-dominated, so a uniform per-node budget
-    // overspends exactly where extra candidates buy noise. Note each tree
-    // LEVEL costs the same total (per-level sample counts sum to N), so
-    // deep levels consume most of the oblique budget.
-    //   0 = uniform pool of 32 at every node (legacy)
-    //   1 = cut only: pool 32 at depth ≤ 2, 8 at depth ≥ 3 (isolates speed)
-    //   2 = cut + reinvest: pool 64 at depth ≤ 2, 8 at depth ≥ 3
-    //       (order-statistics: widen the tournament where estimates are
-    //       reliable and node impact is largest)
-    // Default is 2: validated 2026-06-12 on the deployment protocol
-    // (adult/credit_default/gmsc tuned+ES + covtype multiclass) — accuracy
-    // ties or wins everywhere, adult fit −25%. Env kept as rollback.
-    static const int budget_mode = [] {
-      const char* e = std::getenv("OQB_BUDGET_MODE");
-      return e ? std::atoi(e) : 2;
-    }();
+    // Depth-adaptive pool budget (THEORY.md §2/P4-refined, merged
+    // 2026-06-12): a node at depth d estimates directions from n/2^d
+    // samples — at depth ≥ 3 the gradient statistics are noise-dominated,
+    // and each tree LEVEL costs the same total (per-level sample counts sum
+    // to N), so a uniform budget overspends exactly where extra candidates
+    // buy noise. Cut deep (8) and reinvest shallow (64): order-statistics
+    // says to widen the tournament where estimates are reliable and node
+    // impact is largest. Cut-only (no reinvest) regressed covtype — the two
+    // halves are a package.
     int depth_t = get_node_depth(t);
-    int pool_budget = 32;
-    if (budget_mode == 1) {
-      pool_budget = (depth_t <= 2) ? 32 : 8;
-    } else if (budget_mode == 2) {
-      pool_budget = (depth_t <= 2) ? 64 : 8;
-    }
+    int pool_budget = (depth_t <= 2) ? 64 : 8;
 
     int n_inherited = (int)std::round((float)pool_budget * inherited_rp_ratio);
     if (n_inherited < 0) n_inherited = 0;
     if (n_inherited > pool_budget) n_inherited = pool_budget;
     int n_global = pool_budget - n_inherited;
 
-    // pobs mode 2: carve a fixed pobs slice out of the inherited budget so
-    // every node sees orthogonal-diverse candidates, not just the root.
-    int n_pobs_extra = 0;
-    if (pobs_mode == 2) {
-      n_pobs_extra = std::min(8, n_inherited);
-      n_inherited -= n_pobs_extra;
-    }
+    // Carve a fixed pobs slice out of the inherited budget so every node
+    // sees orthogonal-diverse candidates, not just the root.
+    int n_pobs_extra = std::min(8, n_inherited);
+    n_inherited -= n_pobs_extra;
 
-    if (cov_mode != 2 && has_parent && parent_nz.size > 0) {
+    if (has_parent && parent_nz.size > 0) {
       // Inherited mutation strategies (A/B/C) — the original production
       // design. Research-impl ablations questioned A/B, but transplanting
       // that finding regressed the real tuned benchmarks; until the
@@ -860,25 +790,16 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         bool do_strategy_b = false;
         bool do_strategy_c = false;
 
-        // OQB_POOL_MIX (experiment gate, THEORY.md §1 allocation study):
-        //   0 = production split a:37.5% b:37.5% c:25%
-        //   1 = data-optimal split a:6.25% b:46.9% c:46.9% — empirical
-        //       E[max k] curves show Strategy A saturates at k≈1 (its draws
-        //       are correlated perturbations of one parent direction), so
-        //       its budget shifts to the B/C families whose tails keep
-        //       growing. Greedy allocation on logged gains: a:1 b:15 c:16.
-        static const int pool_mix = [] {
-          const char* e = std::getenv("OQB_POOL_MIX");
-          return e ? std::atoi(e) : 0;
-        }();
-        float thr_a = (pool_mix == 1) ? 0.0625f : 0.375f;
-        float thr_b = (pool_mix == 1) ? 0.53125f : 0.75f;
-
+        // a:37.5% b:37.5% c:25%. A data-optimal per-node-E[max] reallocation
+        // (a:6.25%) was tried and REJECTED on the deployment protocol —
+        // Strategy A's ensemble value is invisible in per-node gains
+        // (THEORY.md §1 allocation study). This split has survived three
+        // challenges; do not reweight it without ensemble-level evidence.
         if (!ctx->dir_cache.empty()) {
-          if (strategy_draw < thr_a) {
+          if (strategy_draw < 0.375f) {
             do_strategy_a = (parent_nz.size > 1);
             if (!do_strategy_a) do_strategy_b = true;
-          } else if (strategy_draw < thr_b) {
+          } else if (strategy_draw < 0.75f) {
             do_strategy_b = true;
           } else {
             do_strategy_c = true;
@@ -972,113 +893,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         fam.push_back(do_strategy_c ? 'c' : (do_strategy_a ? 'a' : 'b'));
       }
 
-      if (pobs_mode > 0) {
-        fill_pobs(n_global);
-        n_global = 0;
-      }
-      float s_param = std::max(2.0f, std::sqrt((float)D));
-      float prob_nonzero = 1.0f / s_param;
-      for (int r = 0; r < n_global; r++) {
-        std::vector<float> w_rand(D, 0.0f);
-        float norm = 0.0f;
-        int nz_count = 0;
-        for (int f = 0; f < D; f++) {
-          if (nz_count < D_SUB_MAX && dist(rng) < prob_nonzero) {
-            float val = (sign_dist(rng) == 0) ? 1.0f : -1.0f;
-            w_rand[f] = val;
-            norm += val * val;
-            nz_count++;
-          }
-        }
-        norm = std::sqrt(norm);
-        if (norm > 1e-12f) {
-          for (int f = 0; f < D; f++) w_rand[f] /= norm;
-          dirs.push_back(std::move(w_rand));
-        } else {
-          std::uniform_int_distribution<int> f_dist(0, D - 1);
-          int f = f_dist(rng);
-          w_rand[f] = 1.0f;
-          dirs.push_back(std::move(w_rand));
-        }
-        fam.push_back('r');
-      }
+      // Diversity slot of the inherited branch (nonzero when
+      // inherited_rp_ratio < 1): pobs blocks.
+      fill_pobs(n_global);
 
-    } else if (cov_mode != 2) {
-      // Root/no-parent pool: keep the production 3:1 SIS-seeded : sparse
-      // split, scaled to the (possibly depth-adaptive) pool budget.
-      int n_seed = (pool_budget * 3) / 4;
-      int n_sparse = pool_budget - n_seed;
-      if (pobs_mode > 0) {
-        fill_pobs(pool_budget);
-        n_seed = 0;
-        n_sparse = 0;
-      }
-      std::vector<uint8_t> selected_mask(D, 0);
-      for (int r = 0; r < n_seed; r++) {
-        int L = len_dist(rng);
-        std::vector<int> selected;
-        selected.reserve(L);
-        for (int attempt = 0; attempt < 50 && (int)selected.size() < L;
-             attempt++) {
-          int f = feat_dist(rng);
-          if (!selected_mask[f]) {
-            selected_mask[f] = 1;
-            selected.push_back(f);
-          }
-        }
-        for (int f : selected) {
-          selected_mask[f] = 0;
-        }
-        if (selected.size() < 2) {
-          std::vector<int> ord(D);
-          std::iota(ord.begin(), ord.end(), 0);
-          std::sort(ord.begin(), ord.end(),
-                    [&](int a, int b) { return fscore[a] > fscore[b]; });
-          selected = {ord[0], ord[1]};
-        }
-
-        std::vector<float> w_rand(D, 0.0f);
-        float norm = 0.0f;
-        for (int f : selected) {
-          float val = (cg_s[f] >= 0.0f) ? -1.0f : 1.0f;
-          w_rand[f] = val;
-          norm += val * val;
-        }
-        norm = std::sqrt(norm);
-        if (norm > 1e-12f) {
-          for (int f : selected) w_rand[f] /= norm;
-          dirs.push_back(std::move(w_rand));
-          fam.push_back('s');
-        }
-      }
-
-      float s_param = std::max(2.0f, std::sqrt((float)D));
-      float prob_nonzero = 1.0f / s_param;
-      for (int r = 0; r < n_sparse; r++) {
-        std::vector<float> w_rand(D, 0.0f);
-        float norm = 0.0f;
-        int nz_count = 0;
-        for (int f = 0; f < D; f++) {
-          if (nz_count < D_SUB_MAX && dist(rng) < prob_nonzero) {
-            float val = (sign_dist(rng) == 0) ? 1.0f : -1.0f;
-            w_rand[f] = val;
-            norm += val * val;
-            nz_count++;
-          }
-        }
-        norm = std::sqrt(norm);
-        if (norm > 1e-12f) {
-          for (int f = 0; f < D; f++) w_rand[f] /= norm;
-          dirs.push_back(std::move(w_rand));
-        } else {
-          std::uniform_int_distribution<int> f_dist(0, D - 1);
-          int f = f_dist(rng);
-          w_rand[f] = 1.0f;
-          dirs.push_back(std::move(w_rand));
-        }
-        fam.push_back('r');
-      }
-
+    } else {
+      // Root/no-parent pool: all pobs blocks.
+      fill_pobs(pool_budget);
     }
 
     if (n_pobs_extra > 0) fill_pobs(n_pobs_extra);
@@ -1581,20 +1402,6 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     }
   }
   return static_cast<void*>(tree);
-}
-
-// One-shot compatibility wrapper
-GF_API void* gf_build_oneshot(const float* X, int N, int D, int D_num,
-                               const float* G, const float* H, int K,
-                               const int* sub, int Ns, int max_depth,
-                               float reg_lambda, unsigned int seed,
-                               float* out_pred) {
-  void* ctx = gf_ctx_create(X, N, D, D_num, sub, Ns);
-  void* tree = gf_build(ctx, X, G, H, K, sub, Ns, max_depth, reg_lambda,
-                              1.0f, 0.1f, 0.5f, (int)seed, out_pred);
-
-  gf_ctx_free(ctx);
-  return tree;
 }
 
 // Predict on RAW X

@@ -7,10 +7,12 @@ from sklearn.utils.validation import check_is_fitted
 
 class OQBoostClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
     """
-    OQBoost: deterministic pool-free oblique tree boosting.
+    OQBoost: gradient-boosted oblique decision trees.
 
-    Gradient-boosted oblique decision trees where split directions are optimized
-    by a C++ BFS engine with zero GPU-CPU sync overhead during training.
+    Split directions are found by a C++ engine running a candidate tournament
+    per node (axis scan, inherited A/B/C mutations, pobs_sis orthogonal
+    blocks, direction cache) with lazy best-first tree growth and a
+    depth-adaptive candidate budget.
 
     Two effective hyperparameters per tree (max_depth, reg_lambda).
     Native missing-value handling (numeric NaN → mean imputation baked into
