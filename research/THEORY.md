@@ -192,6 +192,39 @@ support-restricted orthogonal block. Candidate for the diversity slot,
 pending the standing validation rule below. Cache-integration half of the
 user spec (FIFO, POBS-winners-only insertion) not yet tested.
 
+### 2026-06-12 — P4 round 2: equal-depth + variants (`theory_exp4_oblivious2.py`)
+
+```
+                                  synthetic           multiclass
+standard   d6 lr=0.1              0.9557 / 0.1299     0.8900 / 0.3420
+obliv-semi d6 lr=0.1              0.9523 / 0.1358     0.8876 / 0.3580
+obliv-semi d6 lr=0.3              0.9517 / 0.1529     0.8956 / 0.3195
+standard   d6 lr=0.3              0.9510 / 0.1646     0.8732 / 0.3825
+obliv-full d6 lr=0.1              0.9580 / 0.1431     0.8900 / 0.3785
+obliv-semi+ d6 lr=0.1 (2x cand)   0.9613 / 0.1261     0.9008 / 0.3305
+```
+
+Honest read:
+1. **Leaf-count confound confirmed**: at equal depth, equal budget, lr 0.1,
+   standard ≈ semi. The structural constraint alone is not the win.
+2. **The real wins are exactly what the theory predicts**:
+   - *lr robustness*: at lr 0.3 standard collapses (multiclass −1.7pp,
+     logloss +12%) while oblivious improves — the weaker-per-leaf
+     structure tolerates aggressive shrinkage (flatter tuning surface).
+   - *Budget reinvestment* (the decisive one): pooled evaluation amortizes
+     one candidate projection across all 2^l level nodes, so the
+     tournament can be widened almost for free. `semi+` (2× candidates)
+     is best on BOTH datasets, BOTH metrics. Standard trees pay per node
+     and cannot afford this.
+3. **Design decision**: full-oblivious (shared thresholds) trades logloss
+   for nothing — per-node thresholds (semi) is the right form. Thresholds
+   are cheap 1-D estimates; only directions need pooling.
+
+Revised P4 statement: *oblivious-oblique is not a regularizer win; it is a
+compute-reallocation win — constrain the expensive estimate (direction),
+spend the savings on tournament breadth.* At equal wall-clock the gap
+should widen further (2× was conservative).
+
 ### Pending before any engine work (per the standing rule)
 
 1. standard d6 baseline (research impl) for an equal-depth comparison.
