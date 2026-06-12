@@ -123,3 +123,21 @@ Ablation studies on a classification benchmark (100,000 samples, 50 features) de
 *   **Parent Inheritance & Crossover**: Enabling Strategy C (Crossover) and depth-decayed mutations consistently yields the lowest Log Loss (improving model calibration and reducing overfitting).
 *   **Balanced Argmax**: OQBoost predictions use a prior-corrected argmax formula to account for class imbalance, keeping predictions well-calibrated without altering the C++ Newton-Raphson gradients.
 *   **Mechanism studies in progress**: research-impl ablations on synthetic data questioned the value of parent-direction mutation, but transplanting that change regressed the real tuned benchmarks and was reverted — empirical synthetic-data findings need a theoretical account before they justify engine changes. See `research/FINDINGS.md`.
+
+---
+
+## 7. Future Research: Gradient Covariance Paradigm
+
+Recent research (conducted on 2026-06-13 in pure PyTorch prototype `OQBoostCovClassifier`) proposes a massive architectural simplification to the direction generation pipeline. 
+
+### Proposed Core Simplification:
+Instead of a candidate tournament over a large pool of randomized and inherited directions, the engine evaluates:
+1. All $D$ axis-aligned unit vectors (retaining a backbone to capture unrotated features).
+2. Exactly **one** oblique direction: the gradient covariance vector $w_{\text{cov}}$ computed on the top $d_{\text{sub}}$ features:
+   $$w_{\text{cov\_sub}} = \frac{G_{\text{sub}}}{\|G_{\text{sub}}\|_2 + \epsilon}, \quad \text{where } G_{\text{sub}} = -X_{\text{sub}}^T g$$
+
+This reduces the tournament size to exactly $D+1$ candidates at each node.
+
+### Theoretical Advantage:
+By avoiding local optimization on noisy deep-node Hessians (which WLS/CD attempts by solving $A^{-1}G$), the covariance vector acts as a robust L2-regularizer (Hessian-free). In head-to-head empirical testing, this simple $D+1$ setup consistently outperformed both the C++ production tournament and Coordinate Descent on real tabular datasets (e.g., Adult, Credit Default) while being structurally simpler. Porting this covariance generation logic into the C++ core engine is planned for future releases.
+

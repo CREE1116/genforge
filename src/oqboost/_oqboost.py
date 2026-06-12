@@ -92,6 +92,7 @@ def _get_oqboost_lib():
         ctypes.c_float,   # mutation_rate
         ctypes.c_float,   # mutation_strength
         ctypes.c_int,     # seed
+        ctypes.c_int,     # pobs (1 = per-node pobs carve, 0 = all A/B/C)
         _pf,              # out_pred [N, K]  (may be NULL)
     ]
 
@@ -202,12 +203,6 @@ class OQBoostTree:
     reg_lambda : float   L2 regularisation; also scales leaf path smoothing
     subsample  : float   fraction of training samples used (fit_predict only)
     random_state : int | None   used only for the subsample draw
-
-    Notes
-    -----
-    Legacy v6 knobs (prune_strength, n_wls_max, d_sub_max, gbaor_alpha,
-    n_candidates, honest_split, quant_levels) are accepted for backwards
-    compatibility but ignored: v9 has no corresponding mechanisms.
     """
 
     def __init__(
@@ -216,7 +211,6 @@ class OQBoostTree:
         reg_lambda:   float = 1.0,
         subsample:    float = 1.0,
         random_state: int | None = None,
-        **_legacy_ignored,
     ):
         self.max_depth    = max_depth
         self.reg_lambda   = reg_lambda
@@ -242,6 +236,7 @@ class OQBoostTree:
         inherited_rp_ratio: float = 1.0,
         mutation_rate: float = 0.1,
         mutation_strength: float = 0.5,
+        pobs: bool = True,
     ) -> np.ndarray:
         """One-shot build (creates and frees a binning context internally).
 
@@ -268,7 +263,8 @@ class OQBoostTree:
                 G, H, subset, self.max_depth, self.reg_lambda,
                 inherited_rp_ratio=inherited_rp_ratio,
                 mutation_rate=mutation_rate,
-                mutation_strength=mutation_strength
+                mutation_strength=mutation_strength,
+                pobs=pobs,
             )
         finally:
             ctx.close()
@@ -415,6 +411,7 @@ class OQBoostContext:
         mutation_rate: float = 0.1,
         mutation_strength: float = 0.5,
         seed: int = 42,
+        pobs: bool = True,
     ) -> tuple[OQBoostTree, np.ndarray]:
         """One boosting round → (fitted tree, predictions for all N rows)."""
         if self._handle is None:
@@ -433,6 +430,7 @@ class OQBoostContext:
             ctypes.c_float(mutation_rate),
             ctypes.c_float(mutation_strength),
             ctypes.c_int(seed),
+            ctypes.c_int(1 if pobs else 0),
             _fptr(out_pred),
         )
 

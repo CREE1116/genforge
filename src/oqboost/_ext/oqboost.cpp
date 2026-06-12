@@ -257,7 +257,8 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                                const float* H, int K, const int* sub, int Ns,
                                int max_depth, float reg_lambda,
                                float inherited_rp_ratio, float mutation_rate,
-                               float mutation_strength, int seed, float* out_pred) {
+                               float mutation_strength, int seed, int pobs,
+                               float* out_pred) {
 
   (void)X;
   auto* ctx = static_cast<OQBoostCtx*>(ctx_handle);
@@ -769,15 +770,12 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     int n_global = pool_budget - n_inherited;
 
     // Carve a fixed pobs slice out of the inherited budget so every node
-    // sees orthogonal-diverse candidates, not just the root. OQB_POBS=0
-    // disables the carve (the inherited budget reverts to all A/B/C) for
-    // A/B comparison; the root pool stays pobs either way (the legacy root
-    // generator was removed and the root slot measured neutral).
-    static const bool pobs_on = [] {
-      const char* e = std::getenv("OQB_POBS");
-      return !(e && std::atoi(e) == 0);
-    }();
-    int n_pobs_extra = pobs_on ? std::min(8, n_inherited) : 0;
+    // sees orthogonal-diverse candidates, not just the root. pobs=0 (the
+    // gf_build parameter) disables the carve — the inherited budget reverts
+    // to all A/B/C — for A/B comparison; the root pool stays pobs either
+    // way (the legacy root generator was removed and the root slot measured
+    // neutral).
+    int n_pobs_extra = pobs ? std::min(8, n_inherited) : 0;
     n_inherited -= n_pobs_extra;
 
     if (has_parent && parent_nz.size > 0) {

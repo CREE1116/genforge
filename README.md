@@ -4,6 +4,10 @@
 
 OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes that are inherited and mutated from parent nodes — exploiting the geometric structure of the data without expensive numerical optimization.
 
+<p align="center">
+  <img src="docs/diverse_boundaries.png" alt="OQBoost Decision Boundaries" width="800">
+</p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![CI](https://github.com/cree1116/oqboost/actions/workflows/ci.yml/badge.svg)](https://github.com/cree1116/oqboost/actions)
@@ -172,7 +176,7 @@ Child nodes inherit their parent's split direction and apply two mutation strate
 - *Strategy C:* random blend of the current parent direction with a globally top-performing direction from the ring buffer (last 32 rounds)
 - *Depth decay:* mutation strength decreases as $1/\sqrt{1 + d}$ — wide exploration at shallow depth, fine-tuning at deep nodes
 
-See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`research/FINDINGS.md`](research/FINDINGS.md) for ongoing mechanism studies.
+See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`docs/THEORY.md`](docs/THEORY.md) for theoretical insights and experiment logs.
 
 ---
 
@@ -191,6 +195,7 @@ See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`resea
 | `inherited_rp_ratio` | 1.0 | Fraction of candidates from inheritance + cache |
 | `mutation_rate` | 0.1 | Base noise scale for axis mutations |
 | `mutation_strength` | 0.5 | Base weight for new-axis borrowing |
+| `pobs` | True | Inject Haar-orthogonal POBS candidates into every node's tournament |
 | `random_state` | None | Seed |
 | `verbose` | False | Print per-round metrics |
 

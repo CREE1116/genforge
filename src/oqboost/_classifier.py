@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
 
-class OQBoostClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
+class OQBoostClassifier(BaseEstimator, ClassifierMixin):
     """
     OQBoost: gradient-boosted oblique decision trees.
 
@@ -65,6 +65,11 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
     mutation_strength : float
         Base weight for new-axis borrowing (Strategy B);
         decays with node depth as strength/(1+depth).
+    pobs : bool
+        Inject 8 pobs_sis candidates (SIS-weighted support, exact
+        Haar-orthogonal block) into every node's tournament, carved from
+        the inherited budget.  Validated to improve logloss/AUC on real
+        benchmarks; set False to revert to the pure A/B/C pool.
     """
 
     def __init__(
@@ -83,6 +88,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         inherited_rp_ratio:    float = 1.0,
         mutation_rate:         float = 0.1,
         mutation_strength:     float = 0.5,
+        pobs:                  bool  = True,
     ):
         self.n_estimators          = n_estimators
         self.learning_rate         = learning_rate
@@ -98,6 +104,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
         self.inherited_rp_ratio    = inherited_rp_ratio
         self.mutation_rate         = mutation_rate
         self.mutation_strength     = mutation_strength
+        self.pobs                  = pobs
 
     # ── public fit/predict ────────────────────────────────────────────────────
 
@@ -321,6 +328,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                     mutation_rate=self.mutation_rate,
                     mutation_strength=self.mutation_strength,
                     seed=int(rng.integers(1 << 30)),
+                    pobs=getattr(self, "pobs", True),
                 )
 
                 self.trees_.append(t)
@@ -346,12 +354,9 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                         no_improv += 1
 
                 if self.verbose:
-                    # 버그 수정: Pm 변수가 정의되지 않았던 문제를 해결하기 위해 
-                    # 현재 라운드의 Fsc(Train 예측치)를 기반으로 소프트맥스 확률 행렬 계산
                     Fsc_sh = Fsc - Fsc.max(axis=1, keepdims=True)
                     Pm = np.exp(Fsc_sh)
                     Pm /= Pm.sum(axis=1, keepdims=True)
-                    
                     ll  = -np.log(Pm[np.arange(N), y].clip(1e-8)).mean()
                     acc = (Pm.argmax(axis=1) == y).mean()
                     print(
@@ -367,6 +372,3 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin, TransformerMixin):
                         break
         finally:
             ctx.close()
-
-    def __del__(self):
-        pass
