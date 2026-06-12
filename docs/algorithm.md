@@ -44,14 +44,18 @@ $$s_f = \frac{\left| \sum_{i \in \mathcal{I}_t} x_{if} g_i \right|}{\sqrt{\sum_{
     $$w_f = -\operatorname{sign}\left( \sum_{i \in \mathcal{I}_t} x_{if} g_i \right) \cdot |r_f|, \quad r_f \sim \mathcal{N}(0, 1)$$
 4.  **Normalization**: The weight vector is normalized to unit L2 norm: $w \leftarrow \frac{w}{\|w\|_2}$.
 
-### Stage 2: Dataset-Level Direction Cache (Strategy C)
-High-performing split directions from previous boosting rounds are stored in a global ring buffer `dir_cache` (up to 32 directions, near-duplicates rejected at |cos| > 0.95). At non-root nodes, the informed candidate slot blends a cached direction with the current parent direction:
+### Stage 2: Hereditary Direction Inheritance
+Samples reaching a child node have already been filtered by the parent node's split. The parent's weight vector $w_{\text{parent}}$ serves as an excellent warm-start direction. OQBoost evaluates two mutation strategies:
+*   **Strategy A (Axis-Maintaining Mutation)**: Tilts the parent boundary slightly while maintaining its orientation:
+    $$w_{\text{mutated}} = w_{\text{parent}} + \text{rate} \cdot \epsilon, \quad \epsilon_j \sim \mathcal{U}(-1, 1)$$
+*   **Strategy B (New-Axis Borrowing)**: Extends the sparse representation by adding one highly correlated new feature $f^*$ to the parent's feature set:
+    $$w_{\text{mutated}} = w_{\text{parent}} \oplus \{ f^* \mapsto \pm \text{strength} \}$$
 
-$$w_{\text{blend}} = \alpha w_{\text{parent}} + (1 - \alpha) w_{\text{cache}}, \quad \alpha \sim \mathcal{U}(0.2, 0.8)$$
-
-While the cache is still empty (early trees), the slot falls back to fresh GG-SRP-style sparse random draws. The `inherited_rp_ratio` parameter (default 0.5) splits the oblique candidate budget between this informed pool and the global random pool.
-
-**Why no parent-direction mutation?** Earlier versions also mutated the parent node's own direction (Strategy A: weight perturbation; Strategy B: new-axis borrowing). Controlled strategy ablations (see `research/FINDINGS.md`) showed both are consistently 0.4–1pp worse than replacing them with random draws: a split on $w$ consumes the gradient signal along $w$, so the residual signal inside each child concentrates away from the parent direction. Good oblique directions are a *global* property of the dataset (its rotated subspaces) — which is exactly what the cache captures across trees — not a local property of the parent node. Both strategies were removed; `mutation_rate` / `mutation_strength` remain as deprecated no-ops.
+### Stage 3: Parent-Cache Crossover & Depth-Decayed Mutation
+*   **Strategy C (Global-Local Crossover)**: High-performing split directions from previous boosting rounds are stored in a global ring buffer `dir_cache` (up to 32 directions). OQBoost blends these with the current parent direction:
+    $$w_{\text{blend}} = \alpha w_{\text{parent}} + (1 - \alpha) w_{\text{cache}}, \quad \alpha \sim \mathcal{U}(0, 1)$$
+*   **Depth-Decayed Mutation**: Shallow nodes benefit from exploration, while deep nodes operate on smaller, nearly-pure subsets where large mutations overfit. OQBoost decays the mutation rate and strength at depth $d$:
+    $$\text{rate}_d = \frac{\text{rate}_0}{\sqrt{1 + d}}, \quad \text{strength}_d = \frac{\text{strength}_0}{1 + d}$$
 
 *   **RNG Seed Propagation**: To ensure tree diversity and prevent redundant splits across boosting rounds, the Python classifier passes a unique random seed (e.g., `rng.integers(1 << 30)`) to the C++ engine for each tree. The C++ engine then seeds its node-level generators with `seed + t`, ensuring full determinism and maximum diversity.
 
@@ -116,6 +120,6 @@ OQBoost dynamically selects between two OpenMP parallelization strategies depend
 Ablation studies on a classification benchmark (100,000 samples, 50 features) demonstrate the impact of each algorithmic design:
 
 *   **GG-SRP vs. Coordinate Descent**: Replacing exact Gauss-Seidel CD coordinate search with GG-SRP maintains balanced accuracy parity while speeding up node evaluation by over **10x**.
-*   **Diversity is the essential ingredient**: budget-matched knockouts show removing the random oblique pool collapses accuracy to the axis-only floor, while the random pool alone matches the full candidate set. Its mechanism is wider feature coverage (feature-usage entropy 0.945 → 0.970), not tree decorrelation, and its win share grows monotonically over boosting rounds (18% → 35%) as residuals become oblique.
-*   **Continuity matters at the dataset scale, not the parent scale**: strategy ablations show the direction cache (Strategy C) is the only inherited-slot component that earns its place; parent-direction mutation (former Strategies A/B) consistently underperformed random replacement and was removed. Full study: `research/FINDINGS.md`.
+*   **Parent Inheritance & Crossover**: Enabling Strategy C (Crossover) and depth-decayed mutations consistently yields the lowest Log Loss (improving model calibration and reducing overfitting).
 *   **Balanced Argmax**: OQBoost predictions use a prior-corrected argmax formula to account for class imbalance, keeping predictions well-calibrated without altering the C++ Newton-Raphson gradients.
+*   **Mechanism studies in progress**: research-impl ablations on synthetic data questioned the value of parent-direction mutation, but transplanting that change regressed the real tuned benchmarks and was reverted — empirical synthetic-data findings need a theoretical account before they justify engine changes. See `research/FINDINGS.md`.

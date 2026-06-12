@@ -258,10 +258,6 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                                float mutation_strength, int seed, float* out_pred) {
 
   (void)X;
-  // mutation_rate/mutation_strength belonged to the removed parent-mutation
-  // strategies; kept in the signature for ABI/Python-API compatibility.
-  (void)mutation_rate;
-  (void)mutation_strength;
   auto* ctx = static_cast<OQBoostCtx*>(ctx_handle);
   const int D = ctx->D, D_num = ctx->D_num, D_cat = ctx->D_cat, N = ctx->N;
   const float* GF_RESTRICT Xt = ctx->Ximp.data();
@@ -692,20 +688,44 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     int n_global = 32 - n_inherited;
 
     if (has_parent && parent_nz.size > 0) {
-      // Informed slot = Strategy C only (cache blend). The strategy ablation
-      // (research/FINDINGS.md Part 2) showed parent-direction mutation
-      // (the old Strategies A/B) is consistently WORSE than replacing it
-      // with global random draws — good oblique directions are a property
-      // of the dataset (its rotated subspaces), not of the parent node, so
-      // the continuity worth keeping is the cross-tree cache. When the
-      // cache is still empty (early trees) the draw falls back to a sparse
-      // random direction, identical to the global pool.
-      float s_param_i = std::max(2.0f, std::sqrt((float)D));
-      float prob_nonzero_i = 1.0f / s_param_i;
+      // Inherited mutation strategies (A/B/C) — the original production
+      // design. Research-impl ablations questioned A/B, but transplanting
+      // that finding regressed the real tuned benchmarks; until the
+      // mechanism is understood theoretically the proven configuration
+      // stays (see research/FINDINGS.md).
+      int depth_t = get_node_depth(t);
+      float local_mutation_rate =
+          mutation_rate / std::sqrt(1.0f + (float)depth_t);
+      float local_mutation_strength =
+          mutation_strength / (1.0f + (float)depth_t);
+
       for (int r = 0; r < n_inherited; r++) {
-        std::vector<float> w_rand(D, 0.0f);
+        float strategy_draw = dist(rng);
+        bool do_strategy_a = false;
+        bool do_strategy_b = false;
+        bool do_strategy_c = false;
 
         if (!ctx->dir_cache.empty()) {
+          if (strategy_draw < 0.375f) {
+            do_strategy_a = (parent_nz.size > 1);
+            if (!do_strategy_a) do_strategy_b = true;
+          } else if (strategy_draw < 0.75f) {
+            do_strategy_b = true;
+          } else {
+            do_strategy_c = true;
+          }
+        } else {
+          if (strategy_draw < 0.5f) {
+            do_strategy_a = (parent_nz.size > 1);
+            if (!do_strategy_a) do_strategy_b = true;
+          } else {
+            do_strategy_b = true;
+          }
+        }
+
+        std::vector<float> w_rand(D, 0.0f);
+
+        if (do_strategy_c) {
           std::uniform_int_distribution<int> cache_dist(
               0, (int)ctx->dir_cache.size() - 1);
           const auto& cached_w = ctx->dir_cache[cache_dist(rng)];
@@ -719,11 +739,52 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
             w_rand[d] += alpha * parent_nz.values[i_nz];
           }
         } else {
-          int nz_count = 0;
-          for (int f = 0; f < D; f++) {
-            if (nz_count < D_SUB_MAX && dist(rng) < prob_nonzero_i) {
-              w_rand[f] = (sign_dist(rng) == 0) ? 1.0f : -1.0f;
-              nz_count++;
+          for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
+            w_rand[parent_nz.indices[i_nz]] = parent_nz.values[i_nz];
+          }
+
+          if (do_strategy_a) {
+            std::uniform_int_distribution<int> parent_idx_dist(
+                0, parent_nz.size - 1);
+            int idx1 = parent_idx_dist(rng);
+            float s1 =
+                dist(rng) * 2.0f * local_mutation_rate - local_mutation_rate;
+            w_rand[parent_nz.indices[idx1]] *= (1.0f + s1);
+
+            if (parent_nz.size > 2 && dist(rng) < 0.5f) {
+              int idx2 = parent_idx_dist(rng);
+              while (idx2 == idx1) idx2 = parent_idx_dist(rng);
+              float s2 =
+                  dist(rng) * 2.0f * local_mutation_rate - local_mutation_rate;
+              w_rand[parent_nz.indices[idx2]] *= (1.0f + s2);
+            }
+          } else if (do_strategy_b) {
+            std::vector<int> candidate_feats;
+            std::vector<float> candidate_probs;
+            for (int d = 0; d < D; d++) {
+              bool in_parent = false;
+              for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
+                if (parent_nz.indices[i_nz] == d) {
+                  in_parent = true;
+                  break;
+                }
+              }
+              if (!in_parent) {
+                candidate_feats.push_back(d);
+                candidate_probs.push_back(prob[d]);
+              }
+            }
+
+            if (!candidate_feats.empty()) {
+              std::discrete_distribution<int> new_feat_dist(
+                  candidate_probs.begin(), candidate_probs.end());
+              int idx_feat = new_feat_dist(rng);
+              int f_new = candidate_feats[idx_feat];
+              float sign = (cg_s[f_new] >= 0.0f) ? -1.0f : 1.0f;
+              w_rand[f_new] = sign * local_mutation_strength;
+            } else if (parent_nz.size == 1) {
+              int f_new = (parent_nz.indices[0] + 1) % D;
+              w_rand[f_new] = 0.1f;
             }
           }
         }

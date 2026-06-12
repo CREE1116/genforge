@@ -1,8 +1,8 @@
 # OQBoost
 
-**Gradient-boosted oblique decision trees with gradient-guided random projections.**
+**Gradient-boosted oblique decision trees with hereditary projection evolution.**
 
-OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes, combining a diverse sparse-random-projection pool with a dataset-level cache of proven directions — exploiting the geometric structure of the data without expensive numerical optimization.
+OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes that are inherited and mutated from parent nodes — exploiting the geometric structure of the data without expensive numerical optimization.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
@@ -17,7 +17,7 @@ OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes, c
 |---------|---------|
 | Split type | Oblique (linear projection of multiple features) |
 | Direction finding | GG-SRP: gradient-guided sparse random projection |
-| Direction reuse | Dataset-level cache of winning oblique directions (cross-tree) |
+| Inheritance | Parent weight inheritance with depth-decayed mutation |
 | Missing values | Native — NaN handled via mean imputation in C++ |
 | Categorical features | Native — gradient-rank encoding per round |
 | API | scikit-learn compatible |
@@ -158,28 +158,21 @@ All benchmarks: 80/20 train-test split, 3 repetitions, mean reported. Default hy
 
 ## Algorithm
 
-Every node runs a full 256-bin axis scan, then challenges it with a pool of oblique candidate directions built from two complementary sources:
+OQBoost uses three-stage hereditary projection evolution:
 
-**Source 1 — GG-SRP (Gradient-Guided Sparse Random Projection)**  
-Features are sampled with probability proportional to SIS gradient-importance scores. Each selected feature gets a weight sign aligned with the steepest gradient descent direction. No Gram matrix, no linear system — $O(D)$ per node. Mechanism studies show this diversity pool is the essential ingredient: it widens feature coverage, and its win share grows over boosting rounds as residuals become oblique.
+**Stage 1 — GG-SRP (Gradient-Guided Sparse Random Projection)**  
+Features are sampled with probability proportional to SIS gradient-importance scores. Each selected feature gets a weight sign aligned with the steepest gradient descent direction. No Gram matrix, no linear system — $O(D)$ per node.
 
-**Source 2 — Direction Cache (dataset-level direction reuse)**  
-A ring buffer keeps the most recent globally winning oblique directions (up to 32). Candidates blend a cached direction with the current parent direction at a random ratio. Good oblique directions are a property of the dataset's rotated subspaces, not of any single node — so reuse happens across trees, not from parent to child.
+**Stage 2 — Parent Weight Inheritance**  
+Child nodes inherit their parent's split direction and apply two mutation strategies:
+- *Strategy A:* axis-maintaining noise (tilt the boundary by ±10%)
+- *Strategy B:* new-axis borrowing (add a high-correlation feature not in the parent's support)
 
-`inherited_rp_ratio` splits the candidate budget between the two sources (default 0.5). Earlier versions also mutated the parent node's own direction (Strategies "A/B"); controlled ablations showed parent-direction mutation consistently underperforms random replacement, and it was removed — see [`research/FINDINGS.md`](research/FINDINGS.md).
+**Stage 3 — Global-Local Crossover + Depth Decay**  
+- *Strategy C:* random blend of the current parent direction with a globally top-performing direction from the ring buffer (last 32 rounds)
+- *Depth decay:* mutation strength decreases as $1/\sqrt{1 + d}$ — wide exploration at shallow depth, fine-tuning at deep nodes
 
-**Strategy ablation (synthetic 6k×30 / multiclass 10k×30, 5 seeds, accuracy):**
-
-| Inherited-slot contents | Synthetic | Multiclass |
-|--------------|---------|---------|
-| Parent mutation only (removed A/B) | 0.9588–0.9620 | 0.8927–0.8986 |
-| Global random only | 0.9643 | 0.9027 |
-| Cache only | 0.9664 | 0.9002 |
-| **Cache + random (current)** | **0.9729**¹ | **0.9192**¹ |
-
-¹ current default `inherited_rp_ratio=0.5`, measured post-change.
-
-See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`research/FINDINGS.md`](research/FINDINGS.md) for the mechanism studies.
+See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`research/FINDINGS.md`](research/FINDINGS.md) for ongoing mechanism studies.
 
 ---
 
@@ -195,9 +188,9 @@ See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`resea
 | `early_stopping_rounds` | 50 | Stop if class-weighted val loss stagnates |
 | `cat_features` | None | Categorical column names or indices |
 | `class_weight` | "balanced" | Reweight by inverse class frequency |
-| `inherited_rp_ratio` | 0.5 | Oblique-candidate split: cache-blend vs fresh random projections |
-| `mutation_rate` | — | Deprecated, ignored (parent-mutation strategies removed) |
-| `mutation_strength` | — | Deprecated, ignored (parent-mutation strategies removed) |
+| `inherited_rp_ratio` | 1.0 | Fraction of candidates from inheritance + cache |
+| `mutation_rate` | 0.1 | Base noise scale for axis mutations |
+| `mutation_strength` | 0.5 | Base weight for new-axis borrowing |
 | `random_state` | None | Seed |
 | `verbose` | False | Print per-round metrics |
 

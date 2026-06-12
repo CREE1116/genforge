@@ -208,7 +208,23 @@ A/B's harm, not parent continuity helping.
 The user's hypothesis holds in spirit with one correction: the continuity that
 matters is dataset-level (cache), not parent-level (mutation).
 
-## Final validation and engine change (APPLIED, 2026-06-12)
+## Final validation and engine change (APPLIED then REVERTED, 2026-06-12)
+
+**REVERTED**: despite the validation matrix below, the change regressed the
+user's real benchmark runs (tuned hyperparameters + early stopping — a
+protocol the validation below did NOT replicate; it used fixed
+lr=0.1/depth=6/200-trees). The engine is back on the original A/B/C
+strategies with `inherited_rp_ratio=1.0`. Two standing lessons:
+
+1. **Validation must use the deployment protocol.** Fixed-parameter sweeps
+   said "never worse"; the tuned-parameter + early-stopping benchmark said
+   otherwise. Hyperparameters tuned against one candidate distribution do
+   not transfer to another.
+2. **Empirical synthetic-data findings are hypotheses, not patches.** The
+   knockout/ablation results below remain real observations, but engine
+   changes need a mathematical account of WHY (e.g., what exactly the
+   A/B near-parent cone contributes under tuned lr/ES dynamics) before
+   they are trusted. Theory first, then transplant.
 
 4 configs × 4 datasets × 5 seeds (`final_validation.py`), 200 trees, no ES:
 

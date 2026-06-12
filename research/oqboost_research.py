@@ -211,6 +211,8 @@ class OQBoostResearchTree:
         noise_strategy: str = 'uniform',
         n_random: int = 0,    # sparse random candidates (diversity family)
         n_inherit: int = 4,   # inherited candidates in 'mutate' mode (continuity family)
+        dir_cache: Optional[list] = None,
+        winning_history: Optional[list] = None,
     ):
         self.max_depth = max_depth
         self.reg_lambda = reg_lambda
@@ -228,6 +230,8 @@ class OQBoostResearchTree:
         self.noise_strategy = noise_strategy
         self.n_random = n_random
         self.n_inherit = n_inherit
+        self.dir_cache = dir_cache
+        self.winning_history = winning_history
 
         self.root_: Optional[Node] = None
         self.split_records_: list[SplitRecord] = []
@@ -235,6 +239,35 @@ class OQBoostResearchTree:
         self.cone_log_: list[tuple[int, float, float, float]] = []
         self.D_: int = 0
         self.K_: int = 0
+
+    def cache_direction(self, w: torch.Tensor, initial_score: float = 0.0):
+        norm = float(w.norm())
+        if norm < 1e-12:
+            return
+        wn = (w / norm).detach().cpu()
+
+        if self.winning_history is not None:
+            self.winning_history.append(wn)
+            if len(self.winning_history) > 128:
+                self.winning_history.pop(0)
+
+        if self.dir_cache is None:
+            return
+        for item in self.dir_cache:
+            dot = float(abs(torch.dot(item['w'], wn)))
+            if dot > 0.95:
+                return
+        if len(self.dir_cache) < 32:
+            self.dir_cache.append({'w': wn, 'score': initial_score})
+        else:
+            if self.inherit_mode == 'cache_evolutionary':
+                min_item = min(self.dir_cache, key=lambda x: x['score'])
+                if initial_score > min_item['score']:
+                    min_item['w'] = wn
+                    min_item['score'] = initial_score
+            else:
+                self.dir_cache.pop(0)
+                self.dir_cache.append({'w': wn, 'score': 0.0})
 
     def fit_predict(
         self,
@@ -256,7 +289,7 @@ class OQBoostResearchTree:
 
         self.n_root_ = len(sub)
         out = torch.zeros(N, K, dtype=X.dtype, device=X.device)
-        self.root_ = self._build(X, G, H, sub, depth=0, parent_w=None, out=out)
+        self.root_ = self._build(X, G, H, sub, depth=0, lineage_w=[], out=out)
         return out
 
     def _build(
@@ -266,7 +299,7 @@ class OQBoostResearchTree:
         H: torch.Tensor,
         idx: torch.Tensor,   # global indices of samples in this node
         depth: int,
-        parent_w: Optional[torch.Tensor],
+        lineage_w: list[torch.Tensor],
         out: torch.Tensor,
     ) -> Node:
         n = len(idx)
@@ -277,7 +310,7 @@ class OQBoostResearchTree:
             return Node(is_leaf=True, leaf_value=val)
 
         w, thresh, gain, record = self._find_split(
-            X[idx], G[idx], H[idx], depth, parent_w
+            X[idx], G[idx], H[idx], depth, lineage_w
         )
 
         if gain <= 0 or record is None:
@@ -286,6 +319,14 @@ class OQBoostResearchTree:
             return Node(is_leaf=True, leaf_value=val)
 
         self.split_records_.append(record)
+        if record.winner_type.startswith('inherit_cache_'):
+            parts = record.winner_type.split('_')
+            if len(parts) > 2 and parts[2].isdigit():
+                cache_idx = int(parts[2])
+                if cache_idx < len(self.dir_cache):
+                    self.dir_cache[cache_idx]['score'] += gain
+        elif record.winner_type != 'axis':
+            self.cache_direction(w, initial_score=gain)
 
         proj = X[idx] @ w
         left_mask = proj <= thresh
@@ -298,8 +339,8 @@ class OQBoostResearchTree:
             out[idx] += val.unsqueeze(0)
             return Node(is_leaf=True, leaf_value=val)
 
-        left_child = self._build(X, G, H, left_idx, depth + 1, w, out)
-        right_child = self._build(X, G, H, right_idx, depth + 1, w, out)
+        left_child = self._build(X, G, H, left_idx, depth + 1, lineage_w + [w], out)
+        right_child = self._build(X, G, H, right_idx, depth + 1, lineage_w + [w], out)
         return Node(is_leaf=False, record=record, left=left_child, right=right_child)
 
     def _find_split(
@@ -308,8 +349,9 @@ class OQBoostResearchTree:
         G_node: torch.Tensor,
         H_node: torch.Tensor,
         depth: int,
-        parent_w: Optional[torch.Tensor],
+        lineage_w: list[torch.Tensor],
     ) -> tuple[torch.Tensor, float, float, Optional[SplitRecord]]:
+        parent_w = lineage_w[-1] if len(lineage_w) > 0 else None
         N, D = X_node.shape
         k_dom = _dominant_class(G_node)
 
@@ -501,6 +543,306 @@ class OQBoostResearchTree:
                 else:
                     n_candidates = 8
                 makers = [lambda: make_cosine_constrained(gamma) for _ in range(n_candidates)]
+            elif self.inherit_mode in ['cache_blend', 'cache_orb', 'cache_evolutionary']:
+                if self.dir_cache and len(self.dir_cache) > 0:
+                    def make_cache_blend_or_orb():
+                        idx_rnd = torch.randint(0, len(self.dir_cache), (1,)).item()
+                        cached_item = self.dir_cache[idx_rnd]
+                        cw = cached_item['w'].to(device=X_node.device, dtype=X_node.dtype)
+                        alpha = float(torch.rand(1, device=X_node.device).item()) * 0.6 + 0.2
+                        
+                        if self.inherit_mode == 'cache_blend':
+                            w_blend = alpha * wp + (1.0 - alpha) * cw
+                            n = float(w_blend.norm())
+                            return (w_blend / n, f'inherit_cache_{idx_rnd}') if n > 1e-8 else None
+                        else:
+                            # ORB: Orthogonal Random Blending
+                            # 1. Project cached_w orthogonal to wp
+                            cw_orth = cw - (cw @ wp) * wp
+                            n_c = float(cw_orth.norm())
+                            if n_c > 1e-8:
+                                cw_orth = cw_orth / n_c
+                            else:
+                                cw_orth = cw
+                            
+                            # 2. Draw fresh random direction
+                            sup_idx = torch.where(support)[0].tolist()
+                            sup_union = sorted(set(sup_idx) | set(top_feat[:4]))
+                            r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                            ridx = torch.tensor(sup_union, dtype=torch.long, device=X_node.device)
+                            r[ridx] = torch.randn(len(sup_union), device=X_node.device)
+                            rn = r / (r.norm() + 1e-12)
+                            
+                            # 3. Blend: alpha * random + (1 - alpha) * cached_orth
+                            w_blend = alpha * rn + (1.0 - alpha) * cw_orth
+                            
+                            # 4. Project orthogonal to wp
+                            w_final = w_blend - (w_blend @ wp) * wp
+                            n = float(w_final.norm())
+                            return (w_final / n, f'inherit_cache_{idx_rnd}') if n > 1e-8 else None
+                else:
+                    def make_cache_blend_or_orb():
+                        sup_idx = torch.where(support)[0].tolist()
+                        sup_union = sorted(set(sup_idx) | set(top_feat[:4]))
+                        r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        ridx = torch.tensor(sup_union, dtype=torch.long, device=X_node.device)
+                        r[ridx] = torch.randn(len(sup_union), device=X_node.device)
+                        n = float(r.norm())
+                        return (r / n, 'inherit_cache_fallback') if n > 1e-8 else None
+
+                if self.budget_strategy == 'less':
+                    n_candidates = max(2, 8 - 2 * depth)
+                elif self.budget_strategy == 'density':
+                    gamma = 0.5
+                    n_candidates = max(2, int(round(8 * math.sqrt(1.0 - gamma * gamma))))
+                else:
+                    n_candidates = 8
+                makers = [make_cache_blend_or_orb for _ in range(n_candidates)]
+            elif self.inherit_mode in ['cache_adaptive_blend_size', 'cache_adaptive_blend_gradient', 'cache_adaptive_blend_depth_prop', 'cache_adaptive_blend_depth_inv']:
+                if self.inherit_mode == 'cache_adaptive_blend_size':
+                    rho = float(N) / float(self.n_root_)
+                    alpha = max(0.1, min(0.9, 1.0 - rho))
+                elif self.inherit_mode == 'cache_adaptive_blend_gradient':
+                    G_mean = G_node.mean(dim=0, keepdim=True)
+                    G_var = ((G_node - G_mean) ** 2).sum()
+                    G_energy = (G_node ** 2).sum()
+                    sigma2 = float(G_var / (G_energy + 1e-8))
+                    alpha = max(0.1, min(0.9, 1.0 - sigma2))
+                elif self.inherit_mode == 'cache_adaptive_blend_depth_prop':
+                    alpha = min(0.9, 0.2 + 0.17 * depth)
+                elif self.inherit_mode == 'cache_adaptive_blend_depth_inv':
+                    alpha = max(0.1, 0.8 - 0.17 * depth)
+                else:
+                    alpha = 0.5
+
+                if self.dir_cache and len(self.dir_cache) > 0:
+                    def make_cache_adaptive_blend():
+                        idx_rnd = torch.randint(0, len(self.dir_cache), (1,)).item()
+                        cached_item = self.dir_cache[idx_rnd]
+                        cw = cached_item['w'].to(device=X_node.device, dtype=X_node.dtype)
+                        w_blend = alpha * wp + (1.0 - alpha) * cw
+                        n = float(w_blend.norm())
+                        return (w_blend / n, f'inherit_cache_{idx_rnd}') if n > 1e-8 else None
+                else:
+                    def make_cache_adaptive_blend():
+                        sup_idx = torch.where(support)[0].tolist()
+                        sup_union = sorted(set(sup_idx) | set(top_feat[:4]))
+                        r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        ridx = torch.tensor(sup_union, dtype=torch.long, device=X_node.device)
+                        r[ridx] = torch.randn(len(sup_union), device=X_node.device)
+                        n = float(r.norm())
+                        return (r / n, 'inherit_cache_fallback') if n > 1e-8 else None
+
+                if self.budget_strategy == 'less':
+                    n_candidates = max(2, 8 - 2 * depth)
+                elif self.budget_strategy == 'density':
+                    n_candidates = max(2, int(round(8 * math.sqrt(1.0 - alpha * alpha))))
+                else:
+                    n_candidates = 8
+                makers = [make_cache_adaptive_blend for _ in range(n_candidates)]
+            elif self.inherit_mode == 'random_only':
+                def make_random():
+                    p_nz = 1.0 / max(2.0, math.sqrt(D))
+                    mask = torch.rand(D, device=X_node.device) < p_nz
+                    if not mask.any():
+                        mask[torch.randint(D, (1,), device=X_node.device)] = True
+                    w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    signs = torch.where(
+                        torch.rand(int(mask.sum()), device=X_node.device) < 0.5,
+                        -1.0, 1.0,
+                    )
+                    w_r[mask] = signs.to(X_node.dtype)
+                    w_r = w_r / w_r.norm()
+                    return (w_r, 'random_only')
+
+                n_candidates = 8
+                makers = [make_random for _ in range(n_candidates)]
+            elif self.inherit_mode == 'cache_pca':
+                def make_fallback():
+                    p_nz = 1.0 / max(2.0, math.sqrt(D))
+                    mask = torch.rand(D, device=X_node.device) < p_nz
+                    if not mask.any():
+                        mask[torch.randint(D, (1,), device=X_node.device)] = True
+                    w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                    signs = torch.where(
+                        torch.rand(int(mask.sum()), device=X_node.device) < 0.5,
+                        -1.0, 1.0,
+                    )
+                    w_r[mask] = signs.to(X_node.dtype)
+                    w_r = w_r / w_r.norm()
+                    return (w_r, 'inherit_pca_fallback')
+
+                if self.winning_history and len(self.winning_history) >= 8:
+                    try:
+                        # Compute SVD on CPU to be robust to device-specific SVD implementation limitations/bugs
+                        W_hist = torch.stack(self.winning_history).to(device='cpu', dtype=torch.float32)
+                        mean_W = W_hist.mean(dim=0, keepdim=True)
+                        W_centered = W_hist - mean_W
+                        U, S, Vh = torch.linalg.svd(W_centered, full_matrices=False)
+                        
+                        S_device = S.to(device=X_node.device, dtype=X_node.dtype)
+                        Vh_device = Vh.to(device=X_node.device, dtype=X_node.dtype)
+                        S_Vh = S_device.unsqueeze(1) * Vh_device
+                        
+                        def make_pca_cand():
+                            z = torch.randn(len(S), device=X_node.device, dtype=X_node.dtype)
+                            w_subspace = z @ S_Vh
+                            n_sub = float(w_subspace.norm())
+                            if n_sub < 1e-8:
+                                w_subspace = torch.randn(D, device=X_node.device, dtype=X_node.dtype)
+                                n_sub = float(w_subspace.norm())
+                            w_subspace = w_subspace / n_sub
+                            
+                            p_nz = 1.0 / max(2.0, math.sqrt(D))
+                            mask = torch.rand(D, device=X_node.device) < p_nz
+                            if not mask.any():
+                                mask[torch.randint(D, (1,), device=X_node.device)] = True
+                            r_sparse = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                            signs = torch.where(
+                                torch.rand(int(mask.sum()), device=X_node.device) < 0.5,
+                                -1.0, 1.0,
+                            )
+                            r_sparse[mask] = signs.to(X_node.dtype)
+                            r_sparse = r_sparse / (r_sparse.norm() + 1e-12)
+                            
+                            beta = 0.1
+                            w_blend = (1.0 - beta) * w_subspace + beta * r_sparse
+                            w_final = w_blend - (w_blend @ wp) * wp
+                            n_final = float(w_final.norm())
+                            return (w_final / n_final, 'inherit_pca') if n_final > 1e-8 else None
+                        
+                        makers = [make_pca_cand for _ in range(8)]
+                    except Exception as e:
+                        makers = [make_fallback for _ in range(8)]
+                else:
+                    makers = [make_fallback for _ in range(8)]
+            elif self.inherit_mode == 'cache_lineage_orth':
+                # Compute orthonormal basis Q of lineage_w on the current device
+                Q = []
+                for a in lineage_w:
+                    q = a.to(device=X_node.device, dtype=X_node.dtype)
+                    n_a = q.norm()
+                    if n_a > 1e-12:
+                        q = q / n_a
+                    for prev_q in Q:
+                        q = q - torch.dot(q, prev_q) * prev_q
+                    n_q = q.norm()
+                    if n_q > 1e-12:
+                        Q.append(q / n_q)
+
+                if self.dir_cache and len(self.dir_cache) > 0:
+                    def make_cache_lineage_orth():
+                        idx_rnd = torch.randint(0, len(self.dir_cache), (1,)).item()
+                        cached_item = self.dir_cache[idx_rnd]
+                        cw = cached_item['w'].to(device=X_node.device, dtype=X_node.dtype)
+                        
+                        # Project cw orthogonal to the lineage subspace Q
+                        cw_orth = cw.clone()
+                        for q in Q:
+                            cw_orth = cw_orth - torch.dot(cw_orth, q) * q
+                        n_c = float(cw_orth.norm())
+                        if n_c > 1e-8:
+                            cw_orth = cw_orth / n_c
+                        else:
+                            cw_orth = cw
+                        
+                        # Draw fresh random direction for blending/exploration
+                        sup_idx = torch.where(support)[0].tolist()
+                        sup_union = sorted(set(sup_idx) | set(top_feat[:4]))
+                        r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        ridx = torch.tensor(sup_union, dtype=torch.long, device=X_node.device)
+                        r[ridx] = torch.randn(len(sup_union), device=X_node.device)
+                        
+                        # Project r orthogonal to the lineage subspace Q
+                        r_orth = r.clone()
+                        for q in Q:
+                            r_orth = r_orth - torch.dot(r_orth, q) * q
+                        n_r = float(r_orth.norm())
+                        if n_r > 1e-8:
+                            rn = r_orth / n_r
+                        else:
+                            rn = r / (r.norm() + 1e-12)
+                            
+                        # Blend: alpha * random + (1 - alpha) * cached_orth
+                        alpha = float(torch.rand(1, device=X_node.device).item()) * 0.6 + 0.2
+                        w_blend = alpha * rn + (1.0 - alpha) * cw_orth
+                        
+                        # Project w_blend orthogonal to Q once more to ensure numerical precision
+                        w_final = w_blend.clone()
+                        for q in Q:
+                            w_final = w_final - torch.dot(w_final, q) * q
+                        
+                        n = float(w_final.norm())
+                        return (w_final / n, f'inherit_cache_{idx_rnd}') if n > 1e-8 else None
+                    
+                    n_candidates = 8
+                    makers = [make_cache_lineage_orth for _ in range(n_candidates)]
+                else:
+                    def make_fallback():
+                        p_nz = 1.0 / max(2.0, math.sqrt(D))
+                        mask = torch.rand(D, device=X_node.device) < p_nz
+                        if not mask.any():
+                            mask[torch.randint(D, (1,), device=X_node.device)] = True
+                        w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        signs = torch.where(
+                            torch.rand(int(mask.sum()), device=X_node.device) < 0.5,
+                            -1.0, 1.0,
+                        )
+                        w_r[mask] = signs.to(X_node.dtype)
+                        w_r = w_r / w_r.norm()
+                        return (w_r, 'inherit_cache_fallback')
+                    
+                    makers = [make_fallback for _ in range(8)]
+            elif self.inherit_mode == 'pobs':
+                sup_idx = torch.where(support)[0].tolist() if parent_w is not None else []
+                sup_union = sorted(set(sup_idx) | set(top_feat[:4]))
+                D_sup = len(sup_union)
+                pobs_cands = []
+                while len(pobs_cands) < 8:
+                    block_size = min(D_sup, 8 - len(pobs_cands))
+                    X_rnd = torch.randn(D_sup, block_size, device=X_node.device, dtype=X_node.dtype)
+                    Q, R = torch.linalg.qr(X_rnd)
+                    for i in range(block_size):
+                        w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        ridx = torch.tensor(sup_union, dtype=torch.long, device=X_node.device)
+                        w[ridx] = Q[:, i]
+                        pobs_cands.append(w)
+                makers = [lambda idx=i: (pobs_cands[idx], 'pobs') for i in range(8)]
+            elif self.inherit_mode == 'qmc':
+                sup_idx = torch.where(support)[0].tolist() if parent_w is not None else []
+                sup_union = sorted(set(sup_idx) | set(top_feat[:4]))
+                D_sup = len(sup_union)
+                node_seed = int((depth * 10000 + len(X_node) + int(torch.randint(0, 100000, (1,)).item())) % (2**30))
+                try:
+                    engine = torch.quasirandom.SobolEngine(dimension=D_sup, scramble=True, seed=node_seed)
+                    samples = engine.draw(8).to(device=X_node.device, dtype=X_node.dtype)
+                    samples_clamped = torch.clamp(samples, 1e-6, 1.0 - 1e-6)
+                    z = torch.erfinv(2 * samples_clamped - 1.0) * 1.41421356237
+                    norms = z.norm(dim=1, keepdim=True) + 1e-12
+                    z_normalized = z / norms
+                    
+                    qmc_cands = []
+                    ridx = torch.tensor(sup_union, dtype=torch.long, device=X_node.device)
+                    for i in range(8):
+                        w = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        w[ridx] = z_normalized[i]
+                        qmc_cands.append(w)
+                    makers = [lambda idx=i: (qmc_cands[idx], 'qmc') for i in range(8)]
+                except Exception as e:
+                    def make_fallback():
+                        p_nz = 1.0 / max(2.0, math.sqrt(D))
+                        mask = torch.rand(D, device=X_node.device) < p_nz
+                        if not mask.any():
+                            mask[torch.randint(D, (1,), device=X_node.device)] = True
+                        w_r = torch.zeros(D, dtype=X_node.dtype, device=X_node.device)
+                        signs = torch.where(
+                            torch.rand(int(mask.sum()), device=X_node.device) < 0.5,
+                            -1.0, 1.0,
+                        )
+                        w_r[mask] = signs.to(X_node.dtype)
+                        w_r = w_r / w_r.norm()
+                        return (w_r, 'qmc_fallback')
+                    makers = [make_fallback for _ in range(8)]
             else:  # 'both'
                 makers = [make_A, lambda: make_B(0), lambda: make_O(beta_val), lambda: make_O(beta_val)]
             for mk in makers:
@@ -713,6 +1055,8 @@ class OQBoostResearch:
             self.device = torch.device(device)
 
         self.trees_: list[OQBoostResearchTree] = []
+        self.dir_cache_: list[torch.Tensor] = []
+        self.winning_history_: list[torch.Tensor] = []
         self.F_init_: Optional[torch.Tensor] = None
         self.train_losses_: list[float] = []
         self.classes_: Optional[np.ndarray] = None
@@ -771,6 +1115,8 @@ class OQBoostResearch:
                 noise_strategy=self.noise_strategy,
                 n_random=self.n_random,
                 n_inherit=self.n_inherit,
+                dir_cache=self.dir_cache_,
+                winning_history=self.winning_history_,
             )
 
             # Build on subsample; predict on full X for F update

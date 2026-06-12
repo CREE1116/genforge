@@ -22,7 +22,7 @@ OQBoostClassifier(
     verbose=False,
     cat_features=None,
     class_weight="balanced",
-    inherited_rp_ratio=0.5,
+    inherited_rp_ratio=1.0,
     mutation_rate=0.1,
     mutation_strength=0.5,
 )
@@ -42,9 +42,9 @@ OQBoostClassifier(
 | `verbose` | bool | False | Print per-round metrics |
 | `cat_features` | list or None | None | Categorical column names (DataFrame) or indices |
 | `class_weight` | str or None | "balanced" | "balanced" reweights by inverse class frequency |
-| `inherited_rp_ratio` | float | 0.5 | Oblique-candidate split: cache-blend pool vs fresh random projections |
-| `mutation_rate` | float | — | Deprecated, ignored (parent-mutation strategies removed) |
-| `mutation_strength` | float | — | Deprecated, ignored (parent-mutation strategies removed) |
+| `inherited_rp_ratio` | float | 1.0 | Cache-direction candidate fraction |
+| `mutation_rate` | float | 0.1 | Noise scale for inherited directions |
+| `mutation_strength` | float | 0.5 | Weight of borrowed feature in hybrid directions |
 
 ---
 
