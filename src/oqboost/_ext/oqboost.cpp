@@ -110,15 +110,42 @@ struct OQBoostCtx {
       dir_cache_next = (dir_cache_next + 1) % DIR_CACHE_MAX;
     }
   }
+
+  // ── Oblique scratch buffers (pre-allocated per context) ───────────────────
+  // Flat direction matrix: dirs_buf[i*D + d] = component d of direction i.
+  // dirs_n is reset to 0 at the start of each eval_oblique call.
+  static constexpr int DIRS_MAX = 160;  // pool(64)+pobs(8)+cache(32)+margin
+  std::vector<float> dirs_buf;       // capacity: DIRS_MAX * D
+  int dirs_n = 0;                    // active directions count
+  std::vector<float> scratch_w;      // D floats: temp buffer for one direction
+  std::vector<int>   samp_e_buf;     // EST_NE_MAX ints: stride_cap result
+  std::vector<float> scratch_dir_gain;   // DIRS_MAX floats
+  std::vector<float> scratch_dir_thr;    // DIRS_MAX floats
+  std::vector<int>   scratch_cand_feats; // D ints: strategy B candidate feats
+  std::vector<float> scratch_cand_probs; // D floats: strategy B candidate probs
+  std::vector<float> scratch_Gt;
+  std::vector<float> scratch_Ht;
+  std::vector<float> scratch_eGt;
+  std::vector<float> scratch_eHt;
+  std::vector<float> scratch_cg_s;
+  std::vector<float> scratch_add_s;
+  std::vector<float> scratch_fscore;
+  std::vector<float> scratch_prob;
 };
 
 static inline int get_node_depth(int t) {
+  // Heap index depth = floor(log2(t+1)). Single-cycle bit instruction.
+#if defined(__GNUC__) || defined(__clang__)
+  return (t == 0) ? 0 : (31 - __builtin_clz((unsigned)(t + 1)));
+#elif defined(_MSC_VER)
+  unsigned long idx = 0;
+  _BitScanReverse(&idx, (unsigned)(t + 1));
+  return (t == 0) ? 0 : (int)idx;
+#else
   int depth = 0;
-  while (t > 0) {
-    t = (t - 1) / 2;
-    depth++;
-  }
+  while (t > 0) { t = (t - 1) / 2; depth++; }
   return depth;
+#endif
 }
 
 // Deterministic stride subsample.
@@ -204,6 +231,18 @@ GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
   ctx->code.assign((size_t)N * D, 0);
   ctx->is_nan.assign((size_t)N * D, 0);
 
+  // Pre-allocate oblique scratch buffers (D known here).
+  ctx->dirs_buf.resize((size_t)OQBoostCtx::DIRS_MAX * D, 0.0f);
+  ctx->scratch_w.resize(D, 0.0f);
+  ctx->samp_e_buf.reserve(EST_NE_MAX);
+  ctx->scratch_dir_gain.reserve(OQBoostCtx::DIRS_MAX);
+  ctx->scratch_dir_thr.reserve(OQBoostCtx::DIRS_MAX);
+  ctx->scratch_cand_feats.reserve(D);
+  ctx->scratch_cand_probs.reserve(D);
+  ctx->scratch_cg_s.resize(D, 0.0f);
+  ctx->scratch_add_s.resize(D, 0.0f);
+  ctx->scratch_fscore.resize(D, 0.0f);
+  ctx->scratch_prob.resize(D, 0.0f);
   // ── numeric: μ_f, min/max over the non-missing subsample ─────────────────
   std::vector<float> ax_max(D_num, -1e30f);
   std::vector<float> ax_lo(D_num, 1e30f);
@@ -333,6 +372,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   auto* ctx = static_cast<OQBoostCtx*>(ctx_handle);
   const int AX_BINS = ctx->n_bins;
   const int D = ctx->D, D_num = ctx->D_num, D_cat = ctx->D_cat, N = ctx->N;
+  ctx->scratch_Gt.resize(K);
+  ctx->scratch_Ht.resize(K);
+  ctx->scratch_eGt.resize(K);
+  ctx->scratch_eHt.resize(K);
   const float* GF_RESTRICT Xt = ctx->Ximp.data();
   const int STRIDE = 2 * K + 1;
   const size_t HSZ = (size_t)D * AX_BINS * STRIDE;
@@ -575,24 +618,15 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   std::vector<char> oblique_done(max_nodes, 0);
 
   // ── Phase 1: Axis scan ───────────────────────────────────────────────────
-  auto eval_axis = [&](int t) -> float {
+  // feat_mask is now generated once per node in the growth loop and shared.
+  auto eval_axis = [&](int t, const std::vector<char>& feat_mask) -> float {
     int ns = (int)node_samp[t].size();
     const float* GF_RESTRICT hb = node_hist[t].data();
 
-    std::vector<char> feat_mask(D, 1);
-    if (colsample_bynode < 1.0f) {
-      std::mt19937 col_rng(seed + t);
-      feat_mask.assign(D, 0);
-      int n_sel = std::max(1, (int)std::lrintf(D * colsample_bynode));
-      std::vector<int> f_indices(D);
-      std::iota(f_indices.begin(), f_indices.end(), 0);
-      std::shuffle(f_indices.begin(), f_indices.end(), col_rng);
-      for (int idx = 0; idx < n_sel; idx++) {
-        feat_mask[f_indices[idx]] = 1;
-      }
-    }
-
-    std::vector<float> Gt(K, 0.0f), Ht(K, 0.0f);
+    auto& Gt = ctx->scratch_Gt;
+    auto& Ht = ctx->scratch_Ht;
+    std::fill(Gt.begin(), Gt.end(), 0.0f);
+    std::fill(Ht.begin(), Ht.end(), 0.0f);
     for (int b = 0; b < AX_BINS; b++) {
       const float* GF_RESTRICT slot = hb + (size_t)b * STRIDE;
       for (int c = 0; c < K; c++) {
@@ -626,11 +660,59 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         float thread_best_gain = 0.0f, thread_best_thr = 0.0f;
         int thread_best_axis = -1, thread_best_b = 0;
         uint8_t thread_best_default_left = 1;
-        std::vector<float> thread_Gc(K), thread_Hc(K);
-        // Per-thread scratch buffers, reused across features/bins to avoid
-        // heap churn in the hottest scan loop (K is tiny).
-        std::vector<double> bG_nan(K), bH_nan(K), bG_clean(K), bH_clean(K);
-        std::vector<double> bGc(K), bHc(K), bGL(K), bHL(K), bGR(K), bHR(K);
+        
+        constexpr int K_MAX_STACK = 64;
+        std::vector<float> thread_Gc_fb, thread_Hc_fb;
+        std::vector<double> bG_nan_fb, bH_nan_fb, bG_clean_fb, bH_clean_fb;
+        std::vector<double> bGc_fb, bHc_fb, bGL_fb, bHL_fb, bGR_fb, bHR_fb;
+
+        float thread_Gc_stack[K_MAX_STACK];
+        float thread_Hc_stack[K_MAX_STACK];
+        double bG_nan_stack[K_MAX_STACK];
+        double bH_nan_stack[K_MAX_STACK];
+        double bG_clean_stack[K_MAX_STACK];
+        double bH_clean_stack[K_MAX_STACK];
+        double bGc_stack[K_MAX_STACK];
+        double bHc_stack[K_MAX_STACK];
+        double bGL_stack[K_MAX_STACK];
+        double bHL_stack[K_MAX_STACK];
+        double bGR_stack[K_MAX_STACK];
+        double bHR_stack[K_MAX_STACK];
+
+        float* GF_RESTRICT thread_Gc = thread_Gc_stack;
+        float* GF_RESTRICT thread_Hc = thread_Hc_stack;
+        double* GF_RESTRICT bG_nan = bG_nan_stack;
+        double* GF_RESTRICT bH_nan = bH_nan_stack;
+        double* GF_RESTRICT bG_clean = bG_clean_stack;
+        double* GF_RESTRICT bH_clean = bH_clean_stack;
+        double* GF_RESTRICT bGc = bGc_stack;
+        double* GF_RESTRICT bHc = bHc_stack;
+        double* GF_RESTRICT bGL = bGL_stack;
+        double* GF_RESTRICT bHL = bHL_stack;
+        double* GF_RESTRICT bGR = bGR_stack;
+        double* GF_RESTRICT bHR = bHR_stack;
+
+        if (K > K_MAX_STACK) {
+          thread_Gc_fb.resize(K); thread_Hc_fb.resize(K);
+          bG_nan_fb.resize(K); bH_nan_fb.resize(K);
+          bG_clean_fb.resize(K); bH_clean_fb.resize(K);
+          bGc_fb.resize(K); bHc_fb.resize(K);
+          bGL_fb.resize(K); bHL_fb.resize(K);
+          bGR_fb.resize(K); bHR_fb.resize(K);
+
+          thread_Gc = thread_Gc_fb.data();
+          thread_Hc = thread_Hc_fb.data();
+          bG_nan = bG_nan_fb.data();
+          bH_nan = bH_nan_fb.data();
+          bG_clean = bG_clean_fb.data();
+          bH_clean = bH_clean_fb.data();
+          bGc = bGc_fb.data();
+          bHc = bHc_fb.data();
+          bGL = bGL_fb.data();
+          bHL = bHL_fb.data();
+          bGR = bGR_fb.data();
+          bHR = bHR_fb.data();
+        }
 #ifdef _OPENMP
 #pragma omp for schedule(static) nowait
 #endif
@@ -639,33 +721,26 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           if (ctx->ax_range[f] == 0.0f) continue;
           const float* GF_RESTRICT fbuf = hb + (size_t)f * AX_BINS * STRIDE;
           if (f < D_num) {
-            // Numeric: Joint scan over clean sample thresholds and NaN default routing
             const float* GF_RESTRICT nan_slot = fbuf + (size_t)(AX_BINS - 1) * STRIDE;
             int n_nan = (int)nan_slot[2 * K];
-            std::vector<double>& G_nan = bG_nan;
-            std::vector<double>& H_nan = bH_nan;
             for (int c = 0; c < K; c++) {
-              G_nan[c] = nan_slot[c];
-              H_nan[c] = nan_slot[K + c];
+              bG_nan[c] = nan_slot[c];
+              bH_nan[c] = nan_slot[K + c];
             }
             int n_clean_tot = ns - n_nan;
-            std::vector<double>& G_clean_tot = bG_clean;
-            std::vector<double>& H_clean_tot = bH_clean;
             for (int c = 0; c < K; c++) {
-              G_clean_tot[c] = Gt[c] - G_nan[c];
-              H_clean_tot[c] = Ht[c] - H_nan[c];
+              bG_clean[c] = Gt[c] - bG_nan[c];
+              bH_clean[c] = Ht[c] - bH_nan[c];
             }
-            std::vector<double>& Gc_acc = bGc;
-            std::vector<double>& Hc_acc = bHc;
-            std::fill(Gc_acc.begin(), Gc_acc.end(), 0.0);
-            std::fill(Hc_acc.begin(), Hc_acc.end(), 0.0);
+            std::fill_n(bGc, K, 0.0);
+            std::fill_n(bHc, K, 0.0);
             int n_left = 0;
             for (int b = 0; b < AX_BINS - 1; b++) {
               const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
               n_left += (int)slot[2 * K];
               for (int c = 0; c < K; c++) {
-                Gc_acc[c] += slot[c];
-                Hc_acc[c] += slot[K + c];
+                bGc[c] += slot[c];
+                bHc[c] += slot[K + c];
               }
               int n_clean_R = n_clean_tot - n_left;
               // Option L: NaNs go Left
@@ -674,12 +749,15 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                 int n_R = n_clean_R;
                 if (n_L >= 10 && n_R >= 10) {
                   double H_L_sum = 0.0, H_R_sum = 0.0;
-                  std::vector<double>&GL = bGL, &HL = bHL, &GR = bGR, &HR = bHR;
+                  double* GF_RESTRICT GL = bGL;
+                  double* GF_RESTRICT HL = bHL;
+                  double* GF_RESTRICT GR = bGR;
+                  double* GF_RESTRICT HR = bHR;
                   for (int c = 0; c < K; c++) {
-                    GL[c] = Gc_acc[c] + G_nan[c];
-                    HL[c] = Hc_acc[c] + H_nan[c];
-                    GR[c] = G_clean_tot[c] - Gc_acc[c];
-                    HR[c] = H_clean_tot[c] - Hc_acc[c];
+                    GL[c] = bGc[c] + bG_nan[c];
+                    HL[c] = bHc[c] + bH_nan[c];
+                    GR[c] = bG_clean[c] - bGc[c];
+                    HR[c] = bH_clean[c] - bHc[c];
                     H_L_sum += HL[c];
                     H_R_sum += HR[c];
                   }
@@ -707,12 +785,15 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                 int n_R = n_clean_R + n_nan;
                 if (n_L >= 10 && n_R >= 10) {
                   double H_L_sum = 0.0, H_R_sum = 0.0;
-                  std::vector<double>&GL = bGL, &HL = bHL, &GR = bGR, &HR = bHR;
+                  double* GF_RESTRICT GL = bGL;
+                  double* GF_RESTRICT HL = bHL;
+                  double* GF_RESTRICT GR = bGR;
+                  double* GF_RESTRICT HR = bHR;
                   for (int c = 0; c < K; c++) {
-                    GL[c] = Gc_acc[c];
-                    HL[c] = Hc_acc[c];
-                    GR[c] = G_clean_tot[c] - Gc_acc[c] + G_nan[c];
-                    HR[c] = H_clean_tot[c] - Hc_acc[c] + H_nan[c];
+                    GL[c] = bGc[c];
+                    HL[c] = bHc[c];
+                    GR[c] = bG_clean[c] - bGc[c] + bG_nan[c];
+                    HR[c] = bH_clean[c] - bHc[c] + bH_nan[c];
                     H_L_sum += HL[c];
                     H_R_sum += HR[c];
                   }
@@ -737,8 +818,8 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
             }
           } else {
             // Categorical: normal scan, NaNs are handled natively by category codes (default_left = 1)
-            std::fill(thread_Gc.begin(), thread_Gc.end(), 0.0f);
-            std::fill(thread_Hc.begin(), thread_Hc.end(), 0.0f);
+            std::fill_n(thread_Gc, K, 0.0f);
+            std::fill_n(thread_Hc, K, 0.0f);
             int n_left = 0;
             for (int b = 0; b < AX_BINS - 1; b++) {
               const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
@@ -810,25 +891,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   };
 
   // ── Phase 2: Oblique scan ────────────────────────────────────────────────
-  auto eval_oblique = [&](int t) -> float {
+  auto eval_oblique = [&](int t, const std::vector<char>& feat_mask) -> float {
     const auto& samp = node_samp[t];
     int ns = (int)samp.size();
     if (ns < OBLIQUE_MIN) return cand_gain[t];
 
-    std::vector<char> feat_mask(D, 1);
-    if (colsample_bynode < 1.0f) {
-      std::mt19937 col_rng(seed + t);
-      feat_mask.assign(D, 0);
-      int n_sel = std::max(1, (int)std::lrintf(D * colsample_bynode));
-      std::vector<int> f_indices(D);
-      std::iota(f_indices.begin(), f_indices.end(), 0);
-      std::shuffle(f_indices.begin(), f_indices.end(), col_rng);
-      for (int idx = 0; idx < n_sel; idx++) {
-        feat_mask[f_indices[idx]] = 1;
-      }
-    }
-
-    std::vector<float> Gt(K), Ht(K);
+    auto& Gt = ctx->scratch_Gt;
+    auto& Ht = ctx->scratch_Ht;
     for (int c = 0; c < K; c++) {
       Gt[c] = node_G[(size_t)t * K + c];
       Ht[c] = node_H[(size_t)t * K + c];
@@ -839,13 +908,26 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       total_base -= 0.5f * gt_l1 * gt_l1 / (Ht[c] + reg_lambda + EPS);
     }
 
-    std::vector<int> samp_e = stride_cap(samp, EST_NE_MAX);
+    // Use ctx pre-allocated scratch instead of allocating per eval_oblique call.
+    auto& samp_e = ctx->samp_e_buf;
+    samp_e.clear();
+    if ((int)samp.size() <= EST_NE_MAX) {
+      samp_e.assign(samp.begin(), samp.end());
+    } else {
+      samp_e.resize(EST_NE_MAX);
+      double step = (double)samp.size() / EST_NE_MAX;
+      for (int i = 0; i < EST_NE_MAX; i++)
+        samp_e[i] = samp[(size_t)(i * step)];
+    }
     int ne = (int)samp_e.size();
     bool exact_eval = (ne == ns);
-    std::vector<float> eGt(K, 0.0f), eHt(K, 0.0f);
+    auto& eGt = ctx->scratch_eGt;
+    auto& eHt = ctx->scratch_eHt;
+    std::fill(eGt.begin(), eGt.end(), 0.0f);
+    std::fill(eHt.begin(), eHt.end(), 0.0f);
     if (exact_eval) {
-      eGt = Gt;
-      eHt = Ht;
+      std::copy(Gt.begin(), Gt.end(), eGt.begin());
+      std::copy(Ht.begin(), Ht.end(), eHt.begin());
     } else {
       for (int j : samp_e) {
         for (int c = 0; c < K; c++) {
@@ -872,7 +954,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                   (size_t)D * sizeof(float));
     }
 
-    std::vector<float> cg_s(D, 0.0f), add_s(D, 0.0f);
+    auto& cg_s = ctx->scratch_cg_s;
+    auto& add_s = ctx->scratch_add_s;
+    std::fill(cg_s.begin(), cg_s.end(), 0.0f);
+    std::fill(add_s.begin(), add_s.end(), 0.0f);
     for (int i = 0; i < ne; i++) {
       const float* GF_RESTRICT xi = Xe_ptr + (size_t)i * D;
       int idx = samp_e[i];
@@ -883,12 +968,16 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         add_s[d] += hi * xi[d] * xi[d];
       }
     }
-    std::vector<float> fscore(D, 0.0f);
+    auto& fscore = ctx->scratch_fscore;
     for (int d = 0; d < D; d++) {
       fscore[d] = std::abs(cg_s[d]) / std::sqrt(add_s[d] + reg_lambda + EPS);
     }
 
-    std::vector<std::vector<float>> dirs;
+    // Use ctx flat buffer for direction candidates — eliminates n_dirs heap
+    // mallocs per call. dirs_flat[i*D .. (i+1)*D) holds direction vector i.
+    int& dirs_n = ctx->dirs_n;
+    dirs_n = 0;
+    float* GF_RESTRICT dirs_flat = ctx->dirs_buf.data();
     std::mt19937 rng(seed + t);
 
     // OQB_GAIN_LOG (research instrumentation, THEORY.md §1 open task):
@@ -902,29 +991,20 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     }();
     std::vector<char> fam;
 
-    std::vector<float> prob(D);
+    auto& prob = ctx->scratch_prob;
     for (int d = 0; d < D; d++) {
-      prob[d] = feat_mask[d] ? (fscore[d] + 1e-6f) : 0.0f;
+                    prob[d] = feat_mask[d] ? (fscore[d] + 1e-6f) : 0.0f;
     }
     std::discrete_distribution<int> feat_dist(prob.begin(), prob.end());
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
 
-    // pobs_sis candidates (THEORY.md POBS study, merged 2026-06-12): sample
-    // an SIS-weighted support S (|S| ≈ √D), build an exact Haar-orthogonal
-    // |S|×|S| block ON S via Gram-Schmidt. Sparse (routing-compatible),
-    // exactly orthogonal (zero within-block candidate correlation → every
-    // draw contributes full marginal tail mass), gradient-informed. Fills
-    // the diversity slots (root pool, n_global) plus a fixed 8-candidate
-    // slice of every node's inherited budget — the per-node injection is
-    // what passed the deployment protocol (root-only did not).
     auto fill_pobs = [&](int count) {
       if (count <= 0) return;
       int m = (int)std::lround(std::sqrt((float)D));
       m = std::max(2, std::min({m, D_SUB_MAX, D}));
       std::normal_distribution<float> gauss(0.0f, 1.0f);
-      int target = (int)dirs.size() + count;
-      while ((int)dirs.size() < target) {
-        // Fresh SIS-weighted support per block (covers varied subspaces).
+      int target = dirs_n + count;
+      while (dirs_n < target && dirs_n < OQBoostCtx::DIRS_MAX) {
         std::vector<int> S;
         std::vector<uint8_t> used(D, 0);
         for (int attempt = 0; attempt < 50 * m && (int)S.size() < m;
@@ -937,29 +1017,27 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         }
         int mm = (int)S.size();
         if (mm < 2) break;
-        // Gaussian mm×mm + modified Gram-Schmidt → Haar-orthogonal rows.
-        std::vector<std::vector<float>> B(mm, std::vector<float>(mm));
-        for (auto& row : B)
-          for (auto& v : row) v = gauss(rng);
+        float B_flat[D_SUB_MAX * D_SUB_MAX];
+        for (int ii = 0; ii < mm * mm; ii++) B_flat[ii] = gauss(rng);
         int emitted = 0;
-        for (int i = 0; i < mm && (int)dirs.size() < target; i++) {
+        for (int i = 0; i < mm && dirs_n < target && dirs_n < OQBoostCtx::DIRS_MAX; i++) {
           for (int j = 0; j < i; j++) {
             float dot = 0.0f;
-            for (int d2 = 0; d2 < mm; d2++) dot += B[i][d2] * B[j][d2];
-            for (int d2 = 0; d2 < mm; d2++) B[i][d2] -= dot * B[j][d2];
+            for (int d2 = 0; d2 < mm; d2++) dot += B_flat[i*mm+d2] * B_flat[j*mm+d2];
+            for (int d2 = 0; d2 < mm; d2++) B_flat[i*mm+d2] -= dot * B_flat[j*mm+d2];
           }
           float n2 = 0.0f;
-          for (int d2 = 0; d2 < mm; d2++) n2 += B[i][d2] * B[i][d2];
+          for (int d2 = 0; d2 < mm; d2++) n2 += B_flat[i*mm+d2] * B_flat[i*mm+d2];
           if (n2 < 1e-12f) continue;
           float inv = 1.0f / std::sqrt(n2);
-          for (int d2 = 0; d2 < mm; d2++) B[i][d2] *= inv;
-          std::vector<float> w(D, 0.0f);
-          for (int d2 = 0; d2 < mm; d2++) w[S[d2]] = B[i][d2];
-          dirs.push_back(std::move(w));
+          float* GF_RESTRICT slot = dirs_flat + (size_t)dirs_n * D;
+          std::fill(slot, slot + D, 0.0f);
+          for (int d2 = 0; d2 < mm; d2++) slot[S[d2]] = B_flat[i*mm+d2] * inv;
+          dirs_n++;
           fam.push_back('p');
           emitted++;
         }
-        if (emitted == 0) break;  // degenerate node, avoid spinning
+        if (emitted == 0) break;
       }
     };
 
@@ -972,15 +1050,6 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                             parent_nz);
     }
 
-    // Depth-adaptive pool budget (THEORY.md §2/P4-refined, merged
-    // 2026-06-12): a node at depth d estimates directions from n/2^d
-    // samples — at depth ≥ 3 the gradient statistics are noise-dominated,
-    // and each tree LEVEL costs the same total (per-level sample counts sum
-    // to N), so a uniform budget overspends exactly where extra candidates
-    // buy noise. Cut deep (8) and reinvest shallow (64): order-statistics
-    // says to widen the tournament where estimates are reliable and node
-    // impact is largest. Cut-only (no reinvest) regressed covtype — the two
-    // halves are a package.
     int depth_t = get_node_depth(t);
     int pool_budget = (depth_t <= 2) ? 64 : 8;
 
@@ -989,21 +1058,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     if (n_inherited > pool_budget) n_inherited = pool_budget;
     int n_global = pool_budget - n_inherited;
 
-    // Carve a fixed pobs slice out of the inherited budget so every node
-    // sees orthogonal-diverse candidates, not just the root. pobs=0 (the
-    // gf_build parameter) disables the carve — the inherited budget reverts
-    // to all A/B/C — for A/B comparison; the root pool stays pobs either
-    // way (the legacy root generator was removed and the root slot measured
-    // neutral).
     int n_pobs_extra = pobs ? std::min(8, n_inherited) : 0;
     n_inherited -= n_pobs_extra;
 
     if (has_parent && parent_nz.size > 0) {
-      // Inherited mutation strategies (A/B/C) — the original production
-      // design. Research-impl ablations questioned A/B, but transplanting
-      // that finding regressed the real tuned benchmarks; until the
-      // mechanism is understood theoretically the proven configuration
-      // stays (see research/FINDINGS.md).
       float local_mutation_rate =
           mutation_rate / std::sqrt(1.0f + (float)depth_t);
       float local_mutation_strength =
@@ -1015,11 +1073,6 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         bool do_strategy_b = false;
         bool do_strategy_c = false;
 
-        // a:37.5% b:37.5% c:25%. A data-optimal per-node-E[max] reallocation
-        // (a:6.25%) was tried and REJECTED on the deployment protocol —
-        // Strategy A's ensemble value is invisible in per-node gains
-        // (THEORY.md §1 allocation study). This split has survived three
-        // challenges; do not reweight it without ensemble-level evidence.
         if (!ctx->dir_cache.empty()) {
           if (strategy_draw < 0.375f) {
             do_strategy_a = (parent_nz.size > 1);
@@ -1038,7 +1091,8 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           }
         }
 
-        std::vector<float> w_rand(D, 0.0f);
+        float* GF_RESTRICT w_rand = ctx->scratch_w.data();
+        std::fill(w_rand, w_rand + D, 0.0f);
 
         if (do_strategy_c) {
           std::uniform_int_distribution<int> cache_dist(
@@ -1074,8 +1128,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
               w_rand[parent_nz.indices[idx2]] *= (1.0f + s2);
             }
           } else if (do_strategy_b) {
-            std::vector<int> candidate_feats;
-            std::vector<float> candidate_probs;
+            auto& candidate_feats = ctx->scratch_cand_feats;
+            auto& candidate_probs = ctx->scratch_cand_probs;
+            candidate_feats.clear();
+            candidate_probs.clear();
             for (int d = 0; d < D; d++) {
               bool in_parent = false;
               for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
@@ -1107,13 +1163,17 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         float norm = 0.0f;
         for (int d = 0; d < D; d++) norm += w_rand[d] * w_rand[d];
         norm = std::sqrt(norm);
-        if (norm > 1e-12f) {
-          for (int d = 0; d < D; d++) w_rand[d] /= norm;
-          dirs.push_back(std::move(w_rand));
-        } else {
-          std::vector<float> w_fallback(D, 0.0f);
-          w_fallback[parent_nz.indices[0]] = parent_nz.values[0];
-          dirs.push_back(std::move(w_fallback));
+        if (dirs_n < OQBoostCtx::DIRS_MAX) {
+          float* GF_RESTRICT slot = dirs_flat + (size_t)dirs_n * D;
+          if (norm > 1e-12f) {
+            float inv_norm = 1.0f / norm;
+            for (int d = 0; d < D; d++) slot[d] = w_rand[d] * inv_norm;
+          } else {
+            // Fallback: keep parent's first nonzero direction.
+            std::fill(slot, slot + D, 0.0f);
+            slot[parent_nz.indices[0]] = parent_nz.values[0];
+          }
+          dirs_n++;
         }
         fam.push_back(do_strategy_c ? 'c' : (do_strategy_a ? 'a' : 'b'));
       }
@@ -1134,19 +1194,27 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     // the old approximate 512-sample pre-screen pass did, and removes its
     // sampling noise.
     for (const auto& cw : ctx->dir_cache) {
-      dirs.push_back(cw);
+      if (dirs_n < OQBoostCtx::DIRS_MAX) {
+        std::memcpy(dirs_flat + (size_t)dirs_n * D, cw.data(),
+                    (size_t)D * sizeof(float));
+        dirs_n++;
+      }
       fam.push_back('k');
     }
 
     float ob_gain = 0.0f, ob_thr = 0.0f;
     int ob_idx = -1;
-    const int n_dirs = (int)dirs.size();
-    std::vector<float> dir_gain(n_dirs, 0.0f), dir_thr(n_dirs, 0.0f);
+    const int n_dirs = dirs_n;
+    ctx->scratch_dir_gain.assign(n_dirs, 0.0f);
+    ctx->scratch_dir_thr.assign(n_dirs, 0.0f);
+    auto& dir_gain = ctx->scratch_dir_gain;
+    auto& dir_thr  = ctx->scratch_dir_thr;
 
     // Routing truncates every direction to its first D_SUB_MAX nonzeros
     // (collect_nonzero_stack); sanitize candidates the same way up front so
     // the batched dense projections match what routing will later compute.
-    for (auto& wv : dirs) {
+    for (int di = 0; di < dirs_n; di++) {
+      float* GF_RESTRICT wv = dirs_flat + (size_t)di * D;
       int nz = 0;
       for (int d = 0; d < D; d++) {
         if (wv[d] != 0.0f) {
@@ -1163,12 +1231,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     float* Pj_ptr = ctx->Pj_workspace.data();
 #if GF_HAVE_BLAS
     {
-      std::vector<float> Wd((size_t)n_dirs * D);
-      for (int di = 0; di < n_dirs; di++)
-        std::memcpy(Wd.data() + (size_t)di * D, dirs[di].data(),
-                    (size_t)D * sizeof(float));
+      // dirs_flat already IS the flat Wd matrix layout (dirs_flat[di*D+f]).
+      // Pass it directly to BLAS — eliminates the Wd allocation + memcpy loop.
       cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n_dirs, ne, D,
-                  1.0f, Wd.data(), D, Xe_ptr, D, 0.0f, Pj_ptr, ne);
+                  1.0f, dirs_flat, D, Xe_ptr, D, 0.0f, Pj_ptr, ne);
     }
 #else
 #ifdef _OPENMP
@@ -1176,7 +1242,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 #endif
     for (int di = 0; di < n_dirs; di++) {
       SparseVec sv;
-      collect_nonzero_stack(dirs[di].data(), D, sv);
+      collect_nonzero_stack(dirs_flat + (size_t)di * D, D, sv);
       float* GF_RESTRICT prow = Pj_ptr + (size_t)di * ne;
       for (int si = 0; si < ne; si++)
         prow[si] = sparse_dot_stack(sv, Xe_ptr + (size_t)si * D);
@@ -1188,7 +1254,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 #endif
     for (int di = 0; di < n_dirs; di++) {
       SparseVec sv;
-      collect_nonzero_stack(dirs[di].data(), D, sv);
+      collect_nonzero_stack(dirs_flat + (size_t)di * D, D, sv);
       if (sv.size <= 1) continue;
 
       const float* GF_RESTRICT proj_e = Pj_ptr + (size_t)di * ne;
@@ -1291,7 +1357,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     if (ob_idx < 0) return cand_gain[t];
     SparseVec sv;
 
-    collect_nonzero_stack(dirs[ob_idx].data(), D, sv);
+    collect_nonzero_stack(dirs_flat + (size_t)ob_idx * D, D, sv);
     std::vector<float> proj_full(ns);
     float exact_gain;
     if (exact_eval) {
@@ -1376,7 +1442,9 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     if (exact_gain > cand_gain[t]) {
       cand_gain[t] = exact_gain;
       cand_thr[t] = ob_thr;
-      cand_w[t] = dirs[ob_idx];
+      // Copy best direction from flat buffer into cand_w[t].
+      cand_w[t].assign(dirs_flat + (size_t)ob_idx * D,
+                       dirs_flat + (size_t)ob_idx * D + D);
       cand_axis[t] = -1;
       cand_proj[t] = std::move(proj_full);
     }
@@ -1415,8 +1483,19 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     }
 
     if (!oblique_done[t_node]) {
-      float ag = eval_axis(t_node);
-      float g2 = eval_oblique(t_node);
+      // Generate feat_mask once per node; reuse across both axis and oblique scans.
+      std::vector<char> feat_mask(D, 1);
+      if (colsample_bynode < 1.0f) {
+        std::mt19937 col_rng(seed + t_node);
+        feat_mask.assign(D, 0);
+        int n_sel = std::max(1, (int)std::lrintf(D * colsample_bynode));
+        std::vector<int> f_indices(D);
+        std::iota(f_indices.begin(), f_indices.end(), 0);
+        std::shuffle(f_indices.begin(), f_indices.end(), col_rng);
+        for (int idx = 0; idx < n_sel; idx++) feat_mask[f_indices[idx]] = 1;
+      }
+      float ag = eval_axis(t_node, feat_mask);
+      float g2 = eval_oblique(t_node, feat_mask);
       oblique_done[t_node] = 1;
       (void)ag;
       if (g2 < gamma || g2 <= 0.0f) {
@@ -1578,6 +1657,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 
     node_samp[tl] = std::move(left_sub);
     node_samp[tr_node] = std::move(right_sub);
+    // Parent's sample index list is no longer needed after split;
+    // releasing it here caps peak memory to O(N * current_depth).
+    node_samp[t_node].clear();
+    node_samp[t_node].shrink_to_fit();
     bool can_deepen = (depth_t + 1 < internal_depth) && (splits_left > 0);
     if (can_deepen) {
       for (int child : {tl, tr_node}) {
@@ -1684,7 +1767,16 @@ GF_API void gf_predict(void* tree_handle, const float* X, int N, int K,
     return;
   }
   const int D_num = tree->D_num;
+  // Fast path: purely numerical data (D_cat == 0).
+  // The Xt copy loop only trivially copies numeric columns as-is;
+  // _gf_route handles NaN via tree->na_means directly, so skip the allocation.
+  if (D_num == D) {
+    _gf_route(tree, X, N, out_pred);
+    return;
+  }
+  // General path: categorical columns need rank-encoding into Xt.
   std::vector<float> Xt((size_t)N * D);
+
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -2060,23 +2152,37 @@ GF_API void gf_update_gradients(const float* F, const float* oh, int N, int K, f
   for (int i = 0; i < N; i++) {
     size_t offset = (size_t)i * K;
 
-    // Find max F for numerical stability
+    // K=2 fast path: p0 + p1 = 1, so only one exp() is needed.
+    if (K == 2) {
+      float diff = F[offset] - F[offset + 1];
+      float e = std::exp(-std::abs(diff));
+      float p0 = (diff >= 0.0f) ? (1.0f / (1.0f + e)) : (e / (1.0f + e));
+      float p1 = 1.0f - p0;
+      G[offset]     = p0 - oh[offset];
+      H[offset]     = p0 * p1;
+      G[offset + 1] = p1 - oh[offset + 1];
+      H[offset + 1] = p0 * p1;  // symmetric
+      continue;
+    }
+
+    // General path: find max for numerical stability
     float fmax = F[offset];
     for (int c = 1; c < K; c++) {
-      if (F[offset + c] > fmax) {
-        fmax = F[offset + c];
-      }
+      if (F[offset + c] > fmax) fmax = F[offset + c];
     }
 
-    // Sum of exponentials
+    // Cache exp results in p_buf to avoid computing exp() twice per sample.
+    // Stack-allocated: zero heap traffic in the hot loop.
+    float p_buf[64];  // K <= 64 in all practical boosting scenarios
     double sum_exp = 0.0;
-    for (int c = 0; c < K; c++) {
-      sum_exp += std::exp(F[offset + c] - fmax);
+    const int Kc = (K < 64) ? K : 64;
+    for (int c = 0; c < Kc; c++) {
+      p_buf[c] = std::exp(F[offset + c] - fmax);
+      sum_exp += p_buf[c];
     }
-
-    // Compute P, G, H
-    for (int c = 0; c < K; c++) {
-      float p = (float)(std::exp(F[offset + c] - fmax) / sum_exp);
+    float inv_sum = 1.0f / (float)sum_exp;
+    for (int c = 0; c < Kc; c++) {
+      float p = p_buf[c] * inv_sum;
       G[offset + c] = p - oh[offset + c];
       H[offset + c] = p * (1.0f - p);
     }

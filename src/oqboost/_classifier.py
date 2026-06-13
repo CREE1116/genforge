@@ -4,6 +4,8 @@ import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
+from ._oqboost import predict_ensemble, update_gradients, OQBoostContext
+
 
 class OQBoostClassifier(BaseEstimator, ClassifierMixin):
     """
@@ -241,7 +243,6 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
             N = X_orig.shape[0]
             K = len(self.ovr_ensembles_)
             logits = np.zeros((N, K), dtype=np.float32)
-            from ._oqboost import predict_ensemble
             for c in range(K):
                 clf_c = self.ovr_ensembles_[c]
                 X_c = clf_c._prepare_data(X_orig, is_fit=False)
@@ -253,11 +254,12 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
                     np.array(clf_c.F_init_, dtype=np.float32)
                 )
                 logits[:, c] = F[:, 1] - F[:, 0]
-            
-            logits_sh = logits - logits.max(axis=1, keepdims=True)
-            P = np.exp(logits_sh)
-            P /= P.sum(axis=1, keepdims=True)
-            return P
+
+            # in-place softmax: subtract max for numerical stability, then normalize
+            logits -= logits.max(axis=1, keepdims=True)
+            np.exp(logits, out=logits)
+            logits /= logits.sum(axis=1, keepdims=True)
+            return logits
 
         check_is_fitted(self, "trees_")
 
@@ -267,14 +269,15 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
             X = np.ascontiguousarray(X[:, self._col_perm_])
         N = X.shape[0]
 
-        from ._oqboost import predict_ensemble
         K = len(self.F_init_)
         F = predict_ensemble(self.trees_, X, K, self.learning_rate,
                              np.array(self.F_init_, dtype=np.float32))
 
-        Fsh = F - F.max(axis=1, keepdims=True)
-        P   = np.exp(Fsh); P /= P.sum(axis=1, keepdims=True)
-        return P
+        # in-place softmax: reuse F buffer to avoid allocating Fsh
+        F -= F.max(axis=1, keepdims=True)
+        np.exp(F, out=F)
+        F /= F.sum(axis=1, keepdims=True)
+        return F
 
     # ── save / load ───────────────────────────────────────────────────────────
 
@@ -299,9 +302,15 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
     # ── internal ─────────────────────────────────────────────────────────────
 
     def _resolve_cat_idx(self, D: int) -> list[int]:
-        """Sorted column indices declared categorical via ``cat_features``."""
+        """Sorted column indices declared categorical via ``cat_features``.
+
+        Result is cached in ``_cat_idx_cache_`` after the first call to avoid
+        redundant O(D) traversals during fit.
+        """
         if not self.cat_features:
             return []
+        if hasattr(self, "_cat_idx_cache_"):
+            return self._cat_idx_cache_
         cat_idx = set()
         for cf in self.cat_features:
             if isinstance(cf, (int, np.integer)):
@@ -310,14 +319,18 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
                 names = getattr(self, "feature_names_in_", None)
                 if names is not None and cf in names:
                     cat_idx.add(names.index(cf))
-        return sorted(cat_idx)
+        result = sorted(cat_idx)
+        self._cat_idx_cache_ = result
+        return result
 
     def _resolve_D_num(self, D: int) -> int:
         """Number of numerical (non-categorical) columns."""
         return D - len(self._resolve_cat_idx(D))
 
     def _fit_core(self, X, y, X_val, y_val, D_num, sample_weight=None):
-        from ._oqboost import OQBoostContext
+        # Reset cat_idx cache so a new fit starts fresh
+        if hasattr(self, "_cat_idx_cache_"):
+            del self._cat_idx_cache_
 
         N, D = X.shape
         K    = int(y.max()) + 1
@@ -405,11 +418,12 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
 
         self.trees_: list = []
 
-        from ._oqboost import update_gradients, OQBoostContext
         ctx = OQBoostContext(X, D_num=D_num, max_bin=self.max_bin)
         G_w = np.empty((N, K), dtype=np.float32)
         H_w = np.empty((N, K), dtype=np.float32)
         full_idx = np.arange(N, dtype=np.int32)
+        # Precompute GOSS scale factor (constant throughout training)
+        goss_scale = (1.0 - self.goss_top_rate) / self.goss_other_rate
         try:
             for m in range(self.n_estimators):
                 update_gradients(Fsc, oh, G_w, H_w)
@@ -428,9 +442,8 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
                         remaining_idx = partitioned_idx[:k]
                         random_idx = rng.choice(remaining_idx, size=other_n, replace=False)
                         tree_sub = np.concatenate([top_idx, random_idx]).astype(np.int32)
-                        scale_factor = (1.0 - self.goss_top_rate) / self.goss_other_rate
-                        G_w[random_idx] *= scale_factor
-                        H_w[random_idx] *= scale_factor
+                        G_w[random_idx] *= goss_scale
+                        H_w[random_idx] *= goss_scale
                     else:
                         tree_sub = full_idx
                 elif self.subsample < 1.0:
@@ -462,7 +475,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
                 val_str = ""
                 if X_val is not None:
                     pred_val = t.predict(X_val)
-                    F_val    = F_val + self.learning_rate * pred_val
+                    F_val   += self.learning_rate * pred_val  # in-place: no new array
                     Fv_sh    = F_val - F_val.max(axis=1, keepdims=True)
                     P_val    = np.exp(Fv_sh); P_val /= P_val.sum(axis=1, keepdims=True)
                     val_loss = float(

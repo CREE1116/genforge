@@ -229,8 +229,15 @@ class OQBoostRegressor(BaseEstimator, RegressorMixin):
         return len(self.trees_)
 
     def _resolve_cat_idx(self, D: int) -> list[int]:
+        """Sorted column indices declared categorical via ``cat_features``.
+
+        Result is cached in ``_cat_idx_cache_`` after the first call to avoid
+        redundant O(D) traversals during fit.
+        """
         if not self.cat_features:
             return []
+        if hasattr(self, "_cat_idx_cache_"):
+            return self._cat_idx_cache_
         cat_idx = set()
         for cf in self.cat_features:
             if isinstance(cf, (int, np.integer)):
@@ -239,7 +246,9 @@ class OQBoostRegressor(BaseEstimator, RegressorMixin):
                 names = getattr(self, "feature_names_in_", None)
                 if names is not None and cf in names:
                     cat_idx.add(names.index(cf))
-        return sorted(cat_idx)
+        result = sorted(cat_idx)
+        self._cat_idx_cache_ = result
+        return result
 
     def _resolve_D_num(self, D: int) -> int:
         return D - len(self._resolve_cat_idx(D))
@@ -247,6 +256,10 @@ class OQBoostRegressor(BaseEstimator, RegressorMixin):
     def _fit_core(self, X, y, X_val, y_val, D_num, sample_weight=None):
         N, D = X.shape
         seed = self.random_state if self.random_state is not None else 42
+
+        # Reset cat_idx cache so a new fit starts fresh
+        if hasattr(self, "_cat_idx_cache_"):
+            del self._cat_idx_cache_
 
         cat_idx = self._resolve_cat_idx(D)
         if cat_idx and cat_idx != list(range(D_num, D)):
@@ -295,20 +308,25 @@ class OQBoostRegressor(BaseEstimator, RegressorMixin):
         G_w = np.empty((N, 1), dtype=np.float32)
         H_w = np.empty((N, 1), dtype=np.float32)
         full_idx = np.arange(N, dtype=np.int32)
+        # Precompute GOSS scale factor (constant throughout training)
+        goss_scale = (1.0 - self.goss_top_rate) / self.goss_other_rate
         try:
             for m in range(self.n_estimators):
-                # Compute Gradients & Hessians on Python side
-                diff = Fsc - y[:, np.newaxis]
+                # Compute Gradients & Hessians directly into pre-allocated G_w
+                # to avoid creating a temporary `diff` array each round.
                 if self.loss in ("squared_error", "l2"):
-                    G_w[:, 0] = diff[:, 0]
+                    np.subtract(Fsc[:, 0], y, out=G_w[:, 0])
                     H_w[:, 0] = 1.0
                 elif self.loss in ("absolute_error", "l1"):
-                    G_w[:, 0] = np.sign(diff[:, 0])
+                    np.subtract(Fsc[:, 0], y, out=G_w[:, 0])
+                    np.sign(G_w[:, 0], out=G_w[:, 0])
                     H_w[:, 0] = 1.0
                 elif self.loss == "huber":
-                    abs_diff = np.abs(diff[:, 0])
+                    np.subtract(Fsc[:, 0], y, out=G_w[:, 0])
                     delta = self.huber_delta
-                    G_w[:, 0] = np.where(abs_diff <= delta, diff[:, 0], delta * np.sign(diff[:, 0]))
+                    # |diff| <= delta: G = diff; |diff| > delta: G = delta*sign(diff)
+                    # np.clip achieves exactly this and supports in-place out=
+                    np.clip(G_w[:, 0], -delta, delta, out=G_w[:, 0])
                     H_w[:, 0] = 1.0
 
                 if sample_weight is not None:
@@ -327,9 +345,8 @@ class OQBoostRegressor(BaseEstimator, RegressorMixin):
                         remaining_idx = partitioned_idx[:k]
                         random_idx = rng.choice(remaining_idx, size=other_n, replace=False)
                         tree_sub = np.concatenate([top_idx, random_idx]).astype(np.int32)
-                        scale_factor = (1.0 - self.goss_top_rate) / self.goss_other_rate
-                        G_w[random_idx] *= scale_factor
-                        H_w[random_idx] *= scale_factor
+                        G_w[random_idx] *= goss_scale
+                        H_w[random_idx] *= goss_scale
                     else:
                         tree_sub = full_idx
                 elif self.subsample < 1.0:
@@ -361,8 +378,8 @@ class OQBoostRegressor(BaseEstimator, RegressorMixin):
                 val_str = ""
                 if X_val is not None:
                     pred_val = t.predict(X_val)
-                    F_val    = F_val + self.learning_rate * pred_val
-                    
+                    F_val   += self.learning_rate * pred_val  # in-place: no new array
+
                     diff_val = F_val - y_val[:, np.newaxis]
                     if self.loss in ("squared_error", "l2"):
                         val_loss = float(np.mean(diff_val[:, 0] ** 2))

@@ -239,6 +239,7 @@ def tune_oqboost(X_train, y_train, X_val, y_val, cat_idx, n_classes, n_trials):
             "mutation_rate": trial.suggest_float("mutation_rate", 0.01, 0.5),
             "mutation_strength": trial.suggest_float("mutation_strength", 0.05, 1.0),
             "pobs": False,
+            "goss": False,
             "early_stopping_rounds": 50,
             "cat_features": cat_idx,
             "verbose": False,
