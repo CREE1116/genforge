@@ -116,6 +116,10 @@ pipe.predict(X_test)
 
 **Speed vs accuracy:** Reduce `n_estimators` + increase `learning_rate` for faster training. Use early stopping to find the optimal round count.
 
-**Imbalanced data:** `class_weight="balanced"` (default) reweights gradients by inverse class frequency. Evaluate with `balanced_accuracy_score` rather than raw accuracy.
+**Imbalanced data:** `class_weight="balanced"` reweights gradients by inverse class frequency. Evaluate with `balanced_accuracy_score` rather than raw accuracy.
 
 **Rotation-robust:** OQBoost's oblique splits naturally adapt to rotated feature spaces. If your data has features that are informative as linear combinations, OQBoost often outperforms axis-aligned models without feature engineering.
+
+---
+
+[한국어 버전 (Korean Version)](quickstart.ko.md)

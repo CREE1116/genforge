@@ -141,3 +141,7 @@ This reduces the tournament size to exactly $D+1$ candidates at each node.
 ### Theoretical Advantage:
 By avoiding local optimization on noisy deep-node Hessians (which WLS/CD attempts by solving $A^{-1}G$), the covariance vector acts as a robust L2-regularizer (Hessian-free). In head-to-head empirical testing, this simple $D+1$ setup consistently outperformed both the C++ production tournament and Coordinate Descent on real tabular datasets (e.g., Adult, Credit Default) while being structurally simpler. Porting this covariance generation logic into the C++ core engine is planned for future releases.
 
+---
+
+[한국어 버전 (Korean Version)](algorithm.ko.md)
+

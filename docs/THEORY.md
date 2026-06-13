@@ -395,3 +395,7 @@ Based on the theoretical WLS simplification (ignoring Hessian correlation, $H \a
 2. Deployment-protocol validation: tuned params + early stopping + the real benchmark datasets.
 3. lr sensitivity of the oblivious variant (its weaker-per-leaf structure should tolerate larger lr — check the lr × rounds surface).
 4. Candidate-budget parity check (oblivious currently sees 16 random + axis per level vs standard's per-node budget).
+
+---
+
+[한국어 버전 (Korean Version)](THEORY.ko.md)

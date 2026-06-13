@@ -12,8 +12,8 @@ Gradient-boosted oblique decision tree classifier. Implements the scikit-learn `
 
 ```python
 OQBoostClassifier(
-    n_estimators=500,
-    learning_rate=0.05,
+    n_estimators=1000,
+    learning_rate=0.03,
     max_depth=6,
     reg_lambda=1.0,
     subsample=0.8,
@@ -21,10 +21,12 @@ OQBoostClassifier(
     random_state=None,
     verbose=False,
     cat_features=None,
-    class_weight="balanced",
+    class_weight=None,
+    prior_alpha=0.5,
     inherited_rp_ratio=1.0,
     mutation_rate=0.1,
     mutation_strength=0.5,
+    pobs=False,
 )
 ```
 
@@ -32,8 +34,8 @@ OQBoostClassifier(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `n_estimators` | int | 500 | Number of boosting rounds |
-| `learning_rate` | float | 0.05 | Shrinkage per tree |
+| `n_estimators` | int | 1000 | Number of boosting rounds |
+| `learning_rate` | float | 0.03 | Shrinkage per tree |
 | `max_depth` | int | 6 | Max tree depth; leaf budget = 2^max_depth (64 leaves) |
 | `reg_lambda` | float | 1.0 | L2 leaf regularization |
 | `subsample` | float | 0.8 | Row fraction per tree (0 < subsample ≤ 1) |
@@ -41,10 +43,12 @@ OQBoostClassifier(
 | `random_state` | int or None | None | Random seed |
 | `verbose` | bool | False | Print per-round metrics |
 | `cat_features` | list or None | None | Categorical column names (DataFrame) or indices |
-| `class_weight` | str or None | "balanced" | "balanced" reweights by inverse class frequency |
+| `class_weight` | str or None | None | "balanced" reweights by inverse class frequency |
+| `prior_alpha` | float | 0.5 | Strength of balanced reweighting prior correction (0 to 1) |
 | `inherited_rp_ratio` | float | 1.0 | Cache-direction candidate fraction |
 | `mutation_rate` | float | 0.1 | Noise scale for inherited directions |
 | `mutation_strength` | float | 0.5 | Weight of borrowed feature in hybrid directions |
+| `pobs` | bool | False | Inject Haar-orthogonal POBS candidates into every node's tournament |
 
 ---
 
@@ -187,3 +191,7 @@ clf = load_model("model.joblib")
 ```
 
 Shorthand for `OQBoostClassifier.load(path)`.
+
+---
+
+[한국어 버전 (Korean Version)](api.ko.md)

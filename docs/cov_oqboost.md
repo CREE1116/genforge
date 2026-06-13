@@ -92,3 +92,7 @@ $$w^* = \frac{-X^T g}{\|-X^T g\|_2}$$
 
 - 루프 내에서 게인 최댓값 계산 시 Python 스칼라 변환 및 복사(`.item()`, `float()`)를 원천 차단합니다.
 - 모든 임계값 스캔 및 게인 토너먼트는 GPU 장치 내부 메모리(`cuda` / `mps` 텐서 레이아웃) 상에서 **Pure Tensor-level Argmax** 연산으로 종결한 뒤, 최종 분기 결정 순간에만 CPU 인터럽트를 발생시켜 동기화 레이턴시를 최소화합니다.
+
+---
+
+[English Version (영문 버전)](cov_oqboost.en.md)

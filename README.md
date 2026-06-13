@@ -271,3 +271,7 @@ oqboost/
 ## License
 
 [MIT](LICENSE) — Copyright (c) 2025 cree1116
+
+---
+
+[한국어 버전 (Korean Version)](README.ko.md)

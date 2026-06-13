@@ -69,3 +69,7 @@ $$f^* = (1 - \epsilon) f_{\text{free}}$$
 ## 4. 논문용 영문 요약 (Paper Draft Ready)
 
 > **The gain-preserving property does not require exact gradient exhaustion.** Let $v_G=v_\parallel+v_\perp$ be the orthogonal decomposition of the node gradient vector with respect to the lineage subspace $S=\text{span}(W)$. Under the lineage-orthogonal constraint ($w \in S^\perp$), the achievable maximum gain is reduced from $\|v_G\|_2^2$ to $\|v_\perp\|_2^2$. Therefore, the exact gain preservation ($f^* \approx f_{\text{free}}$) is seamlessly achieved whenever the residual gradient has little linear energy inside the pre-explored lineage subspace ($\|v_\parallel\|_2^2 \ll \|v_G\|_2^2$), which perfectly aligns with the late-stage boosting dynamics where residuals become inherently oblique.
+
+---
+
+[English Version (영문 버전)](research.en.md)
