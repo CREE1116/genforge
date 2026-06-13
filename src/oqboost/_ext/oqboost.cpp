@@ -75,6 +75,10 @@ struct OQBoostCtx {
   std::vector<std::vector<float>> dir_cache;  // dense D each
   int dir_cache_next = 0;
 
+  // Workspaces for oblique search (pre-allocated to avoid frequent malloc)
+  std::vector<float> Xe_workspace; // Size: ne * D
+  std::vector<float> Pj_workspace; // Size: n_dirs * ne
+
   void cache_direction(const std::vector<float>& w) {
     for (int d = D_num; d < D; d++)
       if (w[d] != 0.0f) return;  // touches a cat dim — meaning is per-round
@@ -357,13 +361,22 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   auto accumulate_hist = [&](const int* rows, int nr, float* GF_RESTRICT hb,
                              float* node_P_out) {
     double P_acc = 0.0;
+    int nthreads = 1;
 #ifdef _OPENMP
     if (nr >= 2048) {
-      int nthreads = omp_get_max_threads();
+      nthreads = omp_get_max_threads();
+    } else if (nr >= 512) {
+      nthreads = std::min(4, omp_get_max_threads());
+    } else if (nr >= 128) {
+      nthreads = std::min(2, omp_get_max_threads());
+    }
+#endif
+
+    if (nthreads > 1) {
       if (D >= nthreads && D >= 2) {
-        // Block-wise Feature-parallelism
+        // Block-wise Feature-parallelism (highly efficient for larger D, zero merge overhead)
         int block_size = std::max(1, D / nthreads);
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) num_threads(nthreads)
         for (int fg = 0; fg < D; fg += block_size) {
           int f_end = std::min(fg + block_size, D);
           for (int f = fg; f < f_end; f++) {
@@ -386,87 +399,103 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           }
         }
       } else {
-        // Sample-parallelism with thread-local histograms (efficient for small D)
-        std::vector<float> local_hists((size_t)nthreads * HSZ, 0.0f);
-        std::vector<double> tP(nthreads, 0.0);
+        // Blocked Sample-parallelism (efficient for smaller D, single parallel region)
+        std::memset(hb, 0, HSZ * sizeof(float));
+
+        int B = 16;
+        if (K > 5) B = 8;
+        if (K > 16) B = 4;
+        if (K > 32) B = 2;
+        if (K > 64) B = 1;
+
+        int B_max = B;
+        int HSZ_block_max = B_max * AX_BINS * STRIDE;
+        std::vector<float> local_hists_workspace((size_t)nthreads * HSZ_block_max);
+
 #pragma omp parallel num_threads(nthreads)
         {
           int tid = omp_get_thread_num();
-          float* GF_RESTRICT lb = local_hists.data() + (size_t)tid * HSZ;
-          double lp = 0.0;
+
+          for (int fb = 0; fb < D; fb += B) {
+            int f_end = std::min(fb + B, D);
+            int actual_B = f_end - fb;
+            int HSZ_block = actual_B * AX_BINS * STRIDE;
+
+            float* GF_RESTRICT lb = local_hists_workspace.data() + (size_t)tid * HSZ_block;
+            std::memset(lb, 0, HSZ_block * sizeof(float));
+
+#pragma omp barrier
+
 #pragma omp for schedule(static) nowait
-          for (int si = 0; si < nr; si++) {
-            int j = rows[si];
-            const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
-            const float* GF_RESTRICT gj = G + (size_t)j * K;
-            const float* GF_RESTRICT hj = H + (size_t)j * K;
-            for (int f = 0; f < D; f++) {
-              float* GF_RESTRICT slot = lb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
-              for (int c = 0; c < K; c++) {
-                slot[c] += gj[c];
-                slot[K + c] += hj[c];
-              }
-              slot[2 * K] += 1.0f;
-            }
-            if (node_P_out) {
-              for (int c = 0; c < K; c++) {
-                lp += 0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
+            for (int si = 0; si < nr; si++) {
+              int j = rows[si];
+              const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
+              const float* GF_RESTRICT gj = G + (size_t)j * K;
+              const float* GF_RESTRICT hj = H + (size_t)j * K;
+              for (int f = fb; f < f_end; f++) {
+                int b = cj[f];
+                float* GF_RESTRICT slot = lb + ((size_t)(f - fb) * AX_BINS + b) * STRIDE;
+                for (int c = 0; c < K; c++) {
+                  slot[c] += gj[c];
+                  slot[K + c] += hj[c];
+                }
+                slot[2 * K] += 1.0f;
               }
             }
+
+#pragma omp barrier
+
+#pragma omp for schedule(static)
+            for (int i = 0; i < HSZ_block; i++) {
+              float s = 0.0f;
+              for (int t = 0; t < nthreads; t++) {
+                s += local_hists_workspace[(size_t)t * HSZ_block + i];
+              }
+              hb[(size_t)fb * AX_BINS * STRIDE + i] = s;
+            }
+
+#pragma omp barrier
           }
-          tP[tid] = lp;
         }
-#pragma omp parallel for schedule(static)
-        for (int64_t i = 0; i < (int64_t)HSZ; i++) {
-          float s = 0.0f;
-          for (int t = 0; t < nthreads; t++) {
-            s += local_hists[(size_t)t * HSZ + i];
-          }
-          hb[i] = s;
-        }
-        if (node_P_out) {
-          for (int t = 0; t < nthreads; t++) P_acc += tP[t];
-          *node_P_out = (float)P_acc;
-        }
-        return;
       }
+
       if (node_P_out) {
-#pragma omp parallel for reduction(+:P_acc) schedule(static)
+        double P_sum = 0.0;
+#pragma omp parallel for reduction(+:P_sum) schedule(static) num_threads(nthreads)
         for (int si = 0; si < nr; si++) {
           int j = rows[si];
           const float* GF_RESTRICT gj = G + (size_t)j * K;
           const float* GF_RESTRICT hj = H + (size_t)j * K;
           for (int c = 0; c < K; c++) {
+            P_sum += 0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
+          }
+        }
+        *node_P_out = (float)P_sum;
+      }
+    } else {
+      // Fallback to single-threaded accumulation
+      std::memset(hb, 0, HSZ * sizeof(float));
+      for (int si = 0; si < nr; si++) {
+        int j = rows[si];
+        const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
+        const float* GF_RESTRICT gj = G + (size_t)j * K;
+        const float* GF_RESTRICT hj = H + (size_t)j * K;
+        for (int f = 0; f < D; f++) {
+          float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
+          for (int c = 0; c < K; c++) {
+            slot[c] += gj[c];
+            slot[K + c] += hj[c];
+          }
+          slot[2 * K] += 1.0f;
+        }
+        if (node_P_out) {
+          for (int c = 0; c < K; c++) {
             P_acc += 0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
           }
         }
-        *node_P_out = (float)P_acc;
       }
-      return;
+      if (node_P_out) *node_P_out = (float)P_acc;
     }
-#endif
-    // Fallback to single-threaded accumulation
-    std::memset(hb, 0, HSZ * sizeof(float));
-    for (int si = 0; si < nr; si++) {
-      int j = rows[si];
-      const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
-      const float* GF_RESTRICT gj = G + (size_t)j * K;
-      const float* GF_RESTRICT hj = H + (size_t)j * K;
-      for (int f = 0; f < D; f++) {
-        float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
-        for (int c = 0; c < K; c++) {
-          slot[c] += gj[c];
-          slot[K + c] += hj[c];
-        }
-        slot[2 * K] += 1.0f;
-      }
-      if (node_P_out) {
-        for (int c = 0; c < K; c++) {
-          P_acc += 0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
-        }
-      }
-    }
-    if (node_P_out) *node_P_out = (float)P_acc;
   };
 
   std::vector<std::vector<int>> node_samp(max_nodes);
@@ -646,15 +675,16 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     // Gather the evaluation panel contiguously once: every later pass (SIS
     // accumulation, all candidate projections) then walks Xe sequentially
     // instead of striding through Xt rows scattered across the full matrix.
-    std::vector<float> Xe((size_t)ne * D);
+    ctx->Xe_workspace.resize((size_t)ne * D);
+    float* Xe_ptr = ctx->Xe_workspace.data();
     for (int i = 0; i < ne; i++) {
-      std::memcpy(Xe.data() + (size_t)i * D, Xt + (size_t)samp_e[i] * D,
+      std::memcpy(Xe_ptr + (size_t)i * D, Xt + (size_t)samp_e[i] * D,
                   (size_t)D * sizeof(float));
     }
 
     std::vector<float> cg_s(D, 0.0f), add_s(D, 0.0f);
     for (int i = 0; i < ne; i++) {
-      const float* GF_RESTRICT xi = Xe.data() + (size_t)i * D;
+      const float* GF_RESTRICT xi = Xe_ptr + (size_t)i * D;
       int idx = samp_e[i];
       float gi = G[(size_t)idx * K + kdom];
       float hi = H[(size_t)idx * K + kdom];
@@ -939,7 +969,8 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     // Batched candidate projections over the contiguous panel:
     // Pj[di·ne + si] = dirs[di]·Xe[si]. One GEMM on the AMX/BLAS path
     // replaces n_dirs scattered sparse-dot sweeps.
-    std::vector<float> Pj((size_t)n_dirs * ne);
+    ctx->Pj_workspace.resize((size_t)n_dirs * ne);
+    float* Pj_ptr = ctx->Pj_workspace.data();
 #if GF_HAVE_BLAS
     {
       std::vector<float> Wd((size_t)n_dirs * D);
@@ -947,7 +978,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         std::memcpy(Wd.data() + (size_t)di * D, dirs[di].data(),
                     (size_t)D * sizeof(float));
       cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n_dirs, ne, D,
-                  1.0f, Wd.data(), D, Xe.data(), D, 0.0f, Pj.data(), ne);
+                  1.0f, Wd.data(), D, Xe_ptr, D, 0.0f, Pj_ptr, ne);
     }
 #else
 #ifdef _OPENMP
@@ -956,9 +987,9 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     for (int di = 0; di < n_dirs; di++) {
       SparseVec sv;
       collect_nonzero_stack(dirs[di].data(), D, sv);
-      float* GF_RESTRICT prow = Pj.data() + (size_t)di * ne;
+      float* GF_RESTRICT prow = Pj_ptr + (size_t)di * ne;
       for (int si = 0; si < ne; si++)
-        prow[si] = sparse_dot_stack(sv, Xe.data() + (size_t)si * D);
+        prow[si] = sparse_dot_stack(sv, Xe_ptr + (size_t)si * D);
     }
 #endif
 
@@ -970,7 +1001,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       collect_nonzero_stack(dirs[di].data(), D, sv);
       if (sv.size <= 1) continue;
 
-      const float* GF_RESTRICT proj_e = Pj.data() + (size_t)di * ne;
+      const float* GF_RESTRICT proj_e = Pj_ptr + (size_t)di * ne;
       float min_v = 1e30f, max_v = -1e30f;
       for (int si = 0; si < ne; si++) {
         float proj = proj_e[si];
@@ -1074,7 +1105,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     if (exact_eval) {
       // samp_e == samp here, so the batched panel projections are exactly
       // the per-sample projections routing needs.
-      std::memcpy(proj_full.data(), Pj.data() + (size_t)ob_idx * ne,
+      std::memcpy(proj_full.data(), Pj_ptr + (size_t)ob_idx * ne,
                   (size_t)ne * sizeof(float));
       exact_gain = ob_gain;
     } else {
