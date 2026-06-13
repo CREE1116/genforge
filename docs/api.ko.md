@@ -36,7 +36,7 @@ OQBoostClassifier(
 |-----------|------|---------|-------------|
 | `n_estimators` | int | 1000 | 부스팅 라운드(트리 개수) 수 |
 | `learning_rate` | float | 0.03 | 각 트리의 단일 예측값에 적용할 학습률 (축소 계수) |
-| `max_depth` | int | 6 | 트리 최대 깊이. 리프 노드 한도는 $2^{\text{max\_depth}}$ (64개 리프 노드) |
+| `max_depth` | int | 6 | 트리 최대 깊이. 리프 노드 한도는 $2^{\text{max_depth}}$ (64개 리프 노드) |
 | `reg_lambda` | float | 1.0 | 리프 가중치에 대한 L2 규제 (Newton step 분모 항 추가) |
 | `subsample` | float | 0.8 | 각 트리를 구성할 때 무작위 샘플링할 행 비율 ($0 < \text{subsample} \le 1$) |
 | `early_stopping_rounds` | int or None | 50 | 검증 데이터 손실이 정체되면 조기 종료함. `eval_set` 필요 |

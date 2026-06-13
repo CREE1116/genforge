@@ -25,7 +25,7 @@ $K$-클래스 분류 문제의 경우, 앙상블은 K개의 출력 헤드를 갖
 
 $$w^T x = \sum_{j \in \mathcal{S}} w_j x_j < \theta$$
 
-여기서 $w$는 희소 가중치 벡터(활성 피처 서브공간의 크기를 $|\mathcal{S}| \le D_{\text{SUB\_MAX}} = 16$으로 엄격히 제한)이며, $\theta$는 분기 임계값입니다. 이를 통해 모델은 개별 노드 레벨에서 다차원 피처 간의 선형 상관 관계를 직접 캡처할 수 있습니다.
+여기서 $w$는 희소 가중치 벡터(활성 피처 서브공간의 크기를 $|\mathcal{S}| \le D_{\text{SUB_MAX}} = 16$으로 엄격히 제한)이며, $\theta$는 분기 임계값입니다. 이를 통해 모델은 개별 노드 레벨에서 다차원 피처 간의 선형 상관 관계를 직접 캡처할 수 있습니다.
 
 ---
 
@@ -39,7 +39,7 @@ OQBoost는 각 노드 분기 시점에서 값비싼 좌표 하강법(Coordinate 
 $$s_f = \frac{\left| \sum_{i \in \mathcal{I}_t} x_{if} g_i \right|}{\sqrt{\sum_{i \in \mathcal{I}_t} h_i x_{if}^2 + \lambda}}$$
 
 1.  **서브공간 선택**: 스크리닝 스코어 $s_f$에 비례하는 확률로 무작위 희소 서브공간 $\mathcal{S}$를 샘플링합니다.
-2.  **활성 피처 개수 한도**: C++ `SparseVec` 메모리 한계를 초과하지 않도록 0이 아닌 값을 가지는 피처 수를 $D_{\text{SUB\_MAX}} = 16$으로 고정 캡핑합니다.
+2.  **활성 피처 개수 한도**: C++ `SparseVec` 메모리 한계를 초과하지 않도록 0이 아닌 값을 가지는 피처 수를 $D_{\text{SUB_MAX}} = 16$으로 고정 캡핑합니다.
 3.  **부호 정렬**: 선택된 각 피처 $f \in \mathcal{S}$에 대해, 가중치 부호가 오차가 줄어드는 가파른 경사하강 방향과 일치하도록 결정합니다.
     $$w_f = -\operatorname{sign}\left( \sum_{i \in \mathcal{I}_t} x_{if} g_i \right) \cdot |r_f|, \quad r_f \sim \mathcal{N}(0, 1)$$
 4.  **정규화**: 가중치 벡터의 L2 노름을 1로 정규화합니다: $w \leftarrow \frac{w}{\|w\|_2}$.
@@ -156,7 +156,7 @@ OQBoost는 CPU 스레드 수($T$)와 현재 피처 수($D$)의 관계에 따라 
 노드 분기 마다 임의의 방향 벡터를 무수히 난립시켜 토너먼트를 여는 방식 대신, 다음 두 갈래로만 축을 좁혀 검토합니다.
 1. 기존 $D$개의 단일 피처 축 정렬 벡터 (회전되지 않은 원본 공간의 척도 보호용).
 2. 현 노드의 오차 기여도가 높은 피처들에 한정해 계산한 딱 **1개**의 그라디언트 공분산 벡터 $w_{\text{cov}}$:
-   $$w_{\text{cov\_sub}} = \frac{G_{\text{sub}}}{\|G_{\text{sub}}\|_2 + \epsilon}, \quad \text{where } G_{\text{sub}} = -X_{\text{sub}}^T g$$
+   $$w_{\text{cov_sub}} = \frac{G_{\text{sub}}}{\|G_{\text{sub}}\|_2 + \epsilon}, \quad \text{where } G_{\text{sub}} = -X_{\text{sub}}^T g$$
 
 이를 통해 탐색 후보 풀의 크기를 매 노드마다 $D+1$개로 제한할 수 있습니다.
 

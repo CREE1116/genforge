@@ -25,7 +25,7 @@ Unlike axis-aligned trees that split on a single feature $x_j < \theta$, OQBoost
 
 $$w^T x = \sum_{j \in \mathcal{S}} w_j x_j < \theta$$
 
-where $w$ is a sparse weight vector (restricting the active feature subspace size $|\mathcal{S}| \le D_{\text{SUB\_MAX}} = 16$), and $\theta$ is the split threshold. This allows the model to capture oblique relationships directly at the node level.
+where $w$ is a sparse weight vector (restricting the active feature subspace size $|\mathcal{S}| \le D_{\text{SUB_MAX}} = 16$), and $\theta$ is the split threshold. This allows the model to capture oblique relationships directly at the node level.
 
 ---
 
@@ -39,7 +39,7 @@ Instead of searching all dimensions, OQBoost identifies candidate features using
 $$s_f = \frac{\left| \sum_{i \in \mathcal{I}_t} x_{if} g_i \right|}{\sqrt{\sum_{i \in \mathcal{I}_t} h_i x_{if}^2 + \lambda}}$$
 
 1.  **Subspace Selection**: A sparse random subspace $\mathcal{S}$ is sampled, where feature $f$ is selected with probability proportional to its screening score $s_f$.
-2.  **Active Feature Cap**: To avoid exceeding the C++ `SparseVec` capacity, the number of non-zero features is strictly capped at $D_{\text{SUB\_MAX}} = 16$.
+2.  **Active Feature Cap**: To avoid exceeding the C++ `SparseVec` capacity, the number of non-zero features is strictly capped at $D_{\text{SUB_MAX}} = 16$.
 3.  **Sign Alignment**: For each selected feature $f \in \mathcal{S}$, the projection weight matches the steepest gradient descent sign:
     $$w_f = -\operatorname{sign}\left( \sum_{i \in \mathcal{I}_t} x_{if} g_i \right) \cdot |r_f|, \quad r_f \sim \mathcal{N}(0, 1)$$
 4.  **Normalization**: The weight vector is normalized to unit L2 norm: $w \leftarrow \frac{w}{\|w\|_2}$.
@@ -157,7 +157,7 @@ Recent research (conducted on 2026-06-13 in pure PyTorch prototype `OQBoostCovCl
 Instead of a candidate tournament over a large pool of randomized and inherited directions, the engine evaluates:
 1. All $D$ axis-aligned unit vectors (retaining a backbone to capture unrotated features).
 2. Exactly **one** oblique direction: the gradient covariance vector $w_{\text{cov}}$ computed on the top $d_{\text{sub}}$ features:
-   $$w_{\text{cov\_sub}} = \frac{G_{\text{sub}}}{\|G_{\text{sub}}\|_2 + \epsilon}, \quad \text{where } G_{\text{sub}} = -X_{\text{sub}}^T g$$
+   $$w_{\text{cov_sub}} = \frac{G_{\text{sub}}}{\|G_{\text{sub}}\|_2 + \epsilon}, \quad \text{where } G_{\text{sub}} = -X_{\text{sub}}^T g$$
 
 This reduces the tournament size to exactly $D+1$ candidates at each node.
 
