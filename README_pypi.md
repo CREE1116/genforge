@@ -97,7 +97,7 @@ predictions = reg.predict(X)
 
 ### Subsampling & Speedups
 
-* **`goss`** (`bool`, default=`False`):
+* **`goss`** (`bool`, default=`True`):
   * **Values**: `True` or `False`.
   * **Role**: Activates Gradient-based One-Side Sampling (GOSS). When active, keeps samples with large gradients and randomly samples a fraction of samples with small gradients, speeding up training on large datasets by 2x+ with negligible performance loss.
 * **`goss_top_rate`** (`float`, default=`0.2`):

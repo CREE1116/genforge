@@ -89,7 +89,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         mutation_rate:         float = 0.1,
         mutation_strength:     float = 0.5,
         pobs:                  bool  = False,
-        goss:                  bool  = False,
+        goss:                  bool  = True,
         goss_top_rate:         float = 0.2,
         goss_other_rate:       float = 0.1,
         reg_alpha:             float = 0.0,

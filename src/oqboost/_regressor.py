@@ -51,7 +51,7 @@ class OQBoostRegressor(BaseEstimator, RegressorMixin):
         Base weight for new-axis borrowing (Strategy B).
     pobs : bool, default=False
         Whether to inject pobs candidates into split tournaments.
-    goss : bool, default=False
+    goss : bool, default=True
         Whether to use GOSS row-sampling.
     goss_top_rate : float, default=0.2
         GOSS top gradient retention rate.
@@ -88,7 +88,7 @@ class OQBoostRegressor(BaseEstimator, RegressorMixin):
         mutation_rate:         float = 0.1,
         mutation_strength:     float = 0.5,
         pobs:                  bool  = False,
-        goss:                  bool  = False,
+        goss:                  bool  = True,
         goss_top_rate:         float = 0.2,
         goss_other_rate:       float = 0.1,
         reg_alpha:             float = 0.0,
