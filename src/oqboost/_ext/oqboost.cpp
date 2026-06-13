@@ -496,14 +496,24 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
             int j = rows[si];
             const float* GF_RESTRICT gj = G + (size_t)j * K;
             const float* GF_RESTRICT hj = H + (size_t)j * K;
-            for (int f = fg; f < f_end; f++) {
-              int b = code[(size_t)j * D + f];
-              float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + b) * STRIDE;
-              for (int c = 0; c < K; c++) {
-                slot[c] += gj[c];
-                slot[K + c] += hj[c];
+            const uint8_t* GF_RESTRICT cjf = code + (size_t)j * D;
+            if (K == 2) {  // binary / OVR fast path: STRIDE == 5, unrolled
+              const float g0 = gj[0], g1 = gj[1], h0 = hj[0], h1 = hj[1];
+              for (int f = fg; f < f_end; f++) {
+                float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + cjf[f]) * 5;
+                slot[0] += g0; slot[1] += g1;
+                slot[2] += h0; slot[3] += h1;
+                slot[4] += 1.0f;
               }
-              slot[2 * K] += 1.0f;
+            } else {
+              for (int f = fg; f < f_end; f++) {
+                float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + cjf[f]) * STRIDE;
+                for (int c = 0; c < K; c++) {
+                  slot[c] += gj[c];
+                  slot[K + c] += hj[c];
+                }
+                slot[2 * K] += 1.0f;
+              }
             }
           }
         }
@@ -521,14 +531,23 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
             const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
             const float* GF_RESTRICT gj = G + (size_t)j * K;
             const float* GF_RESTRICT hj = H + (size_t)j * K;
-            for (int f = 0; f < D; f++) {
-              int b = cj[f];
-              float* GF_RESTRICT slot = lb + ((size_t)f * AX_BINS + b) * STRIDE;
-              for (int c = 0; c < K; c++) {
-                slot[c] += gj[c];
-                slot[K + c] += hj[c];
+            if (K == 2) {  // binary / OVR fast path: STRIDE == 5, unrolled
+              const float g0 = gj[0], g1 = gj[1], h0 = hj[0], h1 = hj[1];
+              for (int f = 0; f < D; f++) {
+                float* GF_RESTRICT slot = lb + ((size_t)f * AX_BINS + cj[f]) * 5;
+                slot[0] += g0; slot[1] += g1;
+                slot[2] += h0; slot[3] += h1;
+                slot[4] += 1.0f;
               }
-              slot[2 * K] += 1.0f;
+            } else {
+              for (int f = 0; f < D; f++) {
+                float* GF_RESTRICT slot = lb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
+                for (int c = 0; c < K; c++) {
+                  slot[c] += gj[c];
+                  slot[K + c] += hj[c];
+                }
+                slot[2 * K] += 1.0f;
+              }
             }
           }
 
@@ -564,13 +583,23 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
         const float* GF_RESTRICT gj = G + (size_t)j * K;
         const float* GF_RESTRICT hj = H + (size_t)j * K;
-        for (int f = 0; f < D; f++) {
-          float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
-          for (int c = 0; c < K; c++) {
-            slot[c] += gj[c];
-            slot[K + c] += hj[c];
+        if (K == 2) {  // binary / OVR fast path: STRIDE == 5, unrolled
+          const float g0 = gj[0], g1 = gj[1], h0 = hj[0], h1 = hj[1];
+          for (int f = 0; f < D; f++) {
+            float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + cj[f]) * 5;
+            slot[0] += g0; slot[1] += g1;
+            slot[2] += h0; slot[3] += h1;
+            slot[4] += 1.0f;
           }
-          slot[2 * K] += 1.0f;
+        } else {
+          for (int f = 0; f < D; f++) {
+            float* GF_RESTRICT slot = hb + ((size_t)f * AX_BINS + cj[f]) * STRIDE;
+            for (int c = 0; c < K; c++) {
+              slot[c] += gj[c];
+              slot[K + c] += hj[c];
+            }
+            slot[2 * K] += 1.0f;
+          }
         }
         if (node_P_out) {
           for (int c = 0; c < K; c++) {
@@ -1034,7 +1063,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           std::fill(slot, slot + D, 0.0f);
           for (int d2 = 0; d2 < mm; d2++) slot[S[d2]] = B_flat[i*mm+d2] * inv;
           dirs_n++;
-          fam.push_back('p');
+          if (gain_log) fam.push_back('p');
           emitted++;
         }
         if (emitted == 0) break;
@@ -1066,6 +1095,15 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           mutation_rate / std::sqrt(1.0f + (float)depth_t);
       float local_mutation_strength =
           mutation_strength / (1.0f + (float)depth_t);
+
+      // Strategy-B candidate set (parent-excluded features) and its sampling
+      // distribution depend only on parent_nz and prob[], both fixed for this
+      // node. Build lazily once and reuse across draws — was rebuilt every
+      // draw: an O(D·|parent|) scan plus a discrete_distribution heap alloc.
+      // Construction consumes no rng, so the draw sequence is unchanged.
+      bool b_ready = false;
+      auto& candidate_feats = ctx->scratch_cand_feats;
+      std::discrete_distribution<int> new_feat_dist;
 
       for (int r = 0; r < n_inherited; r++) {
         float strategy_draw = dist(rng);
@@ -1128,27 +1166,29 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
               w_rand[parent_nz.indices[idx2]] *= (1.0f + s2);
             }
           } else if (do_strategy_b) {
-            auto& candidate_feats = ctx->scratch_cand_feats;
-            auto& candidate_probs = ctx->scratch_cand_probs;
-            candidate_feats.clear();
-            candidate_probs.clear();
-            for (int d = 0; d < D; d++) {
-              bool in_parent = false;
-              for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
-                if (parent_nz.indices[i_nz] == d) {
-                  in_parent = true;
-                  break;
+            if (!b_ready) {
+              auto& candidate_probs = ctx->scratch_cand_probs;
+              candidate_feats.clear();
+              candidate_probs.clear();
+              for (int d = 0; d < D; d++) {
+                bool in_parent = false;
+                for (int i_nz = 0; i_nz < parent_nz.size; i_nz++) {
+                  if (parent_nz.indices[i_nz] == d) {
+                    in_parent = true;
+                    break;
+                  }
+                }
+                if (!in_parent) {
+                  candidate_feats.push_back(d);
+                  candidate_probs.push_back(prob[d]);
                 }
               }
-              if (!in_parent) {
-                candidate_feats.push_back(d);
-                candidate_probs.push_back(prob[d]);
-              }
+              new_feat_dist = std::discrete_distribution<int>(
+                  candidate_probs.begin(), candidate_probs.end());
+              b_ready = true;
             }
 
             if (!candidate_feats.empty()) {
-              std::discrete_distribution<int> new_feat_dist(
-                  candidate_probs.begin(), candidate_probs.end());
               int idx_feat = new_feat_dist(rng);
               int f_new = candidate_feats[idx_feat];
               float sign = (cg_s[f_new] >= 0.0f) ? -1.0f : 1.0f;
@@ -1175,7 +1215,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           }
           dirs_n++;
         }
-        fam.push_back(do_strategy_c ? 'c' : (do_strategy_a ? 'a' : 'b'));
+        if (gain_log) fam.push_back(do_strategy_c ? 'c' : (do_strategy_a ? 'a' : 'b'));
       }
 
       // Diversity slot of the inherited branch (nonzero when
@@ -1199,7 +1239,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                     (size_t)D * sizeof(float));
         dirs_n++;
       }
-      fam.push_back('k');
+      if (gain_log) fam.push_back('k');
     }
 
     float ob_gain = 0.0f, ob_thr = 0.0f;
