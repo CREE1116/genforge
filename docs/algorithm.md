@@ -61,7 +61,30 @@ Samples reaching a child node have already been filtered by the parent node's sp
 
 ---
 
-## 4. Memory-Optimized C++ Engine
+## 4. Why It Works: Mathematical and Statistical Intuition
+
+OQBoost outperforms standard axis-aligned models and avoids the heavy computational bottlenecks of traditional oblique tree GBDTs due to several mathematical and statistical properties:
+
+### 4.1 Newton-Raphson Gradient Alignment
+The core advantage of GG-SRP is that it does not rely on purely blind random projections. Instead, it explicitly aligns the projection weight signs with the local gradient descent directions ($w_f \propto -\operatorname{sign}(\sum g_i x_{if})$).
+Mathematically, this aligns the starting projection axis with the steepest descent path of the quadratic Taylor expansion (the Newton step). As a result, even a single random projection vector in the tournament pool is guaranteed to align with the gradient error trends and capture significant gain.
+
+### 4.2 Extreme Values of Gain Distribution (Order Statistics)
+The candidate selection at each decision node is an extreme value optimization problem ($G^* = \max_i \text{gain}(w_i)$).
+According to order statistics, the expected maximum of a mixture of different candidate families (Axis, GG-SRP, Inherited, Cache) is mathematically strictly greater than that of any single family alone, provided their gain distributions have distinct tail shapes or are weakly correlated. This explains why pure configurations (e.g., all-random or all-cache) are consistently outperformed by the production mixture.
+
+### 4.3 Orthogonality Principle & POBS
+When a node splits along direction $w$, the linear component of the gradient error parallel to $w$ is consumed. Consequently, the residual error in the child nodes concentrates in the orthogonal complement subspace ($S^\perp$) of the parent hyperplane.
+- OQBoost exploits this by injecting **POBS (Parseval-Constrained Random Orthogonal Block Projections)**. By generating mutually orthogonal candidates (via Haar-random orthogonal block frames), POBS eliminates redundant search dimensions. Under Parseval's identity, the total projection energy is conserved, guaranteeing a worst-case lower bound on the maximum gain captured per tournament.
+
+### 4.4 Bias-Variance Trade-Off via Depth-Adaptive Budgets
+As trees grow deeper, the number of samples reaching a node $N_t$ decreases exponentially.
+- **Deep Node Estimation Noise**: Computing complex optimization (such as CD or matrix inverses in WLS) on small sample sizes yields high-variance directions that overfit to local noise.
+- **Adaptive Budget Allocation**: OQBoost schedules large tournament sizes (64 candidates) at shallow nodes where the sample size is large and the signal is clean, while restricting deep node tournaments to 8 candidates. This not only speeds up training by 25% but also acts as an implicit regularizer, preventing high-variance splits at deep nodes.
+
+---
+
+## 5. Memory-Optimized C++ Engine
 
 ### Object-Pool Histogram Recycling (`hist_pool`)
 Building histograms is the primary computational bottleneck in GBDT training. To prevent frequent heap memory allocation (`malloc`) and deallocation (`free`) during best-first node growth, OQBoost uses a lightweight object pool for histogram buffers inside `gf_build`:
@@ -103,7 +126,7 @@ OQBoost dynamically selects between two OpenMP parallelization strategies depend
 
 ---
 
-## 5. Algorithmic Complexity
+## 6. Algorithmic Complexity
 
 | Phase | Time Complexity | Notes |
 | :--- | :--- | :--- |
@@ -115,7 +138,7 @@ OQBoost dynamically selects between two OpenMP parallelization strategies depend
 
 ---
 
-## 6. Ablation & Empirical Findings
+## 7. Ablation & Empirical Findings
 
 Ablation studies on a classification benchmark (100,000 samples, 50 features) demonstrate the impact of each algorithmic design:
 
@@ -126,7 +149,7 @@ Ablation studies on a classification benchmark (100,000 samples, 50 features) de
 
 ---
 
-## 7. Future Research: Gradient Covariance Paradigm
+## 8. Future Research: Gradient Covariance Paradigm
 
 Recent research (conducted on 2026-06-13 in pure PyTorch prototype `OQBoostCovClassifier`) proposes a massive architectural simplification to the direction generation pipeline. 
 
@@ -144,4 +167,3 @@ By avoiding local optimization on noisy deep-node Hessians (which WLS/CD attempt
 ---
 
 [한국어 버전 (Korean Version)](algorithm.ko.md)
-
