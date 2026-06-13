@@ -88,7 +88,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         inherited_rp_ratio:    float = 1.0,
         mutation_rate:         float = 0.1,
         mutation_strength:     float = 0.5,
-        pobs:                  bool  = True,
+        pobs:                  bool  = False,
     ):
         self.n_estimators          = n_estimators
         self.learning_rate         = learning_rate
@@ -328,7 +328,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
                     mutation_rate=self.mutation_rate,
                     mutation_strength=self.mutation_strength,
                     seed=int(rng.integers(1 << 30)),
-                    pobs=getattr(self, "pobs", True),
+                    pobs=getattr(self, "pobs", False),
                 )
 
                 self.trees_.append(t)

@@ -5,28 +5,13 @@ import argparse
 import json
 import time
 import warnings
+import sys
 from pathlib import Path
 import numpy as np
 import optuna
 from sklearn.model_selection import train_test_split
 
-# Import benchmark datasets
-from adult import load_data as load_adult
-from credit_default import load_data as load_credit_default
-from give_me_some_credit import load_data as load_gmsc
-from covertype import load_data as load_covertype
-from higgs import load_data as load_higgs
-from rotated_synthetic import load_base as load_rotated
-
-
-DATASETS = {
-    "adult": load_adult,
-    "credit_default": load_credit_default,
-    "give_me_some_credit": load_gmsc,
-    "covertype": load_covertype,
-    "higgs": load_higgs,
-    "rotated_synthetic": load_rotated,
-}
+sys.path.insert(0, str(Path(__file__).parent))
 
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,34 +19,59 @@ BEST_PARAMS_FILE = RESULTS_DIR / "best_params.json"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Optuna hyperparameter tuner for OQBoost benchmarks.")
     parser.add_argument(
-        "--dataset",
-        type=str,
-        default="covertype",
-        choices=list(DATASETS.keys()),
-        help="Dataset to tune on",
+        "--datasets",
+        nargs="*",
+        default=["adult", "credit_default", "give_me_some_credit", "covertype", "higgs", "rotated_synthetic"],
+        help="Datasets to tune (default: all)"
+    )
+    parser.add_argument(
+        "--models",
+        nargs="*",
+        default=["XGBoost", "LightGBM", "CatBoost", "OQBoost"],
+        help="Models to tune (default: XGBoost, LightGBM, CatBoost, OQBoost)"
     )
     parser.add_argument(
         "--trials",
         type=int,
         default=50,
-        help="Number of Optuna trials per model",
+        help="Number of Optuna trials per model"
     )
     parser.add_argument(
         "--subset-size",
         type=int,
         default=100000,
-        help="Subsample training size for speed; set 0 for full dataset",
+        help="Subsample training size for speed; set 0 for full dataset"
+    )
+    parser.add_argument(
+        "--skip",
+        nargs="*",
+        default=[],
+        help="Datasets to skip"
     )
     return parser.parse_args()
 
 
+def load_dataset_by_name(name: str) -> tuple[np.ndarray, np.ndarray, list[int] | None]:
+    import importlib
+    mod = importlib.import_module(name)
+    cat_idx = getattr(mod, "CAT_IDX", None)
+    
+    if name == "rotated_synthetic":
+        # Replicate rotated synthetic data loading with rotation_strength = 1.0
+        rng = np.random.default_rng(42)  # SEED
+        R_full = mod.make_rotation_matrix(mod.N_FEATURES, 1.0, rng)
+        X, y = mod.load_base()
+        return (X @ R_full).astype(np.float32), y.astype(int), cat_idx
+    else:
+        load_fn = getattr(mod, "load_data")
+        X, y = load_fn()
+        return X, y.astype(int), cat_idx
+
+
 def get_data(dataset_name: str, subset_size: int):
-    print(f"Loading dataset: {dataset_name}...")
-    load_fn = DATASETS[dataset_name]
-    X, y = load_fn()
-    y = y.astype(int)
+    X, y, cat_idx = load_dataset_by_name(dataset_name)
     n_classes = int(y.max()) + 1
 
     # Train/Val/Test Split
@@ -73,6 +83,13 @@ def get_data(dataset_name: str, subset_size: int):
         X_train, y_train, test_size=0.1765, random_state=42, stratify=y_train if n_classes < 20 else None
     )
 
+    if cat_idx:
+        from _utils import _encode_cats
+        X_train, X_val = _encode_cats(X_train, X_val, cat_idx)
+
+    X_train = X_train.astype(np.float32)
+    X_val = X_val.astype(np.float32)
+
     if subset_size > 0 and len(y_train) > subset_size:
         print(f"Subsampling training set to {subset_size} samples...")
         rng = np.random.default_rng(42)
@@ -80,7 +97,7 @@ def get_data(dataset_name: str, subset_size: int):
         X_train, y_train = X_train[idx], y_train[idx]
 
     print(f"Shapes: Train {X_train.shape}, Val {X_val.shape}, Test {X_test.shape}")
-    return X_train, y_train, X_val, y_val, X_test, y_test, n_classes
+    return X_train, y_train, X_val, y_val, n_classes, cat_idx
 
 
 def tune_xgboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
@@ -100,18 +117,20 @@ def tune_xgboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 50.0, log=True),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 50.0, log=True),
             "tree_method": "hist",
+            "early_stopping_rounds": 50,
             "eval_metric": "logloss" if n_classes == 2 else "mlogloss",
             "verbosity": 0,
             "random_state": 42,
         }
         
-        model = XGBClassifier(**params, early_stopping_rounds=50)
+        model = XGBClassifier(**params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
         
         preds = model.predict(X_val)
         acc = (preds == y_val).mean()
         return acc
 
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
     print(f"Best XGBoost Trial: {study.best_trial.value:.4f}")
@@ -148,24 +167,32 @@ def tune_lightgbm(X_train, y_train, X_val, y_val, n_classes, n_trials):
             model.fit(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
-                callbacks=[lgb_mod.early_stopping(stopping_rounds=50, verbose=False)],
+                callbacks=[
+                    lgb_mod.early_stopping(stopping_rounds=50, verbose=False),
+                    lgb_mod.log_evaluation(period=-1),
+                ],
             )
         
         preds = model.predict(X_val)
         acc = (preds == y_val).mean()
         return acc
 
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
     print(f"Best LightGBM Trial: {study.best_trial.value:.4f}")
     return study.best_params
 
 
-def tune_catboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
+def tune_catboost(X_train, y_train, X_val, y_val, cat_idx, n_classes, n_trials):
     print("\n==================================================")
     print("Tuning CatBoost...")
     print("==================================================")
     from catboost import CatBoostClassifier
+    from _utils import _catboost_X
+
+    X_train_cb = _catboost_X(X_train, cat_idx)
+    X_val_cb = _catboost_X(X_val, cat_idx)
 
     def objective(trial):
         params = {
@@ -174,24 +201,26 @@ def tune_catboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
             "depth": trial.suggest_int("depth", 5, 10),
             "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 20.0),
             "early_stopping_rounds": 50,
+            "cat_features": cat_idx,
             "verbose": 0,
             "random_seed": 42,
         }
         
         model = CatBoostClassifier(**params)
-        model.fit(X_train, y_train, eval_set=(X_val, y_val))
+        model.fit(X_train_cb, y_train, eval_set=(X_val_cb, y_val))
         
-        preds = model.predict(X_val).ravel()
+        preds = model.predict(X_val_cb).ravel()
         acc = (preds == y_val).mean()
         return acc
 
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
     print(f"Best CatBoost Trial: {study.best_trial.value:.4f}")
     return study.best_params
 
 
-def tune_oqboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
+def tune_oqboost(X_train, y_train, X_val, y_val, cat_idx, n_classes, n_trials):
     print("\n==================================================")
     print("Tuning OQBoost...")
     print("==================================================")
@@ -204,7 +233,13 @@ def tune_oqboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
             "max_depth": trial.suggest_int("max_depth", 4, 8),
             "subsample": trial.suggest_float("subsample", 0.5, 1.0),
             "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 20.0),
+            "inherited_rp_ratio": trial.suggest_float("inherited_rp_ratio", 0.0, 1.0),
+            "mutation_rate": trial.suggest_float("mutation_rate", 0.01, 0.5),
+            "mutation_strength": trial.suggest_float("mutation_strength", 0.05, 1.0),
+            "pobs": trial.suggest_categorical("pobs", [False]),
+            "prior_alpha": trial.suggest_float("prior_alpha", 0.0, 1.0),
             "early_stopping_rounds": 50,
+            "cat_features": cat_idx,
             "verbose": False,
             "random_state": 42,
         }
@@ -216,14 +251,15 @@ def tune_oqboost(X_train, y_train, X_val, y_val, n_classes, n_trials):
         acc = (preds == y_val).mean()
         return acc
 
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
     print(f"Best OQBoost Trial: {study.best_trial.value:.4f}")
     return study.best_params
 
 
-def tune_dataset(dataset_name: str, trials: int, subset_size: int):
-    X_train, y_train, X_val, y_val, X_test, y_test, n_classes = get_data(
+def tune_dataset(dataset_name: str, models: list[str], trials: int, subset_size: int):
+    X_train, y_train, X_val, y_val, n_classes, cat_idx = get_data(
         dataset_name, subset_size
     )
     
@@ -238,19 +274,23 @@ def tune_dataset(dataset_name: str, trials: int, subset_size: int):
     if dataset_name not in results:
         results[dataset_name] = {}
 
-    # Run tuners
     t0 = time.perf_counter()
-    xgb_best = tune_xgboost(X_train, y_train, X_val, y_val, n_classes, trials)
-    results[dataset_name]["XGBoost"] = xgb_best
     
-    lgb_best = tune_lightgbm(X_train, y_train, X_val, y_val, n_classes, trials)
-    results[dataset_name]["LightGBM"] = lgb_best
-    
-    cb_best = tune_catboost(X_train, y_train, X_val, y_val, n_classes, trials)
-    results[dataset_name]["CatBoost"] = cb_best
-    
-    gf_best = tune_oqboost(X_train, y_train, X_val, y_val, n_classes, trials)
-    results[dataset_name]["OQBoost"] = gf_best
+    if "XGBoost" in models:
+        xgb_best = tune_xgboost(X_train, y_train, X_val, y_val, n_classes, trials)
+        results[dataset_name]["XGBoost"] = xgb_best
+        
+    if "LightGBM" in models:
+        lgb_best = tune_lightgbm(X_train, y_train, X_val, y_val, n_classes, trials)
+        results[dataset_name]["LightGBM"] = lgb_best
+        
+    if "CatBoost" in models:
+        cb_best = tune_catboost(X_train, y_train, X_val, y_val, cat_idx, n_classes, trials)
+        results[dataset_name]["CatBoost"] = cb_best
+        
+    if "OQBoost" in models:
+        gf_best = tune_oqboost(X_train, y_train, X_val, y_val, cat_idx, n_classes, trials)
+        results[dataset_name]["OQBoost"] = gf_best
     
     total_time = time.perf_counter() - t0
     print(f"\n[{dataset_name}] Hyperparameter tuning completed in {total_time:.1f} seconds.")
@@ -263,9 +303,24 @@ def tune_dataset(dataset_name: str, trials: int, subset_size: int):
 
 def main():
     args = parse_args()
-    tune_dataset(args.dataset, args.trials, args.subset_size)
+    
+    skip_set = set(args.skip)
+    datasets_to_run = [d for d in args.datasets if d not in skip_set]
+    
+    print(f"Tuning datasets: {datasets_to_run}")
+    print(f"Tuning models: {args.models}")
+    print(f"Trials per model: {args.trials}")
+    print(f"Subset size: {args.subset_size}")
+    
+    for dataset in datasets_to_run:
+        print(f"\n>>> Starting Optuna Hyperparameter Tuning for {dataset} ...")
+        try:
+            tune_dataset(dataset, args.models, args.trials, args.subset_size)
+        except Exception as e:
+            print(f" ERROR during tuning {dataset}: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
     main()
-

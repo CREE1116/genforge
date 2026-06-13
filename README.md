@@ -104,39 +104,43 @@ clf2 = load_model("model.joblib")
 
 ## Benchmark Results
 
-All benchmarks: 80/20 train-test split, 3 repetitions, mean reported. Default hyperparameters throughout. No model-specific tuning.
+All benchmarks: 80/20 train-test split, 3 repetitions, mean ± standard deviation reported. All models (XGBoost, LightGBM, CatBoost, OQBoost) were hyperparameter-tuned using Optuna for 50 trials.
 
 ### Main Benchmark Table
 
-| Dataset | Model | Bal. Acc ↑ | F1 Macro ↑ | Log Loss ↓ | Train (s) | Infer (s) |
-|---------|-------|-----------|-----------|----------|-----------|-----------|
-| Adult Income | XGBoost | 0.7983 | 0.8151 | 0.2748 | **0.32** | **0.003** |
-| | LightGBM | 0.8012 | 0.8180 | 0.2752 | 1.73 | 0.021 |
-| | CatBoost | 0.7965 | 0.8153 | 0.2734 | 11.11 | 0.053 |
-| | **OQBoost** | **0.8444** | 0.8030 | 0.3248 | 6.17 | 0.212 |
-| Credit Default | XGBoost | 0.6539 | 0.6795 | 0.4303 | **0.32** | **0.002** |
-| | LightGBM | 0.6605 | 0.6865 | 0.4271 | 1.68 | 0.008 |
-| | **CatBoost** | **0.6619** | **0.6879** | **0.4257** | 6.33 | 0.005 |
-| | OQBoost | 0.5936 | 0.5900 | 0.4893 | 0.83 | 0.004 |
-| Give Me Credit | XGBoost | 0.6496 | 0.6603 | 0.5246 | **0.28** | **0.001** |
-| | LightGBM | 0.6532 | 0.6631 | 0.5501 | 1.03 | 0.003 |
-| | CatBoost | 0.6841 | 0.6987 | **0.4919** | 0.72 | 0.001 |
-| | **OQBoost** | **0.6909** | 0.6865 | 0.5241 | 0.96 | 0.044 |
-| Rotated Synth. | XGBoost | 0.9704 | 0.9704 | 0.0978 | **2.37** | **0.017** |
-| | LightGBM | 0.9731 | 0.9731 | 0.0898 | 12.13 | 0.302 |
-| | CatBoost | 0.9759 | 0.9758 | 0.0876 | 11.71 | 0.020 |
-| | **OQBoost** | **0.9782** | **0.9782** | **0.0778** | 25.16 | 0.900 |
-| CoverType | — | — | — | — | — | — |
-| Higgs | — | — | — | — | — | — |
-
-> CoverType and Higgs results pending (large-scale runs). See `benchmark/results/` for live updates.
+| Dataset | Model | Accuracy | Bal. Acc. | F1 Macro | Log Loss | Train (s) | Infer (s) |
+|---------|-------|----------|-----------|----------|----------|-----------|-----------|
+| **Adult** | XGBoost | 0.8736±0.0033 | 0.7990±0.0065 | 0.8159±0.0055 | 0.2760±0.0018 | **0.83±0.10** | **0.01±0.00** |
+| | LightGBM | **0.8746±0.0041** | **0.8002±0.0079** | **0.8173±0.0069** | 0.2755±0.0021 | 2.80±0.27 | 0.06±0.00 |
+| | CatBoost | 0.8745±0.0040 | 0.7963±0.0065 | 0.8156±0.0063 | **0.2737±0.0018** | 7.83±0.86 | 0.05±0.00 |
+| | OQBoost | 0.8717±0.0023 | 0.7985±0.0073 | 0.8141±0.0050 | 0.2768±0.0025 | 4.16±0.30 | 0.04±0.01 |
+| **Credit Default** | XGBoost | 0.8206±0.0018 | 0.6584±0.0015 | 0.6836±0.0022 | 0.4280±0.0010 | **0.19±0.01** | **0.00±0.00** |
+| | LightGBM | **0.8223±0.0019** | 0.6585±0.0018 | 0.6844±0.0025 | **0.4239±0.0012** | 5.56±0.32 | 0.07±0.01 |
+| | CatBoost | 0.8220±0.0010 | **0.6603±0.0021** | **0.6859±0.0024** | 0.4274±0.0004 | 0.56±0.08 | **0.00±0.00** |
+| | OQBoost | 0.8211±0.0025 | 0.6569±0.0057 | 0.6824±0.0064 | 0.4251±0.0006 | 0.75±0.03 | **0.00±0.00** |
+| **Give Me Credit** | XGBoost | 0.7400±0.0312 | 0.6381±0.0349 | 0.6488±0.0398 | 0.5093±0.0266 | 0.16±0.03 | **0.00±0.00** |
+| | LightGBM | 0.7417±0.0321 | 0.6250±0.0360 | 0.6341±0.0420 | 0.5051±0.0320 | 0.38±0.20 | **0.00±0.00** |
+| | CatBoost | **0.7650±0.0173** | **0.6750±0.0167** | **0.6888±0.0196** | 0.4951±0.0382 | **0.12±0.02** | **0.00±0.00** |
+| | OQBoost | 0.7600±0.0397 | 0.6651±0.0791 | 0.6719±0.0867 | **0.4940±0.0566** | 0.18±0.02 | **0.00±0.00** |
+| **CoverType** | XGBoost | 0.9704±0.0008 | 0.9392±0.0042 | 0.9460±0.0034 | 0.0789±0.0017 | **74.01±0.27** | 4.06±0.08 |
+| | LightGBM | 0.9704±0.0008 | 0.9397±0.0052 | 0.9466±0.0045 | 0.0823±0.0021 | 286.03±2.17 | 35.09±0.18 |
+| | CatBoost | 0.9588±0.0005 | 0.9303±0.0038 | 0.9371±0.0038 | 0.1171±0.0017 | 130.84±0.51 | **0.19±0.01** |
+| | OQBoost | **0.9752±0.0008** | **0.9495±0.0032** | **0.9543±0.0027** | **0.0762±0.0013** | 219.58±0.85 | 2.66±0.08 |
+| **Higgs** | XGBoost | 0.7304±0.0052 | 0.7291±0.0054 | 0.7293±0.0053 | 0.5259±0.0045 | **5.74±0.81** | 0.08±0.01 |
+| | LightGBM | **0.7319±0.0037** | **0.7307±0.0037** | **0.7309±0.0037** | 0.5255±0.0044 | 33.07±5.15 | 0.46±0.08 |
+| | CatBoost | 0.7293±0.0055 | 0.7279±0.0055 | 0.7281±0.0055 | 0.5296±0.0043 | 11.91±2.24 | **0.01±0.00** |
+| | OQBoost | 0.7311±0.0043 | 0.7300±0.0043 | 0.7301±0.0043 | **0.5243±0.0043** | 45.69±7.71 | 0.74±0.11 |
+| **Rotated Synth.** | XGBoost | 0.9758±0.0014 | 0.9758±0.0015 | 0.9758±0.0014 | 0.0819±0.0023 | **6.46±0.29** | 0.11±0.02 |
+| | LightGBM | 0.9763±0.0017 | 0.9763±0.0017 | 0.9763±0.0017 | 0.0835±0.0023 | 17.72±0.58 | 0.33±0.08 |
+| | CatBoost | 0.9772±0.0019 | 0.9772±0.0019 | 0.9772±0.0019 | 0.0818±0.0034 | 20.75±9.69 | **0.02±0.01** |
+| | OQBoost | **0.9795±0.0013** | **0.9795±0.0013** | **0.9795±0.0013** | **0.0724±0.0027** | 32.08±11.30 | 0.51±0.12 |
 
 ### Highlights
 
-- **Best Balanced Accuracy (Adult Income):** OQBoost **0.844** vs XGBoost 0.798 (+5.8 pp)
-- **Best Balanced Accuracy (Give Me Credit):** OQBoost **0.691** vs XGBoost 0.650 (+6.4 pp)
-- **Best on Rotated Synthetic:** OQBoost **0.978** — highest balanced accuracy AND lowest log loss; validates oblique split advantage over axis-aligned methods
-- **Credit Default:** OQBoost underperforms baselines here (highly imbalanced, 3% positive rate) — an open problem; tree depth / early stopping sensitivity under extreme imbalance
+- **Outstanding on CoverType:** OQBoost achieves **0.9495±0.0032** Balanced Accuracy (outperforming LightGBM's 0.9397 and XGBoost's 0.9392) and the lowest Log Loss of **0.0762** (vs XGBoost's 0.0789 and CatBoost's 0.1171).
+- **Superior on Rotated Synthetic:** OQBoost achieves **0.9795±0.0013** Balanced Accuracy and **0.0724±0.0027** Log Loss, outperforming all baselines (CatBoost 0.9772, LightGBM 0.9763, XGBoost 0.9758). This validates the oblique split advantage on rotated decision boundaries.
+- **Lowest Log Loss on Give Me Credit & Higgs:** OQBoost achieves the lowest Log Loss on Give Me Credit (**0.4940±0.0566** vs CatBoost's 0.4951) and Higgs (**0.5243±0.0043** vs LightGBM's 0.5255).
+- **Strong Performance on Give Me Credit & Adult:** OQBoost performs competitively, scoring **0.6651±0.0791** Balanced Accuracy on Give Me Credit (outperforming XGBoost's 0.6381 and LightGBM's 0.6250) and **0.7985±0.0073** on Adult Income.
 
 ### Figure 1 — Balanced Accuracy Comparison
 
@@ -191,11 +195,11 @@ See [`docs/algorithm.md`](docs/algorithm.md) for the full derivation and [`docs/
 | `subsample` | 0.8 | Row fraction per tree |
 | `early_stopping_rounds` | 50 | Stop if class-weighted val loss stagnates |
 | `cat_features` | None | Categorical column names or indices |
-| `class_weight` | "balanced" | Reweight by inverse class frequency |
+| `class_weight` | None | Reweight by inverse class frequency (e.g. "balanced") |
 | `inherited_rp_ratio` | 1.0 | Fraction of candidates from inheritance + cache |
 | `mutation_rate` | 0.1 | Base noise scale for axis mutations |
 | `mutation_strength` | 0.5 | Base weight for new-axis borrowing |
-| `pobs` | True | Inject Haar-orthogonal POBS candidates into every node's tournament |
+| `pobs` | False | Inject Haar-orthogonal POBS candidates into every node's tournament |
 | `random_state` | None | Seed |
 | `verbose` | False | Print per-round metrics |
 
