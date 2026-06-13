@@ -98,7 +98,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         max_leaves:            int | None = None,
         max_bin:               int = 255,
         colsample_bynode:      float = 1.0,
-        multi_strategy:        str = "ovr",
+        multi_strategy:        str = "shared",
     ):
         self.n_estimators          = n_estimators
         self.learning_rate         = learning_rate
@@ -125,6 +125,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         self.max_bin               = max_bin
         self.colsample_bynode      = colsample_bynode
         self.multi_strategy        = multi_strategy
+        self.feature_names_in_     = None
 
     # ── public fit/predict ────────────────────────────────────────────────────
 
@@ -305,8 +306,10 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         for cf in self.cat_features:
             if isinstance(cf, (int, np.integer)):
                 cat_idx.add(int(cf))
-            elif self.feature_names_in_ is not None and cf in self.feature_names_in_:
-                cat_idx.add(self.feature_names_in_.index(cf))
+            else:
+                names = getattr(self, "feature_names_in_", None)
+                if names is not None and cf in names:
+                    cat_idx.add(names.index(cf))
         return sorted(cat_idx)
 
     def _resolve_D_num(self, D: int) -> int:

@@ -13,17 +13,21 @@ Quickstart
 """
 
 from ._classifier import OQBoostClassifier
+from ._regressor import OQBoostRegressor
 from ._oqboost import OQBoostTree
 
 
-def load_model(path: str) -> OQBoostClassifier:
+def load_model(path: str) -> OQBoostClassifier | OQBoostRegressor:
     """Load a model saved with ``clf.save(path)``."""
-    return OQBoostClassifier.load(path)
+    # joblib.load retrieves the actual pickled estimator type
+    import joblib
+    return joblib.load(path)
 
 
 __version__ = "0.1.3"
 __all__ = [
     "OQBoostClassifier",
+    "OQBoostRegressor",
     "OQBoostTree",
     "load_model",
 ]
