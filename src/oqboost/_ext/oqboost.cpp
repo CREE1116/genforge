@@ -54,16 +54,25 @@
 #include "oqboost_types.h"
 #include "oqboost_core.h"
 
+static inline double thr_l1(double g, float alpha) {
+  if (alpha <= 0.0f) return g;
+  if (g > alpha) return g - alpha;
+  if (g < -alpha) return g + alpha;
+  return 0.0;
+}
+
 static constexpr int OBLIQUE_MIN = 64;  // min node size to fit directions
 
 // ─── Binning context (per dataset, reused across all boosting rounds) ───────
 struct OQBoostCtx {
   int N = 0, D = 0, D_num = 0, D_cat = 0;
+  int n_bins = 255;
   std::vector<uint8_t> code;            // N·D uint8 bin codes
   std::vector<float> ax_min, ax_range;  // per-feature bin frame
   std::vector<float> Ximp;              // N·D transformed x̃ (numeric static,
                                         // cat columns rewritten per round)
   std::vector<float> col_mean;          // [D_num] numeric impute means μ_f
+  std::vector<uint8_t> is_nan;          // N·D missing value mask (1 if NaN, 0 if not)
 
   // Categorical raw-value dictionaries (static across rounds).
   std::vector<std::unordered_map<int, int>> cat_id;  // raw → dense id
@@ -122,7 +131,7 @@ static std::vector<int> stride_cap(const std::vector<int>& v, int cap) {
   return out;
 }
 
-// Route a TRANSFORMED matrix x̃ (no NaN, cats already rank-encoded).
+// Route a TRANSFORMED matrix x̃ (can have NaNs, cats already rank-encoded).
 static void _gf_route(const OQTree* tree, const float* X, int N,
                          float* out_pred) {
   int D = tree->D, K = tree->K;
@@ -141,8 +150,32 @@ static void _gf_route(const OQTree* tree, const float* X, int N,
     int t = 0;
     for (int dep = 0; dep < tree->max_depth; dep++) {
       if (tree->is_leaf[t]) break;
-      float proj = sparse_dot_stack(node_nz[t], xi);
-      int next_t = (proj < tree->split_threshold[t]) ? (2 * t + 1) : (2 * t + 2);
+      bool has_nan = false;
+      const SparseVec& sv = node_nz[t];
+      if (sv.size == 1) {
+        int idx = sv.indices[0];
+        if (idx < tree->D_num && std::isnan(xi[idx])) {
+          has_nan = true;
+        }
+      }
+      int next_t;
+      if (has_nan) {
+        next_t = (tree->default_left[t] != 0) ? (2 * t + 1) : (2 * t + 2);
+      } else {
+        float proj = 0.0f;
+        if (sv.size == 1) {
+          proj = sv.values[0] * xi[sv.indices[0]];
+        } else {
+          for (int k = 0; k < sv.size; k++) {
+            float v = xi[sv.indices[k]];
+            if (std::isnan(v)) {
+              v = tree->na_means[sv.indices[k]];
+            }
+            proj += sv.values[k] * v;
+          }
+        }
+        next_t = (proj < tree->split_threshold[t]) ? (2 * t + 1) : (2 * t + 2);
+      }
       if (next_t >= T) break;
       t = next_t;
     }
@@ -156,8 +189,10 @@ extern "C" {
 
 // Pre-bin all features once.
 GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
-                                 const int* sub, int Ns) {
+                                 const int* sub, int Ns, int max_bin) {
   auto* ctx = new OQBoostCtx();
+  ctx->n_bins = std::max(2, std::min(max_bin, 255));
+  const int AX_BINS = ctx->n_bins;
   ctx->N = N;
   ctx->D = D;
   ctx->D_num = D_num;
@@ -167,6 +202,7 @@ GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
   ctx->col_mean.assign(D_num, 0.0f);
   ctx->Ximp.assign((size_t)N * D, 0.0f);
   ctx->code.assign((size_t)N * D, 0);
+  ctx->is_nan.assign((size_t)N * D, 0);
 
   // ── numeric: μ_f, min/max over the non-missing subsample ─────────────────
   std::vector<float> ax_max(D_num, -1e30f);
@@ -195,7 +231,7 @@ GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
     float range = ax_max[f] - ax_lo[f];
     if (range > 1e-12f) {
       ctx->ax_range[f] = range;
-      ax_scale[f] = (float)AX_BINS / (range + EPS);
+      ax_scale[f] = (float)(AX_BINS - 1) / (range + EPS);
     }
   }
 
@@ -208,12 +244,21 @@ GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
     uint8_t* GF_RESTRICT ci = ctx->code.data() + (size_t)i * D;
     for (int f = 0; f < D_num; f++) {
       float v = xi[f];
-      if (std::isnan(v)) v = ctx->col_mean[f];
+      bool is_missing = std::isnan(v);
+      if (is_missing) {
+        ctx->is_nan[(size_t)i * D + f] = 1;
+        v = ctx->col_mean[f];
+      }
       ti[f] = v;
       if (ctx->ax_range[f] == 0.0f) continue;
-      int b = (int)((v - ctx->ax_min[f]) * ax_scale[f]);
-      if (b < 0) b = 0;
-      if (b >= AX_BINS) b = AX_BINS - 1;
+      int b;
+      if (is_missing) {
+        b = AX_BINS - 1;
+      } else {
+        b = (int)((v - ctx->ax_min[f]) * ax_scale[f]);
+        if (b < 0) b = 0;
+        if (b >= AX_BINS - 1) b = AX_BINS - 2;
+      }
       ci[f] = (uint8_t)b;
     }
   }
@@ -242,6 +287,7 @@ GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
       for (int i = 0; i < N; i++) {
         float v = X[(size_t)i * D + f];
         if (std::isnan(v)) {
+          ctx->is_nan[(size_t)i * D + f] = 1;
           ctx->cat_dense[(size_t)i * ctx->D_cat + fc] = nan_id;
         } else {
           auto it = m.find((int)std::lrintf(v));
@@ -256,16 +302,36 @@ GF_API void* gf_ctx_create(const float* X, int N, int D, int D_num,
 
 GF_API void gf_ctx_free(void* h) { delete static_cast<OQBoostCtx*>(h); }
 
+static inline bool has_nan_in_split(const uint8_t* is_nan, int i, int D, const SparseVec& sv) {
+  if (sv.size == 1) {
+    return is_nan[(size_t)i * D + sv.indices[0]] != 0;
+  }
+  return false;
+}
+
+static inline float compute_split_score(const std::vector<double>& GL, const std::vector<double>& HL,
+                                        const std::vector<double>& GR, const std::vector<double>& HR,
+                                        int K, float reg_lambda) {
+  float score = 0.0f;
+  for (int c = 0; c < K; c++) {
+    score += 0.5f * (float)(GL[c] * GL[c] / (HL[c] + reg_lambda + EPS) +
+                            GR[c] * GR[c] / (HR[c] + reg_lambda + EPS));
+  }
+  return score;
+}
+
 // ─── gf_build — one boosting round on a binning context ────────────────
 GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
                                const float* H, int K, const int* sub, int Ns,
                                int max_depth, float reg_lambda,
                                float inherited_rp_ratio, float mutation_rate,
                                float mutation_strength, int seed, int pobs,
-                               float* out_pred) {
+                               float reg_alpha, float gamma, float min_child_weight,
+                               float colsample_bynode, int max_leaves, float* out_pred) {
 
   (void)X;
   auto* ctx = static_cast<OQBoostCtx*>(ctx_handle);
+  const int AX_BINS = ctx->n_bins;
   const int D = ctx->D, D_num = ctx->D_num, D_cat = ctx->D_cat, N = ctx->N;
   const float* GF_RESTRICT Xt = ctx->Ximp.data();
   const int STRIDE = 2 * K + 1;
@@ -274,7 +340,6 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 
 
   const int internal_depth = std::min(2 * max_depth, 22);
-  const int max_leaves = 1 << max_depth;
   int max_nodes = (1 << (internal_depth + 1)) - 1;
   auto* tree = new OQTree();
   tree->K = K;
@@ -283,6 +348,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   tree->max_depth = internal_depth;
   tree->total_nodes = max_nodes;
   tree->is_leaf.assign(max_nodes, 1);
+  tree->default_left.assign(max_nodes, 1);  // default missing values to Left child
   tree->split_hyp_idx.assign(max_nodes, -1);
   tree->split_threshold.assign(max_nodes, 0.0f);
   tree->leaf_values.assign((size_t)max_nodes * K, 0.0f);
@@ -399,62 +465,37 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           }
         }
       } else {
-        // Blocked Sample-parallelism (efficient for smaller D, single parallel region)
-        std::memset(hb, 0, HSZ * sizeof(float));
-
-        int B = 16;
-        if (K > 5) B = 8;
-        if (K > 16) B = 4;
-        if (K > 32) B = 2;
-        if (K > 64) B = 1;
-
-        int B_max = B;
-        int HSZ_block_max = B_max * AX_BINS * STRIDE;
-        std::vector<float> local_hists_workspace((size_t)nthreads * HSZ_block_max);
-
+        // Flat Thread-local Sample-parallelism (extremely fast for smaller D)
+        std::vector<float> local_hists((size_t)nthreads * HSZ, 0.0f);
 #pragma omp parallel num_threads(nthreads)
         {
           int tid = omp_get_thread_num();
-
-          for (int fb = 0; fb < D; fb += B) {
-            int f_end = std::min(fb + B, D);
-            int actual_B = f_end - fb;
-            int HSZ_block = actual_B * AX_BINS * STRIDE;
-
-            float* GF_RESTRICT lb = local_hists_workspace.data() + (size_t)tid * HSZ_block;
-            std::memset(lb, 0, HSZ_block * sizeof(float));
-
-#pragma omp barrier
-
-#pragma omp for schedule(static) nowait
-            for (int si = 0; si < nr; si++) {
-              int j = rows[si];
-              const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
-              const float* GF_RESTRICT gj = G + (size_t)j * K;
-              const float* GF_RESTRICT hj = H + (size_t)j * K;
-              for (int f = fb; f < f_end; f++) {
-                int b = cj[f];
-                float* GF_RESTRICT slot = lb + ((size_t)(f - fb) * AX_BINS + b) * STRIDE;
-                for (int c = 0; c < K; c++) {
-                  slot[c] += gj[c];
-                  slot[K + c] += hj[c];
-                }
-                slot[2 * K] += 1.0f;
-              }
-            }
-
-#pragma omp barrier
+          float* GF_RESTRICT lb = local_hists.data() + (size_t)tid * HSZ;
 
 #pragma omp for schedule(static)
-            for (int i = 0; i < HSZ_block; i++) {
-              float s = 0.0f;
-              for (int t = 0; t < nthreads; t++) {
-                s += local_hists_workspace[(size_t)t * HSZ_block + i];
+          for (int si = 0; si < nr; si++) {
+            int j = rows[si];
+            const uint8_t* GF_RESTRICT cj = code + (size_t)j * D;
+            const float* GF_RESTRICT gj = G + (size_t)j * K;
+            const float* GF_RESTRICT hj = H + (size_t)j * K;
+            for (int f = 0; f < D; f++) {
+              int b = cj[f];
+              float* GF_RESTRICT slot = lb + ((size_t)f * AX_BINS + b) * STRIDE;
+              for (int c = 0; c < K; c++) {
+                slot[c] += gj[c];
+                slot[K + c] += hj[c];
               }
-              hb[(size_t)fb * AX_BINS * STRIDE + i] = s;
+              slot[2 * K] += 1.0f;
             }
+          }
 
-#pragma omp barrier
+#pragma omp for schedule(static)
+          for (size_t i = 0; i < HSZ; i++) {
+            float s = 0.0f;
+            for (int t = 0; t < nthreads; t++) {
+              s += local_hists[(size_t)t * HSZ + i];
+            }
+            hb[i] = s;
           }
         }
       }
@@ -527,6 +568,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   std::vector<float> cand_thr(max_nodes, 0.0f);
   std::vector<int> cand_axis(max_nodes, -1);
   std::vector<int> cand_bcode(max_nodes, 0);
+  std::vector<uint8_t> cand_default_left(max_nodes, 1);
   std::vector<std::vector<float>> cand_w(max_nodes);
   std::vector<std::vector<float>> cand_proj(max_nodes);
 
@@ -536,6 +578,19 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
   auto eval_axis = [&](int t) -> float {
     int ns = (int)node_samp[t].size();
     const float* GF_RESTRICT hb = node_hist[t].data();
+
+    std::vector<char> feat_mask(D, 1);
+    if (colsample_bynode < 1.0f) {
+      std::mt19937 col_rng(seed + t);
+      feat_mask.assign(D, 0);
+      int n_sel = std::max(1, (int)std::lrintf(D * colsample_bynode));
+      std::vector<int> f_indices(D);
+      std::iota(f_indices.begin(), f_indices.end(), 0);
+      std::shuffle(f_indices.begin(), f_indices.end(), col_rng);
+      for (int idx = 0; idx < n_sel; idx++) {
+        feat_mask[f_indices[idx]] = 1;
+      }
+    }
 
     std::vector<float> Gt(K, 0.0f), Ht(K, 0.0f);
     for (int b = 0; b < AX_BINS; b++) {
@@ -551,76 +606,193 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     }
     node_has_tot[t] = 1;
     float total_base = 0.0f;
-    for (int c = 0; c < K; c++)
-      total_base -= 0.5f * Gt[c] * Gt[c] / (Ht[c] + reg_lambda + EPS);
+    for (int c = 0; c < K; c++) {
+      double gt_l1 = thr_l1(Gt[c], reg_alpha);
+      total_base -= 0.5f * gt_l1 * gt_l1 / (Ht[c] + reg_lambda + EPS);
+    }
 
     float best_gain = 0.0f, best_thr = 0.0f;
     int best_axis = -1, best_axis_b = 0;
+    uint8_t best_default_left = 1;
 
-    // NOTE: an `if (D * K >= 192)` serialization guard was A/B-tested here
-    // (2026-06-12) and measured ~7% SLOWER overall — libomp's spin-wait
-    // keeps workers hot, so even these small regions win parallel. The
-    // profiler's dominant __psynch_cvwait is parked/spinning workers, not
-    // lost wall time. Don't re-add work-size guards without an A/B.
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
     {
       float l_gain = 0.0f, l_thr = 0.0f;
       int l_axis = -1, l_b = 0;
-      std::vector<float> Gc(K), Hc(K);
+      uint8_t l_default_left = 1;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+      {
+        float thread_best_gain = 0.0f, thread_best_thr = 0.0f;
+        int thread_best_axis = -1, thread_best_b = 0;
+        uint8_t thread_best_default_left = 1;
+        std::vector<float> thread_Gc(K), thread_Hc(K);
+        // Per-thread scratch buffers, reused across features/bins to avoid
+        // heap churn in the hottest scan loop (K is tiny).
+        std::vector<double> bG_nan(K), bH_nan(K), bG_clean(K), bH_clean(K);
+        std::vector<double> bGc(K), bHc(K), bGL(K), bHL(K), bGR(K), bHR(K);
 #ifdef _OPENMP
 #pragma omp for schedule(static) nowait
 #endif
-      for (int f = 0; f < D; f++) {
-        if (ctx->ax_range[f] == 0.0f) continue;
-        const float* GF_RESTRICT fbuf = hb + (size_t)f * AX_BINS * STRIDE;
-        std::fill(Gc.begin(), Gc.end(), 0.0f);
-        std::fill(Hc.begin(), Hc.end(), 0.0f);
-        int n_left = 0;
-        for (int b = 0; b < AX_BINS - 1; b++) {
-          const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
-          n_left += (int)slot[2 * K];
-          for (int c = 0; c < K; c++) {
-            Gc[c] += slot[c];
-            Hc[c] += slot[K + c];
-          }
-          int n_right = ns - n_left;
-          if (n_left < 10 || n_right < 10) continue;
-          float Hcs = 0.0f, Hrs = 0.0f;
-          for (int c = 0; c < K; c++) {
-            Hcs += Hc[c];
-            Hrs += Ht[c] - Hc[c];
-          }
-          if (Hcs < MIN_CHILD_W || Hrs < MIN_CHILD_W) continue;
-          float gain = total_base;
-          for (int c = 0; c < K; c++) {
-            float Gr = Gt[c] - Gc[c], Hr = Ht[c] - Hc[c];
-            gain += 0.5f * (Gc[c] * Gc[c] / (Hc[c] + reg_lambda + EPS) +
-                            Gr * Gr / (Hr + reg_lambda + EPS));
-          }
-          if (gain > l_gain || (gain == l_gain && l_axis >= 0 && f < l_axis)) {
-            l_gain = gain;
-            l_axis = f;
-            l_b = b;
-            l_thr =
-                ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
+        for (int f = 0; f < D; f++) {
+          if (!feat_mask[f]) continue;
+          if (ctx->ax_range[f] == 0.0f) continue;
+          const float* GF_RESTRICT fbuf = hb + (size_t)f * AX_BINS * STRIDE;
+          if (f < D_num) {
+            // Numeric: Joint scan over clean sample thresholds and NaN default routing
+            const float* GF_RESTRICT nan_slot = fbuf + (size_t)(AX_BINS - 1) * STRIDE;
+            int n_nan = (int)nan_slot[2 * K];
+            std::vector<double>& G_nan = bG_nan;
+            std::vector<double>& H_nan = bH_nan;
+            for (int c = 0; c < K; c++) {
+              G_nan[c] = nan_slot[c];
+              H_nan[c] = nan_slot[K + c];
+            }
+            int n_clean_tot = ns - n_nan;
+            std::vector<double>& G_clean_tot = bG_clean;
+            std::vector<double>& H_clean_tot = bH_clean;
+            for (int c = 0; c < K; c++) {
+              G_clean_tot[c] = Gt[c] - G_nan[c];
+              H_clean_tot[c] = Ht[c] - H_nan[c];
+            }
+            std::vector<double>& Gc_acc = bGc;
+            std::vector<double>& Hc_acc = bHc;
+            std::fill(Gc_acc.begin(), Gc_acc.end(), 0.0);
+            std::fill(Hc_acc.begin(), Hc_acc.end(), 0.0);
+            int n_left = 0;
+            for (int b = 0; b < AX_BINS - 1; b++) {
+              const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
+              n_left += (int)slot[2 * K];
+              for (int c = 0; c < K; c++) {
+                Gc_acc[c] += slot[c];
+                Hc_acc[c] += slot[K + c];
+              }
+              int n_clean_R = n_clean_tot - n_left;
+              // Option L: NaNs go Left
+              {
+                int n_L = n_left + n_nan;
+                int n_R = n_clean_R;
+                if (n_L >= 10 && n_R >= 10) {
+                  double H_L_sum = 0.0, H_R_sum = 0.0;
+                  std::vector<double>&GL = bGL, &HL = bHL, &GR = bGR, &HR = bHR;
+                  for (int c = 0; c < K; c++) {
+                    GL[c] = Gc_acc[c] + G_nan[c];
+                    HL[c] = Hc_acc[c] + H_nan[c];
+                    GR[c] = G_clean_tot[c] - Gc_acc[c];
+                    HR[c] = H_clean_tot[c] - Hc_acc[c];
+                    H_L_sum += HL[c];
+                    H_R_sum += HR[c];
+                  }
+                  if (H_L_sum >= min_child_weight && H_R_sum >= min_child_weight) {
+                    float gain = total_base;
+                    for (int c = 0; c < K; c++) {
+                      double gl_l1 = thr_l1(GL[c], reg_alpha);
+                      double gr_l1 = thr_l1(GR[c], reg_alpha);
+                      gain += 0.5f * (float)(gl_l1 * gl_l1 / (HL[c] + reg_lambda + EPS) +
+                                             gr_l1 * gr_l1 / (HR[c] + reg_lambda + EPS));
+                    }
+                    if (gain > thread_best_gain || (gain == thread_best_gain && thread_best_axis >= 0 && f < thread_best_axis)) {
+                      thread_best_gain = gain;
+                      thread_best_axis = f;
+                      thread_best_b = b;
+                      thread_best_thr = ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
+                      thread_best_default_left = 1;
+                    }
+                  }
+                }
+              }
+              // Option R: NaNs go Right
+              {
+                int n_L = n_left;
+                int n_R = n_clean_R + n_nan;
+                if (n_L >= 10 && n_R >= 10) {
+                  double H_L_sum = 0.0, H_R_sum = 0.0;
+                  std::vector<double>&GL = bGL, &HL = bHL, &GR = bGR, &HR = bHR;
+                  for (int c = 0; c < K; c++) {
+                    GL[c] = Gc_acc[c];
+                    HL[c] = Hc_acc[c];
+                    GR[c] = G_clean_tot[c] - Gc_acc[c] + G_nan[c];
+                    HR[c] = H_clean_tot[c] - Hc_acc[c] + H_nan[c];
+                    H_L_sum += HL[c];
+                    H_R_sum += HR[c];
+                  }
+                  if (H_L_sum >= min_child_weight && H_R_sum >= min_child_weight) {
+                    float gain = total_base;
+                    for (int c = 0; c < K; c++) {
+                      double gl_l1 = thr_l1(GL[c], reg_alpha);
+                      double gr_l1 = thr_l1(GR[c], reg_alpha);
+                      gain += 0.5f * (float)(gl_l1 * gl_l1 / (HL[c] + reg_lambda + EPS) +
+                                             gr_l1 * gr_l1 / (HR[c] + reg_lambda + EPS));
+                    }
+                    if (gain > thread_best_gain || (gain == thread_best_gain && thread_best_axis >= 0 && f < thread_best_axis)) {
+                      thread_best_gain = gain;
+                      thread_best_axis = f;
+                      thread_best_b = b;
+                      thread_best_thr = ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
+                      thread_best_default_left = 0;
+                    }
+                  }
+                }
+              }
+            }
+          } else {
+            // Categorical: normal scan, NaNs are handled natively by category codes (default_left = 1)
+            std::fill(thread_Gc.begin(), thread_Gc.end(), 0.0f);
+            std::fill(thread_Hc.begin(), thread_Hc.end(), 0.0f);
+            int n_left = 0;
+            for (int b = 0; b < AX_BINS - 1; b++) {
+              const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
+              n_left += (int)slot[2 * K];
+              for (int c = 0; c < K; c++) {
+                thread_Gc[c] += slot[c];
+                thread_Hc[c] += slot[K + c];
+              }
+              int n_right = ns - n_left;
+              if (n_left < 10 || n_right < 10) continue;
+              float Hcs = 0.0f, Hrs = 0.0f;
+              for (int c = 0; c < K; c++) {
+                Hcs += thread_Hc[c];
+                Hrs += Ht[c] - thread_Hc[c];
+              }
+              if (Hcs < min_child_weight || Hrs < min_child_weight) continue;
+              float gain = total_base;
+              for (int c = 0; c < K; c++) {
+                float Gr = Gt[c] - thread_Gc[c], Hr = Ht[c] - thread_Hc[c];
+                double tc_l1 = thr_l1(thread_Gc[c], reg_alpha);
+                double gr_l1 = thr_l1(Gr, reg_alpha);
+                gain += 0.5f * (tc_l1 * tc_l1 / (thread_Hc[c] + reg_lambda + EPS) +
+                                gr_l1 * gr_l1 / (Hr + reg_lambda + EPS));
+              }
+              if (gain > thread_best_gain || (gain == thread_best_gain && thread_best_axis >= 0 && f < thread_best_axis)) {
+                thread_best_gain = gain;
+                thread_best_axis = f;
+                thread_best_b = b;
+                thread_best_thr = ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
+                thread_best_default_left = 1;
+              }
+            }
           }
         }
-      }
 #ifdef _OPENMP
 #pragma omp critical
 #endif
-      {
-        if (l_axis >= 0 &&
-            (l_gain > best_gain ||
-             (l_gain == best_gain && (best_axis < 0 || l_axis < best_axis)))) {
-          best_gain = l_gain;
-          best_axis = l_axis;
-          best_axis_b = l_b;
-          best_thr = l_thr;
+        {
+          if (thread_best_axis >= 0 &&
+              (thread_best_gain > l_gain ||
+               (thread_best_gain == l_gain && (l_axis < 0 || thread_best_axis < l_axis)))) {
+            l_gain = thread_best_gain;
+            l_axis = thread_best_axis;
+            l_b = thread_best_b;
+            l_thr = thread_best_thr;
+            l_default_left = thread_best_default_left;
+          }
         }
       }
+      best_gain = l_gain;
+      best_axis = l_axis;
+      best_axis_b = l_b;
+      best_thr = l_thr;
+      best_default_left = l_default_left;
     }
 
     cand_gain[t] = best_gain;
@@ -642,14 +814,30 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
     const auto& samp = node_samp[t];
     int ns = (int)samp.size();
     if (ns < OBLIQUE_MIN) return cand_gain[t];
+
+    std::vector<char> feat_mask(D, 1);
+    if (colsample_bynode < 1.0f) {
+      std::mt19937 col_rng(seed + t);
+      feat_mask.assign(D, 0);
+      int n_sel = std::max(1, (int)std::lrintf(D * colsample_bynode));
+      std::vector<int> f_indices(D);
+      std::iota(f_indices.begin(), f_indices.end(), 0);
+      std::shuffle(f_indices.begin(), f_indices.end(), col_rng);
+      for (int idx = 0; idx < n_sel; idx++) {
+        feat_mask[f_indices[idx]] = 1;
+      }
+    }
+
     std::vector<float> Gt(K), Ht(K);
     for (int c = 0; c < K; c++) {
       Gt[c] = node_G[(size_t)t * K + c];
       Ht[c] = node_H[(size_t)t * K + c];
     }
     float total_base = 0.0f;
-    for (int c = 0; c < K; c++)
-      total_base -= 0.5f * Gt[c] * Gt[c] / (Ht[c] + reg_lambda + EPS);
+    for (int c = 0; c < K; c++) {
+      double gt_l1 = thr_l1(Gt[c], reg_alpha);
+      total_base -= 0.5f * gt_l1 * gt_l1 / (Ht[c] + reg_lambda + EPS);
+    }
 
     std::vector<int> samp_e = stride_cap(samp, EST_NE_MAX);
     int ne = (int)samp_e.size();
@@ -667,8 +855,10 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       }
     }
     float e_base = 0.0f;
-    for (int c = 0; c < K; c++)
-      e_base -= 0.5f * eGt[c] * eGt[c] / (eHt[c] + reg_lambda + EPS);
+    for (int c = 0; c < K; c++) {
+      double egt_l1 = thr_l1(eGt[c], reg_alpha);
+      e_base -= 0.5f * egt_l1 * egt_l1 / (eHt[c] + reg_lambda + EPS);
+    }
 
     int kdom = dominant_class(samp_e, G, K);
 
@@ -714,7 +904,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 
     std::vector<float> prob(D);
     for (int d = 0; d < D; d++) {
-      prob[d] = fscore[d] + 1e-6f;
+      prob[d] = feat_mask[d] ? (fscore[d] + 1e-6f) : 0.0f;
     }
     std::discrete_distribution<int> feat_dist(prob.begin(), prob.end());
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -1058,12 +1248,14 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
           Hcs += lHc[c];
           Hrs += eHt[c] - lHc[c];
         }
-        if (Hcs < MIN_CHILD_W || Hrs < MIN_CHILD_W) continue;
+        if (Hcs < min_child_weight || Hrs < min_child_weight) continue;
         float gain = e_base;
         for (int c = 0; c < K; c++) {
           float Gr = eGt[c] - lGc[c], Hr = eHt[c] - lHc[c];
-          gain += 0.5f * (lGc[c] * lGc[c] / (lHc[c] + reg_lambda + EPS) +
-                          Gr * Gr / (Hr + reg_lambda + EPS));
+          double lGc_l1 = thr_l1(lGc[c], reg_alpha);
+          double Gr_l1 = thr_l1(Gr, reg_alpha);
+          gain += 0.5f * (float)(lGc_l1 * lGc_l1 / (lHc[c] + reg_lambda + EPS) +
+                                 Gr_l1 * Gr_l1 / (Hr + reg_lambda + EPS));
         }
         if (gain > d_gain) {
           d_gain = gain;
@@ -1170,12 +1362,14 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         HLs += HL[c];
         HRs += Ht[c] - HL[c];
       }
-      if (HLs < MIN_CHILD_W || HRs < MIN_CHILD_W) return cand_gain[t];
+      if (HLs < min_child_weight || HRs < min_child_weight) return cand_gain[t];
       exact_gain = total_base;
       for (int c = 0; c < K; c++) {
         float GR = Gt[c] - GL[c], HR = Ht[c] - HL[c];
-        exact_gain += 0.5f * (GL[c] * GL[c] / (HL[c] + reg_lambda + EPS) +
-                              GR * GR / (HR + reg_lambda + EPS));
+        double gl_l1 = thr_l1(GL[c], reg_alpha);
+        double gr_l1 = thr_l1(GR, reg_alpha);
+        exact_gain += 0.5f * (float)(gl_l1 * gl_l1 / (HL[c] + reg_lambda + EPS) +
+                                     gr_l1 * gr_l1 / (HR + reg_lambda + EPS));
       }
     }
 
@@ -1225,7 +1419,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       float g2 = eval_oblique(t_node);
       oblique_done[t_node] = 1;
       (void)ag;
-      if (g2 <= 0.0f) {
+      if (g2 < gamma || g2 <= 0.0f) {
         recycle_hist(node_hist[t_node]);
         continue;
       }
@@ -1235,26 +1429,35 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         continue;
       }
     }
+
+    if (cand_gain[t_node] < gamma) {
+      recycle_hist(node_hist[t_node]);
+      continue;
+    }
     const auto& samp = node_samp[t_node];
     int tl = 2 * t_node + 1, tr_node = 2 * t_node + 2;
     int depth_t = get_node_depth(t_node);
 
+    // --- Split Refinement Step (Removed for Optimized Joint Scan in eval_axis) ---
     if (cand_axis[t_node] < 0) ctx->cache_direction(cand_w[t_node]);
     tree->is_leaf[t_node] = 0;
     tree->split_threshold[t_node] = cand_thr[t_node];
     tree->split_gain[t_node] = cand_gain[t_node];
+    tree->default_left[t_node] = cand_default_left[t_node];
     std::copy(cand_w[t_node].begin(), cand_w[t_node].end(),
               tree->split_weights.data() + (size_t)t_node * D);
     splits_left--;
 
     int ax = cand_axis[t_node];
-    int bcode = cand_bcode[t_node];
     float thr = cand_thr[t_node];
-    const std::vector<float>& proj = cand_proj[t_node];
     std::vector<int> left_sub, right_sub;
     std::vector<float> GL(K, 0.0f), HL(K, 0.0f);
     float PL = 0.0f;
     int ns = (int)samp.size();
+    
+    SparseVec sv;
+    collect_nonzero_stack(cand_w[t_node].data(), D, sv);
+
 #ifdef _OPENMP
     if (ns >= 8192) {
       int nthreads = omp_get_max_threads();
@@ -1279,9 +1482,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 #pragma omp for schedule(static) nowait
         for (int si = 0; si < ns; si++) {
           int j = samp[si];
-          bool go_left = (ax >= 0)
-                             ? (code[(size_t)j * D + ax] <= (uint8_t)bcode)
-                             : (proj[si] < thr);
+          bool go_left;
+          if (has_nan_in_split(ctx->is_nan.data(), j, D, sv)) {
+            go_left = (tree->default_left[t_node] != 0);
+          } else {
+            float proj_val = sparse_dot_stack(sv, Xt + (size_t)j * D);
+            go_left = (proj_val < thr);
+          }
           if (go_left) {
             Lv.push_back(j);
             const float* GF_RESTRICT gj = G + (size_t)j * K;
@@ -1298,22 +1505,34 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
         }
         tPL[tid] = pl;
       }
-      size_t nl = 0, nr = 0;
-      for (int t = 0; t < actual_threads; t++) {
-        nl += tL[t].size();
-        nr += tR[t].size();
-      }
-      left_sub.reserve(nl);
-      right_sub.reserve(nr);
+      std::vector<int> offset_L(actual_threads + 1, 0);
+      std::vector<int> offset_R(actual_threads + 1, 0);
       double PLd = 0.0;
       for (int t = 0; t < actual_threads; t++) {
-        left_sub.insert(left_sub.end(), tL[t].begin(), tL[t].end());
-        right_sub.insert(right_sub.end(), tR[t].begin(), tR[t].end());
+        offset_L[t + 1] = offset_L[t] + (int)tL[t].size();
+        offset_R[t + 1] = offset_R[t] + (int)tR[t].size();
         for (int c = 0; c < K; c++) {
           GL[c] += tGL[t][c];
           HL[c] += tHL[t][c];
         }
         PLd += tPL[t];
+      }
+      left_sub.resize(offset_L[actual_threads]);
+      right_sub.resize(offset_R[actual_threads]);
+
+#pragma omp parallel num_threads(actual_threads)
+      {
+        int tid = omp_get_thread_num();
+        if (tid < actual_threads) {
+          if (!tL[tid].empty()) {
+            std::memcpy(left_sub.data() + offset_L[tid], tL[tid].data(),
+                        tL[tid].size() * sizeof(int));
+          }
+          if (!tR[tid].empty()) {
+            std::memcpy(right_sub.data() + offset_R[tid], tR[tid].data(),
+                        tR[tid].size() * sizeof(int));
+          }
+        }
       }
       PL = (float)PLd;
     } else
@@ -1323,8 +1542,13 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       right_sub.reserve(ns / 2 + 64);
       for (int si = 0; si < ns; si++) {
         int j = samp[si];
-        bool go_left = (ax >= 0) ? (code[(size_t)j * D + ax] <= (uint8_t)bcode)
-                                 : (proj[si] < thr);
+        bool go_left;
+        if (has_nan_in_split(ctx->is_nan.data(), j, D, sv)) {
+          go_left = (tree->default_left[t_node] != 0);
+        } else {
+          float proj_val = sparse_dot_stack(sv, Xt + (size_t)j * D);
+          go_left = (proj_val < thr);
+        }
         if (go_left) {
           left_sub.push_back(j);
           const float* GF_RESTRICT gj = G + (size_t)j * K;
@@ -1388,7 +1612,7 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
       bool use_parent = (t > 0) && hasv[par_idx];
       for (int c = 0; c < K; c++) {
         float Gs = node_G[(size_t)t * K + c], Hs = node_H[(size_t)t * K + c];
-        float raw = -Gs / (Hs + reg_lambda + EPS);
+        float raw = -thr_l1(Gs, reg_alpha) / (Hs + reg_lambda + EPS);
         float v = use_parent
                       ? (Hs * raw + reg_lambda * sm[(size_t)par_idx * K + c]) /
                             (Hs + reg_lambda + EPS)
@@ -1424,12 +1648,20 @@ GF_API void* gf_build(void* ctx_handle, const float* X, const float* G,
 #endif
       for (int i = 0; i < N; i++) {
         if (in_sub[i]) continue;
-        const float* GF_RESTRICT xi = Xt + (size_t)i * D;
         int t = 0;
         for (int dep = 0; dep < tree->max_depth; dep++) {
           if (tree->is_leaf[t]) break;
-          float proj = sparse_dot_stack(node_nz[t], xi);
-          t = (proj < tree->split_threshold[t]) ? (2 * t + 1) : (2 * t + 2);
+          bool has_nan = false;
+          const SparseVec& sv = node_nz[t];
+          if (has_nan_in_split(ctx->is_nan.data(), i, D, sv)) {
+            has_nan = true;
+          }
+          if (has_nan) {
+            t = (tree->default_left[t] != 0) ? (2 * t + 1) : (2 * t + 2);
+          } else {
+            float proj = sparse_dot_stack(sv, Xt + (size_t)i * D);
+            t = (proj < tree->split_threshold[t]) ? (2 * t + 1) : (2 * t + 2);
+          }
         }
         const float* lv = tree->leaf_values.data() + (size_t)t * K;
         float* oi = out_pred + (size_t)i * K;
@@ -1462,15 +1694,15 @@ GF_API void gf_predict(void* tree_handle, const float* X, int N, int K,
     for (int f = 0; f < D; f++) {
       float v = xi[f];
       if (f < D_num) {
-        ti[f] = std::isnan(v) ? tree->na_means[f] : v;
+        ti[f] = v; // Keep NaN as NaN!
       } else {
         int fc = f - D_num;
         if (std::isnan(v) || fc >= (int)tree->cat_ranks.size()) {
-          ti[f] = tree->na_means[f];
+          ti[f] = std::nanf(""); // Represent missing category as NaN!
         } else {
           const auto& m = tree->cat_ranks[fc];
           auto it = m.find((int)std::lrintf(v));
-          ti[f] = (it != m.end()) ? it->second : tree->na_means[f];
+          ti[f] = (it != m.end()) ? it->second : std::nanf(""); // Represent unseen category as NaN!
         }
       }
     }
@@ -1485,6 +1717,7 @@ struct GFCompactNode {
   SparseVec nz;
   float thr = 0.0f;
   int32_t left = -1, right = -1;  // compact ids; -1 → leaf
+  uint8_t default_left = 1;
 };
 
 // Ensemble predict on RAW X: out_pred must be pre-filled with F_init by the
@@ -1526,9 +1759,7 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
     const float* GF_RESTRICT xi = X + (size_t)i * D;
     float* GF_RESTRICT ti = Xt.data() + (size_t)i * D;
     for (int f = 0; f < D; f++) {
-      float v = xi[f];
-      if (has_meta && f < D_num && std::isnan(v)) v = trees[0]->na_means[f];
-      ti[f] = v;
+      ti[f] = xi[f]; // Keep NaN as NaN!
     }
   }
 
@@ -1567,13 +1798,19 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
     }
   }
 
+  std::vector<int> col_offset(D_cat + 1, 0);
+  int r_sum = 0;
+  for (int fc = 0; fc < D_cat; fc++) {
+    col_offset[fc] = r_sum;
+    r_sum += cat_card[fc] + 1;
+  }
+  col_offset[D_cat] = r_sum;
+
   static constexpr int TILE = 16;
   std::vector<std::vector<GFCompactNode>> tile_nodes(TILE);
   std::vector<std::vector<float>> tile_leaves(TILE);
-  // Per (tile tree, cat col): flat rank table indexed by dense code; the
-  // last entry (code == card) is the tree's NaN/unseen fallback.
-  std::vector<std::vector<float>> tile_rank(D_cat > 0 ? (size_t)TILE * D_cat
-                                                      : 0);
+  // Flattened rank table: size TILE * r_sum
+  std::vector<float> tile_rank_flat(D_cat > 0 ? (size_t)TILE * r_sum : 0, 0.0f);
   std::vector<int> heap_of;
   heap_of.reserve(256);
 
@@ -1610,18 +1847,25 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
           nodes[c].thr = tr->split_threshold[h];
           nodes[c].left = next;
           nodes[c].right = next + 1;
+          nodes[c].default_left = tr->default_left[h];
           next += 2;
         }
       }
 
       // ── per-tree rank tables (code → encoded value) ─────────────────────
-      for (int fc = 0; fc < D_cat; fc++) {
-        auto& tbl = tile_rank[(size_t)tt * D_cat + fc];
-        tbl.assign((size_t)cat_card[fc] + 1, tr->na_means[D_num + fc]);
-        if (fc < (int)tr->cat_ranks.size()) {
-          for (const auto& kv : tr->cat_ranks[fc]) {
-            auto it = raw2code[fc].find(kv.first);
-            if (it != raw2code[fc].end()) tbl[it->second] = kv.second;
+      if (D_cat > 0) {
+        int base_offset = tt * r_sum;
+        for (int fc = 0; fc < D_cat; fc++) {
+          int offset = base_offset + col_offset[fc];
+          float fallback = std::nanf(""); // Represent missing/unseen category as NaN!
+          std::fill(tile_rank_flat.begin() + offset, tile_rank_flat.begin() + offset + cat_card[fc] + 1, fallback);
+          if (fc < (int)tr->cat_ranks.size()) {
+            for (const auto& kv : tr->cat_ranks[fc]) {
+              auto it = raw2code[fc].find(kv.first);
+              if (it != raw2code[fc].end()) {
+                tile_rank_flat[offset + it->second] = kv.second;
+              }
+            }
           }
         }
       }
@@ -1648,15 +1892,39 @@ GF_API void gf_predict_ensemble(void* const* handles, int n_trees,
             D_cat > 0 ? codes.data() + (size_t)i * D_cat : nullptr;
         for (int tt = 0; tt < tn; tt++) {
           if (D_cat > 0) {
-            const auto* tbl0 = tile_rank.data() + (size_t)tt * D_cat;
+            const float* GF_RESTRICT tr_rank = tile_rank_flat.data() + (size_t)tt * r_sum;
             for (int fc = 0; fc < D_cat; fc++)
-              row[D_num + fc] = tbl0[fc][ci[fc]];
+              row[D_num + fc] = tr_rank[col_offset[fc] + ci[fc]];
           }
           const GFCompactNode* GF_RESTRICT nd = tile_nodes[tt].data();
           int n = 0;
           while (nd[n].left >= 0) {
-            float proj = sparse_dot_stack(nd[n].nz, rp);
-            n = (proj < nd[n].thr) ? nd[n].left : nd[n].right;
+            bool has_nan = false;
+            const SparseVec& sv = nd[n].nz;
+            if (sv.size == 1) {
+              int idx = sv.indices[0];
+              if (idx < D_num && std::isnan(rp[idx])) {
+                has_nan = true;
+              }
+            }
+            if (has_nan) {
+              n = (nd[n].default_left != 0) ? nd[n].left : nd[n].right;
+            } else {
+              float proj = 0.0f;
+              if (sv.size == 1) {
+                proj = sv.values[0] * rp[sv.indices[0]];
+              } else {
+                const float* na_means = trees[tile_lo + tt]->na_means.data();
+                for (int k = 0; k < sv.size; k++) {
+                  float v = rp[sv.indices[k]];
+                  if (std::isnan(v)) {
+                    v = na_means[sv.indices[k]];
+                  }
+                  proj += sv.values[k] * v;
+                }
+              }
+              n = (proj < nd[n].thr) ? nd[n].left : nd[n].right;
+            }
           }
           const float* lv = tile_leaves[tt].data() + (size_t)n * K;
           for (int k = 0; k < K; k++) oi[k] += lr * lv[k];
@@ -1733,19 +2001,27 @@ GF_API int oqtree_get_D(void* handle) {
 
 GF_API void oqtree_export(void* handle, int* split_hyp_idx,
                           float* split_threshold, float* leaf_values,
-                          uint8_t* is_leaf) {
+                          uint8_t* is_leaf, uint8_t* default_left) {
   const OQTree* tree = static_cast<const OQTree*>(handle);
   int n = tree->total_nodes, K = tree->K;
   for (int i = 0; i < n; ++i) split_hyp_idx[i] = tree->split_hyp_idx[i];
   for (int i = 0; i < n; ++i) split_threshold[i] = tree->split_threshold[i];
   for (size_t i = 0; i < (size_t)n * K; ++i) leaf_values[i] = tree->leaf_values[i];
   for (int i = 0; i < n; ++i) is_leaf[i] = tree->is_leaf[i];
+  if (default_left) {
+    if (!tree->default_left.empty()) {
+      for (int i = 0; i < n; ++i) default_left[i] = tree->default_left[i];
+    } else {
+      for (int i = 0; i < n; ++i) default_left[i] = 1;
+    }
+  }
 }
 
 GF_API void* oqtree_from_arrays(const int* split_hyp_idx,
                                 const float* split_threshold,
                                 const float* leaf_values,
-                                const uint8_t* is_leaf, int total_nodes, int K,
+                                const uint8_t* is_leaf,
+                                const uint8_t* default_left, int total_nodes, int K,
                                 int max_depth) {
   OQTree* tree = new OQTree();
   tree->total_nodes = total_nodes;
@@ -1755,6 +2031,11 @@ GF_API void* oqtree_from_arrays(const int* split_hyp_idx,
   tree->split_threshold.assign(split_threshold, split_threshold + total_nodes);
   tree->leaf_values.assign(leaf_values, leaf_values + (size_t)total_nodes * K);
   tree->is_leaf.assign(is_leaf, is_leaf + total_nodes);
+  if (default_left) {
+    tree->default_left.assign(default_left, default_left + total_nodes);
+  } else {
+    tree->default_left.assign(total_nodes, 1);
+  }
   return static_cast<void*>(tree);
 }
 

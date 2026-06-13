@@ -21,7 +21,7 @@ def load_model(path: str) -> OQBoostClassifier:
     return OQBoostClassifier.load(path)
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"
 __all__ = [
     "OQBoostClassifier",
     "OQBoostTree",

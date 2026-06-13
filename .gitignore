@@ -50,3 +50,9 @@ benchmark/catboost_info/
 benchmark/data/
 # CatBoost training artifacts
 catboost_info/
+
+# Secrets / local env
+.env
+
+# Stray test artifacts
+test.joblib

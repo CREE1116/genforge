@@ -183,3 +183,13 @@ def test_pipeline_compatibility(binary_data):
     pipe.fit(X, y)
     preds = pipe.predict(X)
     assert preds.shape == (len(y),)
+
+
+def test_goss_sampling(binary_data):
+    X, y = binary_data
+    clf = OQBoostClassifier(n_estimators=5, max_depth=2, verbose=False, random_state=0, goss=True)
+    clf.fit(X, y)
+    preds = clf.predict(X)
+    proba = clf.predict_proba(X)
+    assert preds.shape == (len(y),)
+    assert not np.isnan(proba).any()

@@ -15,6 +15,7 @@ struct OQTree {
   std::vector<float>   split_threshold;
   std::vector<float>   leaf_values;
   std::vector<uint8_t> is_leaf;
+  std::vector<uint8_t> default_left;  // [total_nodes]: 1 if NaNs go left, 0 if right
   std::vector<float>   split_gain;
   std::vector<float>   split_weights;  // [total_nodes × D]
 

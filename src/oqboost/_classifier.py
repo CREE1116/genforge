@@ -89,6 +89,16 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         mutation_rate:         float = 0.1,
         mutation_strength:     float = 0.5,
         pobs:                  bool  = False,
+        goss:                  bool  = False,
+        goss_top_rate:         float = 0.2,
+        goss_other_rate:       float = 0.1,
+        reg_alpha:             float = 0.0,
+        gamma:                 float = 0.0,
+        min_child_weight:      float = 1.0,
+        max_leaves:            int | None = None,
+        max_bin:               int = 255,
+        colsample_bynode:      float = 1.0,
+        multi_strategy:        str = "ovr",
     ):
         self.n_estimators          = n_estimators
         self.learning_rate         = learning_rate
@@ -105,6 +115,16 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         self.mutation_rate         = mutation_rate
         self.mutation_strength     = mutation_strength
         self.pobs                  = pobs
+        self.goss                  = goss
+        self.goss_top_rate         = goss_top_rate
+        self.goss_other_rate       = goss_other_rate
+        self.reg_alpha             = reg_alpha
+        self.gamma                 = gamma
+        self.min_child_weight      = min_child_weight
+        self.max_leaves            = max_leaves
+        self.max_bin               = max_bin
+        self.colsample_bynode      = colsample_bynode
+        self.multi_strategy        = multi_strategy
 
     # ── public fit/predict ────────────────────────────────────────────────────
 
@@ -171,13 +191,19 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         y : array-like of shape (n_samples,)
         eval_set : list of (X_val, y_val) tuples, optional
             First tuple is used for early stopping and validation metrics.
-        sample_weight : ignored (class weights computed internally from y)
+        sample_weight : array-like of shape (n_samples,), optional
+            Individual weights for each sample.
         """
         X = self._prepare_data(X, is_fit=True)
         y = np.asarray(y, dtype=np.int64)
 
         self.n_features_in_ = X.shape[1]
         self.classes_       = np.unique(y)
+
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=np.float32)
+            if sample_weight.ndim != 1 or len(sample_weight) != X.shape[0]:
+                raise ValueError("sample_weight must be a 1D array of length N.")
 
         D_num = self._resolve_D_num(X.shape[1])
 
@@ -187,7 +213,7 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
             X_val = self._prepare_data(X_val, is_fit=False)
             y_val = np.asarray(y_val, dtype=np.int64)
 
-        self._fit_core(X, y, X_val, y_val, D_num)
+        self._fit_core(X, y, X_val, y_val, D_num, sample_weight=sample_weight)
         return self
 
     def predict(self, X) -> np.ndarray:
@@ -209,6 +235,29 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         return P.argmax(axis=1)
 
     def predict_proba(self, X) -> np.ndarray:
+        if hasattr(self, "ovr_ensembles_") and self.ovr_ensembles_:
+            X_orig = X
+            N = X_orig.shape[0]
+            K = len(self.ovr_ensembles_)
+            logits = np.zeros((N, K), dtype=np.float32)
+            from ._oqboost import predict_ensemble
+            for c in range(K):
+                clf_c = self.ovr_ensembles_[c]
+                X_c = clf_c._prepare_data(X_orig, is_fit=False)
+                X_c = np.ascontiguousarray(X_c, dtype=np.float32)
+                if getattr(clf_c, "_col_perm_", None) is not None:
+                    X_c = np.ascontiguousarray(X_c[:, clf_c._col_perm_])
+                F = predict_ensemble(
+                    clf_c.trees_, X_c, 2, clf_c.learning_rate,
+                    np.array(clf_c.F_init_, dtype=np.float32)
+                )
+                logits[:, c] = F[:, 1] - F[:, 0]
+            
+            logits_sh = logits - logits.max(axis=1, keepdims=True)
+            P = np.exp(logits_sh)
+            P /= P.sum(axis=1, keepdims=True)
+            return P
+
         check_is_fitted(self, "trees_")
 
         X = self._prepare_data(X, is_fit=False)
@@ -242,6 +291,8 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
     def get_n_trees(self) -> int:
         """Return the number of trees actually fitted."""
         check_is_fitted(self, "trees_")
+        if hasattr(self, "ovr_ensembles_") and self.ovr_ensembles_:
+            return sum(len(clf.trees_) for clf in self.ovr_ensembles_)
         return len(self.trees_)
 
     # ── internal ─────────────────────────────────────────────────────────────
@@ -262,12 +313,63 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
         """Number of numerical (non-categorical) columns."""
         return D - len(self._resolve_cat_idx(D))
 
-    def _fit_core(self, X, y, X_val, y_val, D_num):
+    def _fit_core(self, X, y, X_val, y_val, D_num, sample_weight=None):
         from ._oqboost import OQBoostContext
 
         N, D = X.shape
         K    = int(y.max()) + 1
         seed = self.random_state if self.random_state is not None else 42
+
+        if K >= 3 and self.multi_strategy == "ovr":
+            # Train K separate binary classifiers
+            self.ovr_ensembles_ = []
+            self.trees_ = []  # Empty placeholder for check_is_fitted
+            self.F_init_ = [0.0] * K  # Dummy
+            
+            cnt = np.bincount(y, minlength=K).astype(np.float32)
+            self._prior_ = (cnt / N).tolist()
+            self._col_perm_ = None
+            
+            for c in range(K):
+                y_c = (y == c).astype(np.int64)
+                
+                eval_set_c = None
+                if X_val is not None:
+                    y_val_c = (y_val == c).astype(np.int64)
+                    eval_set_c = [(X_val, y_val_c)]
+                
+                clf_c = OQBoostClassifier(
+                    n_estimators=self.n_estimators,
+                    learning_rate=self.learning_rate,
+                    max_depth=self.max_depth,
+                    reg_lambda=self.reg_lambda,
+                    subsample=self.subsample,
+                    early_stopping_rounds=self.early_stopping_rounds,
+                    random_state=seed + c if seed is not None else None,
+                    verbose=self.verbose,
+                    cat_features=self.cat_features,
+                    class_weight=None,
+                    prior_alpha=self.prior_alpha,
+                    inherited_rp_ratio=self.inherited_rp_ratio,
+                    mutation_rate=self.mutation_rate,
+                    mutation_strength=self.mutation_strength,
+                    pobs=self.pobs,
+                    goss=self.goss,
+                    goss_top_rate=self.goss_top_rate,
+                    goss_other_rate=self.goss_other_rate,
+                    reg_alpha=self.reg_alpha,
+                    gamma=self.gamma,
+                    min_child_weight=self.min_child_weight,
+                    max_leaves=self.max_leaves,
+                    max_bin=self.max_bin,
+                    colsample_bynode=self.colsample_bynode,
+                    multi_strategy="shared"
+                )
+                if self.verbose:
+                    print(f"  [OQBoost OVR] Fitting class {c+1}/{K}...")
+                clf_c.fit(X, y_c, eval_set=eval_set_c, sample_weight=sample_weight)
+                self.ovr_ensembles_.append(clf_c)
+            return
 
         cat_idx = self._resolve_cat_idx(D)
         if cat_idx and cat_idx != list(range(D_num, D)):
@@ -280,10 +382,6 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
             if X_val is not None:
                 X_val = np.ascontiguousarray(X_val[:, self._col_perm_])
 
-        # Training is always unweighted: gradient reweighting distorts the
-        # probability estimates (log loss) and desynchronises early stopping.
-        # class_weight="balanced" is instead applied at decision time in
-        # predict() via prior-corrected argmax, using the prior stored here.
         cnt = np.bincount(y, minlength=K).astype(np.float32)
         self._prior_ = (cnt / N).tolist()
 
@@ -304,16 +402,35 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
 
         self.trees_: list = []
 
-        from ._oqboost import update_gradients
-        ctx = OQBoostContext(X, D_num=D_num)
+        from ._oqboost import update_gradients, OQBoostContext
+        ctx = OQBoostContext(X, D_num=D_num, max_bin=self.max_bin)
         G_w = np.empty((N, K), dtype=np.float32)
         H_w = np.empty((N, K), dtype=np.float32)
         full_idx = np.arange(N, dtype=np.int32)
         try:
             for m in range(self.n_estimators):
                 update_gradients(Fsc, oh, G_w, H_w)
+                if sample_weight is not None:
+                    G_w *= sample_weight[:, np.newaxis]
+                    H_w *= sample_weight[:, np.newaxis]
 
-                if self.subsample < 1.0:
+                if self.goss:
+                    grad_norms = np.mean(np.abs(G_w), axis=1)
+                    top_n = int(self.goss_top_rate * N)
+                    other_n = int(self.goss_other_rate * (N - top_n))
+                    if top_n > 0 and other_n > 0 and (top_n + other_n) < N:
+                        k = N - top_n
+                        partitioned_idx = np.argpartition(grad_norms, k)
+                        top_idx = partitioned_idx[k:]
+                        remaining_idx = partitioned_idx[:k]
+                        random_idx = rng.choice(remaining_idx, size=other_n, replace=False)
+                        tree_sub = np.concatenate([top_idx, random_idx]).astype(np.int32)
+                        scale_factor = (1.0 - self.goss_top_rate) / self.goss_other_rate
+                        G_w[random_idx] *= scale_factor
+                        H_w[random_idx] *= scale_factor
+                    else:
+                        tree_sub = full_idx
+                elif self.subsample < 1.0:
                     tree_sub = np.flatnonzero(
                         rng.random(N) < self.subsample
                     ).astype(np.int32)
@@ -329,6 +446,11 @@ class OQBoostClassifier(BaseEstimator, ClassifierMixin):
                     mutation_strength=self.mutation_strength,
                     seed=int(rng.integers(1 << 30)),
                     pobs=getattr(self, "pobs", False),
+                    reg_alpha=self.reg_alpha,
+                    gamma=self.gamma,
+                    min_child_weight=self.min_child_weight,
+                    colsample_bynode=self.colsample_bynode,
+                    max_leaves=self.max_leaves if self.max_leaves is not None else (1 << self.max_depth),
                 )
 
                 self.trees_.append(t)

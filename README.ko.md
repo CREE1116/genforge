@@ -5,7 +5,7 @@
 OQBoost는 기존의 축 정렬 분기(axis-aligned splits) 대신 그라디언트(gradient)에 의해 정렬되는 사선 하이퍼플레인(oblique hyperplanes) 분기를 수행합니다. 이 분기 방향들은 부모 노드로부터 상속 및 변이되는 유전적 파이프라인을 거치며, 값비싼 수치 최적화 없이도 데이터의 고유한 기하학적 구조를 효과적으로 캡처합니다.
 
 <p align="center">
-  <img src="docs/diverse_boundaries.png" alt="OQBoost 결정 경계" width="800">
+  <img src="https://raw.githubusercontent.com/cree1116/oqboost/main/docs/diverse_boundaries.png" alt="OQBoost 결정 경계" width="800">
 </p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -144,23 +144,23 @@ clf2 = load_model("model.joblib")
 
 ### 그림 1 — 균형 정확도 비교 (Balanced Accuracy Comparison)
 
-![Balanced Accuracy](benchmark/results/figures/fig2_balanced_accuracy.png)
+![Balanced Accuracy](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig2_balanced_accuracy.png)
 
 ### 그림 2 — 성능 대 학습 속도 비교 (Performance vs Training Cost)
 
-![Perf vs Cost](benchmark/results/figures/fig5_perf_vs_cost.png)
+![Perf vs Cost](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig5_perf_vs_cost.png)
 
 ### 그림 3 — 회전 강건성 평가 (Rotation Robustness)
 
-![Rotation Robustness](benchmark/results/figures/fig6_rotation_robustness.png)
+![Rotation Robustness](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig6_rotation_robustness.png)
 
 ### 그림 4 — 결측치 내성 평가 (Missing Value Robustness)
 
-![Missing Value](benchmark/results/figures/fig7_missing_value.png)
+![Missing Value](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig7_missing_value.png)
 
 ### 그림 5 — 범주 카디널리티 내성 평가 (Categorical Cardinality Robustness)
 
-![Categorical](benchmark/results/figures/fig8_categorical.png)
+![Categorical](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig8_categorical.png)
 
 ---
 

@@ -31,7 +31,7 @@ static constexpr float EPS = 1e-8f;
 static constexpr float MIN_CHILD_W = 0.1f;
 static constexpr int D_SUB_MAX = 16;     // feature dims entering one CD solve
 static constexpr int HIST_BINS = 64;     // local bins for candidate scans
-static constexpr int AX_BINS = 256;      // global pre-binned feature codes
+static constexpr int AX_BINS = 255;      // global pre-binned feature codes
 static constexpr int EST_NE_MAX = 2048;  // gain-estimation subsample cap
 static constexpr int CD_SWEEPS = 2;      // max CD sweeps (warm-started)
 static constexpr int WLS_CAP = 2048;     // CD-WLS instance subsample cap
@@ -99,6 +99,131 @@ static inline float sparse_dot_stack(const SparseVec& sv,
              sv.values[3] * xi[sv.indices[3]] +
              sv.values[4] * xi[sv.indices[4]] +
              sv.values[5] * xi[sv.indices[5]];
+    case 7:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]];
+    case 8:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]];
+    case 9:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]] +
+             sv.values[8] * xi[sv.indices[8]];
+    case 10:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]] +
+             sv.values[8] * xi[sv.indices[8]] +
+             sv.values[9] * xi[sv.indices[9]];
+    case 11:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]] +
+             sv.values[8] * xi[sv.indices[8]] +
+             sv.values[9] * xi[sv.indices[9]] +
+             sv.values[10] * xi[sv.indices[10]];
+    case 12:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]] +
+             sv.values[8] * xi[sv.indices[8]] +
+             sv.values[9] * xi[sv.indices[9]] +
+             sv.values[10] * xi[sv.indices[10]] +
+             sv.values[11] * xi[sv.indices[11]];
+    case 13:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]] +
+             sv.values[8] * xi[sv.indices[8]] +
+             sv.values[9] * xi[sv.indices[9]] +
+             sv.values[10] * xi[sv.indices[10]] +
+             sv.values[11] * xi[sv.indices[11]] +
+             sv.values[12] * xi[sv.indices[12]];
+    case 14:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]] +
+             sv.values[8] * xi[sv.indices[8]] +
+             sv.values[9] * xi[sv.indices[9]] +
+             sv.values[10] * xi[sv.indices[10]] +
+             sv.values[11] * xi[sv.indices[11]] +
+             sv.values[12] * xi[sv.indices[12]] +
+             sv.values[13] * xi[sv.indices[13]];
+    case 15:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]] +
+             sv.values[8] * xi[sv.indices[8]] +
+             sv.values[9] * xi[sv.indices[9]] +
+             sv.values[10] * xi[sv.indices[10]] +
+             sv.values[11] * xi[sv.indices[11]] +
+             sv.values[12] * xi[sv.indices[12]] +
+             sv.values[13] * xi[sv.indices[13]] +
+             sv.values[14] * xi[sv.indices[14]];
+    case 16:
+      return sv.values[0] * xi[sv.indices[0]] +
+             sv.values[1] * xi[sv.indices[1]] +
+             sv.values[2] * xi[sv.indices[2]] +
+             sv.values[3] * xi[sv.indices[3]] +
+             sv.values[4] * xi[sv.indices[4]] +
+             sv.values[5] * xi[sv.indices[5]] +
+             sv.values[6] * xi[sv.indices[6]] +
+             sv.values[7] * xi[sv.indices[7]] +
+             sv.values[8] * xi[sv.indices[8]] +
+             sv.values[9] * xi[sv.indices[9]] +
+             sv.values[10] * xi[sv.indices[10]] +
+             sv.values[11] * xi[sv.indices[11]] +
+             sv.values[12] * xi[sv.indices[12]] +
+             sv.values[13] * xi[sv.indices[13]] +
+             sv.values[14] * xi[sv.indices[14]] +
+             sv.values[15] * xi[sv.indices[15]];
     default:
       float proj = 0.0f;
       for (int i = 0; i < sv.size; i++) {

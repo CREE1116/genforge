@@ -5,7 +5,7 @@
 OQBoost replaces axis-aligned splits with gradient-guided oblique hyperplanes that are inherited and mutated from parent nodes — exploiting the geometric structure of the data without expensive numerical optimization.
 
 <p align="center">
-  <img src="docs/diverse_boundaries.png" alt="OQBoost Decision Boundaries" width="800">
+  <img src="https://raw.githubusercontent.com/cree1116/oqboost/main/docs/diverse_boundaries.png" alt="OQBoost Decision Boundaries" width="800">
 </p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -144,23 +144,23 @@ All benchmarks: 80/20 train-test split, 3 repetitions, mean ± standard deviatio
 
 ### Figure 1 — Balanced Accuracy Comparison
 
-![Balanced Accuracy](benchmark/results/figures/fig2_balanced_accuracy.png)
+![Balanced Accuracy](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig2_balanced_accuracy.png)
 
 ### Figure 2 — Performance vs Training Cost
 
-![Perf vs Cost](benchmark/results/figures/fig5_perf_vs_cost.png)
+![Perf vs Cost](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig5_perf_vs_cost.png)
 
 ### Figure 3 — Rotation Robustness
 
-![Rotation Robustness](benchmark/results/figures/fig6_rotation_robustness.png)
+![Rotation Robustness](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig6_rotation_robustness.png)
 
 ### Figure 4 — Missing Value Robustness
 
-![Missing Value](benchmark/results/figures/fig7_missing_value.png)
+![Missing Value](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig7_missing_value.png)
 
 ### Figure 5 — Categorical Cardinality Robustness
 
-![Categorical](benchmark/results/figures/fig8_categorical.png)
+![Categorical](https://raw.githubusercontent.com/cree1116/oqboost/main/benchmark/results/figures/fig8_categorical.png)
 
 ---
 

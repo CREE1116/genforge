@@ -49,11 +49,11 @@ def _get_oqboost_lib():
     lib.oqtree_get_D.argtypes = [ctypes.c_void_p]
     lib.oqtree_get_D.restype = ctypes.c_int
 
-    lib.oqtree_export.argtypes = [ctypes.c_void_p, _pi, _pf, _pf, _pu8]
+    lib.oqtree_export.argtypes = [ctypes.c_void_p, _pi, _pf, _pf, _pu8, _pu8]
     lib.oqtree_export.restype = None
 
     lib.oqtree_from_arrays.argtypes = [
-        _pi, _pf, _pf, _pu8,
+        _pi, _pf, _pf, _pu8, _pu8,
         ctypes.c_int,  # total_nodes
         ctypes.c_int,  # K
         ctypes.c_int,  # max_depth
@@ -72,6 +72,7 @@ def _get_oqboost_lib():
         ctypes.c_int,  # D_num
         _pi,           # sub   [Ns]     (stats subsample)
         ctypes.c_int,  # Ns
+        ctypes.c_int,  # max_bin
     ]
     lib.gf_ctx_create.restype = ctypes.c_void_p
 
@@ -93,6 +94,11 @@ def _get_oqboost_lib():
         ctypes.c_float,   # mutation_strength
         ctypes.c_int,     # seed
         ctypes.c_int,     # pobs (1 = per-node pobs carve, 0 = all A/B/C)
+        ctypes.c_float,   # reg_alpha
+        ctypes.c_float,   # gamma
+        ctypes.c_float,   # min_child_weight
+        ctypes.c_float,   # colsample_bynode
+        ctypes.c_int,     # max_leaves
         _pf,              # out_pred [N, K]  (may be NULL)
     ]
 
@@ -307,9 +313,11 @@ class OQBoostTree:
         threshold = np.empty(n_nodes,     dtype=np.float32)
         leaf_vals = np.empty(n_nodes * K, dtype=np.float32)
         is_leaf   = np.empty(n_nodes,     dtype=np.uint8)
+        default_left = np.empty(n_nodes,  dtype=np.uint8)
         lib.oqtree_export(
             h, _iptr(hyp_idx), _fptr(threshold), _fptr(leaf_vals),
             is_leaf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            default_left.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         )
         split_weights = np.empty(n_nodes * D, dtype=np.float32)
         lib.oqtree_get_split_weights(h, _fptr(split_weights))
@@ -335,6 +343,7 @@ class OQBoostTree:
             "threshold":     threshold,
             "leaf_vals":     leaf_vals,
             "is_leaf":       is_leaf,
+            "default_left":  default_left,
             "split_weights": split_weights,
             "D_num":         D_num,
             "D_cat":         D_cat,
@@ -357,9 +366,11 @@ class OQBoostTree:
             return
         lib = _get_oqboost_lib()
         s   = state
+        dl  = s.get("default_left", np.ones(s["n_nodes"], dtype=np.uint8))
         handle = lib.oqtree_from_arrays(
             _iptr(s["hyp_idx"]), _fptr(s["threshold"]), _fptr(s["leaf_vals"]),
             s["is_leaf"].ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            dl.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             s["n_nodes"], s["K"], s["tree_max_depth"],
         )
         lib.oqtree_set_split_weights(handle, s["D"], _fptr(s["split_weights"]))
@@ -385,19 +396,19 @@ class OQBoostTree:
 class OQBoostContext:
     """Reusable binning context for a boosting run.
 
-    Bins X once (numeric: NaN-mean-imputed 256-bin codes; categorical:
+    Bins X once (numeric: NaN-mean-imputed codes; categorical:
     value dictionaries) and reuses it for every round — only the
     categorical gradient-rank re-encoding is recomputed per tree.
     """
 
-    def __init__(self, X: np.ndarray, D_num: int | None = None):
+    def __init__(self, X: np.ndarray, D_num: int | None = None, max_bin: int = 255):
         X = np.ascontiguousarray(X, dtype=np.float32)
         self.N, self.D = X.shape
         self.D_num = self.D if D_num is None else int(D_num)
         sub = np.arange(self.N, dtype=np.int32)
         lib = _get_oqboost_lib()
         self._handle = lib.gf_ctx_create(
-            _fptr(X), self.N, self.D, self.D_num, _iptr(sub), self.N
+            _fptr(X), self.N, self.D, self.D_num, _iptr(sub), self.N, ctypes.c_int(max_bin)
         )
 
     def build(
@@ -412,6 +423,11 @@ class OQBoostContext:
         mutation_strength: float = 0.5,
         seed: int = 42,
         pobs: bool = True,
+        reg_alpha: float = 0.0,
+        gamma: float = 0.0,
+        min_child_weight: float = 1.0,
+        colsample_bynode: float = 1.0,
+        max_leaves: int = 256,
     ) -> tuple[OQBoostTree, np.ndarray]:
         """One boosting round → (fitted tree, predictions for all N rows)."""
         if self._handle is None:
@@ -431,6 +447,11 @@ class OQBoostContext:
             ctypes.c_float(mutation_strength),
             ctypes.c_int(seed),
             ctypes.c_int(1 if pobs else 0),
+            ctypes.c_float(reg_alpha),
+            ctypes.c_float(gamma),
+            ctypes.c_float(min_child_weight),
+            ctypes.c_float(colsample_bynode),
+            ctypes.c_int(max_leaves),
             _fptr(out_pred),
         )
 
